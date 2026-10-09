@@ -2,19 +2,21 @@
 name = "bevy_penumbra"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.97.1"
 description = "Sparse world-space Split Radiance Cascades diffuse global illumination for Bevy"
 license = "MIT OR Apache-2.0"
 keywords = ["bevy", "global-illumination", "radiance-cascades", "slang"]
 categories = ["game-development", "graphics", "rendering"]
 
 [dependencies]
-bevy = { version = "0.19.1", default-features = false, features = ["3d_bevy_render", "bevy_log"] }
-bevy_slang = { version = "0.1.0", path = "../bevy_slang" }
+bevy = { version = "0.20.0", default-features = false, features = ["3d_bevy_render", "bevy_log"] }
+bevy_slang = { version = "0.1.0", path = "../bevy_slang", features = ["spirv_passthrough"] }
+wgpu = { version = "30.0.1", default-features = false }
 
 [dev-dependencies]
-bevy = { version = "0.19.1", default-features = false, features = ["3d", "png"] }
-naga = { version = "29", features = ["wgsl-in"] }
+bevy_texture_cache = { version = "0.1.0", path = "../bevy_texture_cache" }
+bevy = { version = "0.20.0", default-features = false, features = ["3d", "png", "free_camera"] }
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
 
 [profile.dev]
 opt-level = 1
@@ -24,3 +26,9 @@ opt-level = 3
 
 [lints.rust]
 missing_docs = "warn"
+
+[dependencies.indexmap]
+version = '2'
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tempfile = "3"

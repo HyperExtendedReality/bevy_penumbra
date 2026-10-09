@@ -14,15 +14,26 @@ from PIL import Image
 REGIONS = {"front": (230, 307, 262, 340), "back_wall": (180, 135, 328, 250)}
 
 
+def regions(image):
+    """Scale the original Cornell ROIs to the capture's actual viewport."""
+    height, width, _ = image.shape
+    result = {}
+    for name, (x0, y0, x1, y1) in REGIONS.items():
+        bounds = (round(x0 * width / 640), round(y0 * height / 480),
+                  round(x1 * width / 640), round(y1 * height / 480))
+        assert bounds[2] - bounds[0] >= 3 and bounds[3] - bounds[1] >= 3, "ROI too small"
+        result[name] = bounds
+    return result
+
+
 def read(path):
     image = np.asarray(Image.open(path).convert("RGB"), dtype=np.float64)
-    assert image.shape == (480, 640, 3), "metrics require 640x480 captures"
     return image
 
 
 def measure(image):
     result = {}
-    for name, (x0, y0, x1, y1) in REGIONS.items():
+    for name, (x0, y0, x1, y1) in regions(image).items():
         rgb = image[y0:y1, x0:x1]
         # Remove the smooth illumination gradient; measure broad blotches as
         # well as fine noise. Adjacent-pixel differences miss blurred artifacts.
@@ -45,8 +56,9 @@ def main():
     paths = sorted(glob.glob(args.sequence))
     assert len(paths) >= 8, "capture at least eight frames"
     frames = [read(path) for path in paths]
+    assert all(frame.shape == frames[0].shape for frame in frames), "sequence dimensions changed"
     report = {"before": before, "after": after, "frames": len(frames), "temporal_mae": {}}
-    for name, (x0, y0, x1, y1) in REGIONS.items():
+    for name, (x0, y0, x1, y1) in regions(frames[0]).items():
         changes = [float(np.abs(b[y0:y1, x0:x1] - a[y0:y1, x0:x1]).mean()) for a, b in zip(frames, frames[1:])]
         report["temporal_mae"][name] = {"mean": float(np.mean(changes)), "maximum": max(changes)}
         # Preserve useful lighting: reducing noise by making everything black
