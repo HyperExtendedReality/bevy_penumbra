@@ -1328,10 +1328,13 @@ pub(crate) fn update_scene(
             .entry(mesh_handle.0.id())
             .or_insert_with(|| mesh_support(mesh))
             .is_ok()
-            && crate::material::material_mesh_support(material_asset, mesh).is_ok()
+            && crate::material::material_mesh_layout_support(material_asset, mesh).is_ok()
         {
             pending_entities.insert(entity);
         }
+    }
+    if texture_cache.permanent_failure {
+        pending_entities.clear();
     }
     if scene.pending_entities.as_ref() != &*pending_entities {
         scene.pending_entities = Arc::new(pending_entities.clone());
@@ -1487,7 +1490,7 @@ pub(crate) fn update_scene(
         ) else {
             continue;
         };
-        if let Err(reason) = crate::material::material_mesh_support(material, mesh) {
+        if let Err(reason) = crate::material::material_mesh_layout_support(material, mesh) {
             warn!(?entity, "GI material rejected: {reason}");
             continue;
         }

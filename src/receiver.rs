@@ -450,6 +450,7 @@ pub(crate) fn draw(
     pipelines: Res<PipelineCache>,
     receivers: Res<ReceiverPipelines>,
     mut ctx: RenderContext,
+    mut last_phase_items: Local<HashMap<bevy::render::view::RetainedViewEntity, usize>>,
 ) {
     let entity = view.entity();
     let (camera, view, depth, identity) = view.into_inner();
@@ -459,9 +460,20 @@ pub(crate) fn draw(
     let Some(phase) = phases.get(&view.retained_view_entity) else {
         return;
     };
+    let item_count = phase.items.len();
+    if last_phase_items.insert(view.retained_view_entity, item_count) != Some(item_count) {
+        info!(
+            view = ?view.retained_view_entity,
+            receivers = item_count,
+            incomplete = receivers.incomplete_views.contains(&view.retained_view_entity),
+            identity_uniforms = world.contains_resource::<IdentityBindGroup>(),
+            "GI receiver raster phase"
+        );
+    }
     let pipelines_ready = !receivers
         .incomplete_views
         .contains(&view.retained_view_entity)
+        && !phase.items.is_empty()
         && phase
             .items
             .values()

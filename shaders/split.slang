@@ -176,30 +176,27 @@ void seed(uint3 thread : SV_DispatchThreadID) {
     uint2 full = fullPixel(thread.xy, params);
     float depth = depthTexture.Load(int3(full, 0));
     float3 normal = normalTexture.Load(int3(full, 0)).xyz * 2 - 1;
-    uint4 receiver = rasterReceiver.Load(int3(full, 0));
-    if (depth <= 0 || receiver.z == 0 || dot(normal, normal) < 0.01) return;
-    float2 encodedNormal = float2(float(receiver.z & 0x7fffu), float((receiver.z >> 15) & 0x7fffu))
-        / 32767.0;
-    float3 geometricNormal = decodeNormal(encodedNormal);
-    if (dot(geometricNormal, normal) < 0) geometricNormal = -geometricNormal;
+    if (depth <= 0 || dot(normal, normal) < 0.01) return;
+    normal = normalize(normal);
     float3 surfacePosition = worldPosition(float2(full) + 0.5, depth, params);
     float3 near = worldPosition(float2(full) + 0.5, 1, params);
     float distance = length(surfacePosition - near);
-    // Keep an unmatched raster sample isolated instead of borrowing another surface's cache.
-    uint fallbackOffset = hashKey(int4(int(params.frame.x),0,0,0),0x7fffffffu);
-    uint surfaceGroup = 0x80000000u | ((sample + fallbackOffset) % 0x7fffffffu);
-    if (distance > 0 && isfinite(distance)) {
-        Hit receiverHit = traceRay(near, (surfacePosition - near) / distance, distance + params.tuning.z);
-        if (receiverHit.triangle != EMPTY
-            && abs(receiverHit.distance - distance) <= max(params.tuning.z, distance * 0.00001)
-            && all(hitInstanceIdentity(receiverHit) == receiver.xy))
-            surfaceGroup = triangleSurfaceGroup(receiverHit.triangle);
-    }
+    if (!(distance > 0) || !isfinite(distance)) return;
+    // Reconstruct the visible receiver from the prepass ray itself. This keeps
+    // the entity and triangle identity in lockstep with the GI acceleration
+    // structure, without depending on a second material raster pass.
+    Hit receiverHit = traceRay(near, (surfacePosition - near) / distance, distance + params.tuning.z);
+    if (receiverHit.triangle == EMPTY
+        || abs(receiverHit.distance - distance) > max(params.tuning.z, distance * 0.00001)) return;
+    uint2 receiverIdentity = hitInstanceIdentity(receiverHit);
+    uint surfaceGroup = triangleSurfaceGroup(receiverHit.triangle);
+    float3 geometricNormal = hitAttributes(receiverHit).geometricNormal;
+    if (dot(geometricNormal, normal) < 0) geometricNormal = -geometricNormal;
     surfaceGroupOutput.Store(int2(thread.xy), surfaceGroup);
     float3 position = rayOffset(surfacePosition, geometricNormal, params.tuning.z);
     uint index = sample * CASCADES;
     Entry entry = (Entry)0;
-    entry.identity = receiver.xy;
+    entry.identity = receiverIdentity;
     entry.padding.y = surfaceGroup;
     entry.merged = float4(geometricNormal, 0); // receiver normal, consumed before trace deposit
     entry.key = cacheKey(position, 0, 0, params, false, surfaceKey(normal), uint(splitDistanceLod(position))); entry.samples = 1; entry.valid = 1;
@@ -295,12 +292,8 @@ uint currentCapacity() {
 void retain(uint3 thread : SV_DispatchThreadID) {
     if (thread.x >= params.size.w || params.history.z == 0 || params.history.x == 0 || params.history.w == 0) return;
     uint capacity = currentCapacity();
-    uint historyCapacity = 2 * params.size.w;
-    // Previous chains are canonical key/identity order from reduce. Fixed quotas keep
-    // overflow deterministic without a prefix-sum pass; hash skew can leave slots unused.
-    // shortcut: two slots per bucket waste capacity under hash skew; use prefix compaction when drops matter.
-    uint bucketQuota = historyCapacity / params.size.w + uint(thread.x < historyCapacity % params.size.w);
-    uint bucketBase = thread.x * (historyCapacity / params.size.w) + min(thread.x, historyCapacity % params.size.w);
+    uint bucketQuota = params.history.y > 0 ? 4 : 2;
+    uint bucketBase = thread.x * bucketQuota;
     uint bucketRetained = 0;
     uint bucketLoad = 0;
     [loop] for (uint index = previousHeads[thread.x]; index != EMPTY; index = previousEntries[index].next) {
@@ -515,10 +508,15 @@ void mergeEntry(uint index) {
 [numthreads(64, 1, 1)]
 void merge(uint3 thread : SV_DispatchThreadID) {
     uint index = thread.x * CASCADES + thread.y;
-    if (index >= currentCapacity() + 2 * params.size.w) return;
+    if (index >= currentCapacity() + (params.history.y > 0 ? 4 : 2) * params.size.w) return;
     Entry entry = entries[index];
     if (entry.valid != (params.frame.x | 0x80000000u)
         || params.frame.x - entry.lastSample > uint(params.history.w)) return;
+    // A retained interval already contains its composed lighting estimate.
+    // Refresh it when sampled again; rebuilding every old angular interval
+    // traced the same neighbor visibility repeatedly and dominated steady GI.
+    // Unknown intervals still merge so newly available parents can fill them.
+    if (entry.samples == 0 && entry.merged.w > 0) return;
     // One thread per canonical entry avoids serial ray traversals along a bucket.
     // Retained physical offsets need not agree with the key's cascade level.
     mergeEntry(index);
@@ -588,12 +586,18 @@ void gather(uint3 thread : SV_DispatchThreadID) {
     uint2 full = fullPixel(pixel, params);
     float depth = depthTexture.Load(int3(full, 0));
     float3 normal = normalTexture.Load(int3(full, 0)).xyz * 2.0 - 1.0;
-    if (depth <= 0.0 || dot(normal, normal) < 0.01) { irradiance.Store(int2(pixel), float4(0.0)); return; }
+    if (depth <= 0.0 || dot(normal, normal) < 0.01) {
+        irradiance.Store(int2(pixel), 0);
+        return;
+    }
     normal = normalize(normal);
-    uint receiver = (pixel.x + pixel.y * params.size.x) * CASCADES;
-    if (entries[receiver].samples == 0) { irradiance.Store(int2(pixel), 0); return; }
-    float3 position = entries[receiver].origin.xyz;
-    float3 result = diffuseGather(position, normal, false, false, entries[receiver].identity, entries[receiver].padding.y)
+    uint entry = (pixel.x + pixel.y * params.size.x) * CASCADES;
+    if (entries[entry].samples == 0) {
+        irradiance.Store(int2(pixel), 0);
+        return;
+    }
+    float3 position = entries[entry].origin.xyz;
+    float3 result = diffuseGather(position, normal, false, false, entries[entry].identity, entries[entry].padding.y)
                    + emissiveIrradiance(worldPosition(float2(full) + 0.5, depth, params), normal, params.lightCounts.z);
     irradiance.Store(int2(pixel), float4(result, depth));
 }
@@ -603,8 +607,9 @@ void gather(uint3 thread : SV_DispatchThreadID) {
 void commitCache(uint3 thread : SV_DispatchThreadID) {
     uint bucket = thread.x;
     if (bucket >= params.size.w) return;
-    uint capacity = 2 * params.size.w;
-    uint quota = capacity / params.size.w;
+    // Secondary transport needs its own retention capacity; otherwise primary
+    // and secondary angular histories evict one another in crowded buckets.
+    uint quota = params.history.y > 0 ? 4 : 2;
     uint base = bucket * quota;
     uint retained = 0;
     uint output = EMPTY;
@@ -612,12 +617,10 @@ void commitCache(uint3 thread : SV_DispatchThreadID) {
     [loop] while (source != EMPTY) {
         Entry entry = entries[source];
         uint next = entry.next;
-        // Unmatched receiver groups are transient; never persist their sample-local IDs.
-        if (params.history.w > 0
-            && (entry.padding.y & 0x80000000u) == 0
+        bool eligible = params.history.w > 0 && (entry.padding.y & 0x80000000u) == 0
             && entry.valid == (params.frame.x | 0x80000000u)
-            && params.frame.x - entry.lastSample <= uint(params.history.w)
-            && retained < quota) {
+            && params.frame.x - entry.lastSample <= uint(params.history.w);
+        if (eligible && retained < quota) {
             uint slot = base + retained++;
             entry.next = output;
             entry.padding.x = slot;
@@ -626,11 +629,7 @@ void commitCache(uint3 thread : SV_DispatchThreadID) {
             output = slot;
         } else {
             entries[source].padding.x = EMPTY;
-            if (params.history.w > 0
-                && (entry.padding.y & 0x80000000u) == 0
-                && entry.valid == (params.frame.x | 0x80000000u)
-                && params.frame.x - entry.lastSample <= uint(params.history.w))
-                heads[2 * params.size.w + 4].add(1);
+            if (eligible) heads[2 * params.size.w + 4].add(1);
         }
         source = next;
     }

@@ -187,6 +187,9 @@ pub struct RadianceCascadesPlugin {
     /// Scene and atlas transfer bytes per render frame. Default: 2 MiB; minimum
     /// one 16-byte word.
     pub geometry_upload_bytes_per_frame: usize,
+    /// Maximum number of GI compute pipelines to compile concurrently. Default: 2.
+    /// Higher values can increase driver memory use during pipeline creation.
+    pub max_concurrent_pipeline_compiles: usize,
 }
 
 impl Default for RadianceCascadesPlugin {
@@ -197,6 +200,7 @@ impl Default for RadianceCascadesPlugin {
             scene_gpu_budget_bytes: 256 * 1024 * 1024,
             view_gpu_budget_bytes: 2 * 1024 * 1024 * 1024,
             geometry_upload_bytes_per_frame: 2 * 1024 * 1024,
+            max_concurrent_pipeline_compiles: 2,
         }
     }
 }
@@ -239,7 +243,11 @@ impl Plugin for RadianceCascadesPlugin {
             PostUpdate,
             environment::update_environment_tables.after(bevy::asset::AssetEventSystems),
         );
-        render::install(app, self.compiler.clone());
+        render::install(
+            app,
+            self.compiler.clone(),
+            self.max_concurrent_pipeline_compiles,
+        );
     }
 }
 

@@ -11,7 +11,7 @@ categories = ["game-development", "graphics", "rendering"]
 [dependencies]
 bevy = { version = "0.20.0", default-features = false, features = ["3d_bevy_render", "bevy_log"] }
 bevy_slang = { version = "0.1.0", path = "../bevy_slang", features = ["spirv_passthrough"] }
-wgpu = { version = "30.0.1", default-features = false }
+wgpu = { version = "30.0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 bevy_texture_cache = { version = "0.1.0", path = "../bevy_texture_cache" }

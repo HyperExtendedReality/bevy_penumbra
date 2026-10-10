@@ -66,11 +66,14 @@ int2 irradianceOctTexel(int2 pixel) {
     else if (p.y > last) { p.y = last; p.x = last - p.x; }
     return p;
 }
+[ForceInline]
 float2 irradianceOctUv(int2 pixel) { return (float2(irradianceOctTexel(pixel)) + 0.5) / float(IRRADIANCE_SIDE); }
+[ForceInline]
 uint irradianceOctIndex(int2 pixel) {
     int2 texel = irradianceOctTexel(pixel);
     return uint(texel.x + texel.y * int(IRRADIANCE_SIDE));
 }
+[ForceInline]
 float luminance(float3 color) { return dot(color, float3(0.2126, 0.7152, 0.0722)); }
 float3 deferredBaseColor(uint4 packed) {
     float3 encoded = float3(packed.x & 255u, (packed.x >> 8) & 255u, (packed.x >> 16) & 255u) / 255.0;
@@ -102,12 +105,14 @@ float3 rayOffset(float3 position, float3 normal, float bias) {
         isfinite(shifted.y) ? shifted.y : position.y,
         isfinite(shifted.z) ? shifted.z : position.z);
 }
+[ForceInline]
 float2 encodeNormal(float3 n) {
     n /= abs(n.x) + abs(n.y) + abs(n.z);
     float2 p = n.xy;
     if (n.z < 0) p = (1 - abs(p.yx)) * float2(p.x >= 0 ? 1 : -1, p.y >= 0 ? 1 : -1);
     return p * 0.5 + 0.5;
 }
+[ForceInline]
 float3 decodeNormal(float2 p) {
     p = p * 2 - 1;
     float3 n = float3(p, 1 - abs(p.x) - abs(p.y));
@@ -116,27 +121,32 @@ float3 decodeNormal(float2 p) {
     return normalize(n);
 }
 
+[ForceInline]
 float3 decodeDirection(float2 uv) {
     float phi = uv.x * 2.0 * PI;
     float y = uv.y * 2.0 - 1.0;
     float r = sqrt(max(0.0, 1.0 - y * y));
     return float3(r * cos(phi), y, r * sin(phi));
 }
+[ForceInline]
 float2 encodeDirection(float3 direction) {
     return float2(frac(atan2(direction.z, direction.x) / (2.0 * PI) + 1.0),
                   saturate(direction.y * 0.5 + 0.5));
 }
+[ForceInline]
 uint directionIndex(float3 direction, uint level) {
     uint theta = BASE_THETA << level;
     uint2 xy = min(uint2(encodeDirection(direction) * float2(2 * theta, theta)),
                    uint2(2 * theta - 1, theta - 1));
     return xy.x + xy.y * 2 * theta;
 }
+[ForceInline]
 float3 binDirection(uint index, uint level) {
     uint theta = BASE_THETA << level;
     return decodeDirection((float2(index % (2 * theta), index / (2 * theta)) + 0.5)
                            / float2(2 * theta, theta));
 }
+[ForceInline]
 float2 r2(uint index) {
     // Fixed-point phase avoids float sequence quantization after long sessions.
     uint2 phase = index * uint2(3242174889u, 2447445414u);
@@ -148,26 +158,31 @@ float3 cosineDirection(float3 normal, float2 uv) {
     return tangent * (radius * cos(angle)) + cross(normal, tangent) * (radius * sin(angle))
            + normal * sqrt(1 - uv.x);
 }
+[ForceInline]
 float spacing(Parameters p, uint level, bool secondary = false, uint lod = 0) {
     return p.tuning.x * float(1u << (level + lod)) * (secondary ? 4.0 : 1.0);
 }
 // Opposing faces in a thin wall must not share hemisphere samples or feedback.
 // Six normal sectors split opposing faces; component IDs separately split disconnected islands.
+[ForceInline]
 uint surfaceKey(float3 normal) {
     float3 n = abs(normal);
     uint axis = n.x >= n.y && n.x >= n.z ? 0 : (n.y >= n.z ? 1 : 2);
     return (axis * 2 + (normal[axis] < 0 ? 1u : 0u)) << 15;
 }
+[ForceInline]
 int4 cacheKey(float3 position, uint direction, uint level, Parameters p, bool secondary = false, uint surface = 0, uint lod = 0) {
     return int4(int3(floor(position / spacing(p, level, secondary, lod))),
                 int(direction | (level << 12) | (secondary ? SECONDARY : 0) | surface | (lod << 18)));
 }
+[ForceInline]
 uint hashKey(int4 key, uint bucketCount) {
     uint4 k = uint4(key);
     uint h = k.x * 0x8da6b343u ^ k.y * 0xd8163841u ^ k.z * 0xcb1ab31fu ^ k.w * 0x165667b1u;
     h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
     return h & (bucketCount - 1);
 }
+[ForceInline]
 float3 worldPosition(float2 pixel, float depth, Parameters p) {
     float2 uv = (pixel - float2(p.viewport.xy)) / float2(p.viewport.zw);
     float4 h = mul(p.worldFromClip, float4(uv.x * 2 - 1, 1 - uv.y * 2, depth, 1));
@@ -183,6 +198,7 @@ float2 primaryRayCone(float2 pixel, float depth, float3 origin, float3 receiver,
     float receiverWidth = max(length(receiverX - receiver), length(receiverY - receiver));
     return float2(width, max(receiverWidth - width, 0) / max(length(receiver - origin), 1e-20));
 }
+[ForceInline]
 float3 previousWorldPosition(float2 pixel, float depth, Parameters p) {
     float2 uv = (pixel - float2(p.viewport.xy)) / float2(p.viewport.zw);
     float4 h = mul(p.previousWorldFromClip, float4(uv.x * 2 - 1, 1 - uv.y * 2, depth, 1));

@@ -80,7 +80,8 @@ const COMPUTE_ENTRIES: [&str; 18] = [
 const SLANG_OPTIMIZATION_LEVEL: u8 = 2;
 
 fn cache_head_bytes(buckets: u64) -> u64 {
-    // Bucket heads, retention count, irradiance heads, then four diagnostics.
+    // Bucket heads, retention count, irradiance heads, four diagnostics and
+    // the compact persistent-entry allocator.
     (buckets * 2 + 5) * 4
 }
 
@@ -89,11 +90,11 @@ fn cache_work_slots(samples: u64, layers: u64) -> u64 {
 }
 
 fn cache_entry_bytes(samples: u64, layers: u64, buckets: u64) -> u64 {
-    (cache_work_slots(samples, layers) + buckets * CACHE_HISTORY_PER_BUCKET) * ENTRY_SIZE
+    (cache_work_slots(samples, layers) + buckets * CACHE_HISTORY_PER_BUCKET * layers) * ENTRY_SIZE
 }
 
-fn cache_history_bytes(buckets: u64) -> u64 {
-    buckets * CACHE_HISTORY_PER_BUCKET * ENTRY_SIZE
+fn cache_history_bytes(buckets: u64, layers: u64) -> u64 {
+    buckets * CACHE_HISTORY_PER_BUCKET * layers * ENTRY_SIZE
 }
 
 fn view_budget_max_rays(viewport: UVec2, settings: RadianceCascades, budget: u64) -> u32 {
@@ -124,7 +125,7 @@ fn view_fits_device(size: UVec2, settings: RadianceCascades, limits: &WgpuLimits
         && u64::from(size.y.div_ceil(8)) <= workgroups
         && buckets.div_ceil(64) <= workgroups
         && cache_entry_bytes(pixels, layers, buckets) <= binding_limit
-        && cache_history_bytes(buckets) <= binding_limit
+        && cache_history_bytes(buckets, layers) <= binding_limit
         && cache_head_bytes(buckets) <= binding_limit
         && buckets * PROBE_SIZE * 2 <= binding_limit
 }
@@ -584,6 +585,7 @@ struct Pipelines {
     native_jobs: Vec<Task<(usize, Result<ComputePipeline, String>, std::time::Duration)>>,
     native_cache: Option<wgpu::PipelineCache>,
     native_cache_path: Option<std::path::PathBuf>,
+    native_vulkan: bool,
     timing: ComputePipelineTiming,
     composite: CachedRenderPipelineId,
     refit: CachedComputePipelineId,
@@ -610,7 +612,7 @@ fn spirv_workgroup(bytes: &[u8]) -> Result<(Vec<u32>, (u32, u32, u32)), String> 
     if bytes.len() < 20 || bytes.len() % 4 != 0 {
         return Err("invalid SPIR-V byte length".into());
     }
-    let words: Vec<u32> = bytes
+    let mut words: Vec<u32> = bytes
         .chunks_exact(4)
         .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
         .collect();
@@ -618,31 +620,63 @@ fn spirv_workgroup(bytes: &[u8]) -> Result<(Vec<u32>, (u32, u32, u32)), String> 
         return Err("invalid SPIR-V magic".into());
     }
     let mut offset = 5;
+    let mut workgroup_size = None;
     while offset < words.len() {
         let count = (words[offset] >> 16) as usize;
         if count == 0 || offset + count > words.len() {
             return Err("invalid SPIR-V instruction".into());
         }
         // OpExecutionMode, LocalSize. Each cached module has one compute entry.
-        if words[offset] & 0xffff == 16 && count == 6 && words[offset + 2] == 17 {
-            let size = (words[offset + 3], words[offset + 4], words[offset + 5]);
-            return Ok((words, size));
+        let opcode = words[offset] & 0xffff;
+        if opcode == 54 && count >= 5 {
+            // Slang ForceInline folds hot arithmetic helpers before emission.
+            // Preserve the remaining traversal call graph for bounded cold compilation.
+            words[offset + 3] = (words[offset + 3] & !1) | 2;
+        }
+        if opcode == 16 && count == 6 && words[offset + 2] == 17 {
+            workgroup_size = Some((words[offset + 3], words[offset + 4], words[offset + 5]));
         }
         offset += count;
     }
-    Err("SPIR-V compute entry has no static LocalSize".into())
+    workgroup_size
+        .map(|size| (words, size))
+        .ok_or_else(|| "SPIR-V compute entry has no static LocalSize".into())
 }
 
-async fn native_compute_pipeline(
+fn relocate_native_compute_shader(shader: &mut Shader, vulkan: bool) -> Result<(), String> {
+    if !vulkan {
+        return Ok(());
+    }
+    // Vulkan packs sparse logical bindings densely. Passthrough bypasses
+    // Naga's relocation, so apply the layout's physical map ourselves.
+    let mappings: Vec<_> = compute_layout()
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(physical, entry)| bevy_slang::SpirvBindingRemap {
+            group: 0,
+            binding: entry.binding,
+            mapped_binding: physical as u32,
+        })
+        .collect();
+    bevy_slang::remap_spirv_bindings(shader, &mappings).map_err(|error| error.to_string())
+}
+
+fn native_compute_pipeline(
     device: RenderDevice,
     layouts: [BindGroupLayout; 2],
     bytes: Arc<Vec<u8>>,
     entry: &'static str,
     pipeline_cache: Option<wgpu::PipelineCache>,
+    vulkan: bool,
 ) -> Result<ComputePipeline, String> {
-    let (words, workgroup_size) = spirv_workgroup(&bytes)?;
+    let mut shader = Shader::from_spirv(bytes.as_ref().clone(), entry);
+    relocate_native_compute_shader(&mut shader, vulkan)?;
+    let bevy::shader::Source::SpirV(bytes) = &shader.source else {
+        unreachable!()
+    };
+    let (words, workgroup_size) = spirv_workgroup(bytes)?;
     let device = device.wgpu_device();
-    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     // Only our bundled, Slang-compiled sources enter this path. Their explicit
     // layouts match the bindings below; arbitrary user shaders remain WGSL.
     let module = unsafe {
@@ -669,10 +703,89 @@ async fn native_compute_pipeline(
         compilation_options: default(),
         cache: pipeline_cache.as_ref(),
     });
-    if let Some(error) = scope.pop().await {
-        return Err(error.to_string());
-    }
     Ok(pipeline.into())
+}
+
+#[cfg(test)]
+#[test]
+fn native_compute_binding_relocation_respects_backend() {
+    // Receiver-history storage (23) and G-buffer sampling (27) must stay
+    // distinct after Vulkan packs the sparse layout. Set 1 is already dense.
+    let words = [
+        0x0723_0203u32,
+        0x0001_0500,
+        0,
+        4,
+        0,
+        (4 << 16) | 71,
+        1,
+        34,
+        0,
+        (4 << 16) | 71,
+        1,
+        33,
+        23,
+        (4 << 16) | 71,
+        2,
+        34,
+        0,
+        (4 << 16) | 71,
+        2,
+        33,
+        27,
+        (4 << 16) | 71,
+        3,
+        34,
+        1,
+        (4 << 16) | 71,
+        3,
+        33,
+        2,
+    ];
+    let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let mut shader = Shader::from_spirv(bytes.clone(), "relocation_test");
+    relocate_native_compute_shader(&mut shader, false).unwrap();
+    assert!(matches!(&shader.source, bevy::shader::Source::SpirV(data) if data.as_ref() == bytes));
+    relocate_native_compute_shader(&mut shader, true).unwrap();
+    let bevy::shader::Source::SpirV(data) = &shader.source else {
+        unreachable!()
+    };
+    let patched: Vec<_> = data
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect();
+    assert_eq!(patched[12], 20);
+    assert_eq!(patched[20], 23);
+    assert_eq!(patched[28], 2);
+}
+
+#[cfg(test)]
+#[test]
+fn spirv_workgroup_preserves_helper_calls_for_driver_compilation() {
+    // Header, OpExecutionMode LocalSize, OpFunction, OpFunctionEnd.
+    let words: [u32; 17] = [
+        0x0723_0203,
+        0x0001_0500,
+        0,
+        4,
+        0,
+        (6 << 16) | 16,
+        7,
+        17,
+        8,
+        8,
+        1,
+        (5 << 16) | 54,
+        1,
+        7,
+        0,
+        2,
+        (1 << 16) | 56,
+    ];
+    let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let (patched, size) = spirv_workgroup(&bytes).unwrap();
+    assert_eq!(patched[14], 2);
+    assert_eq!(size, (8, 8, 1));
 }
 
 #[derive(Default)]
@@ -685,6 +798,7 @@ struct ComputePipelineTiming {
 #[derive(Resource)]
 struct PipelineShaders {
     handles: Vec<Handle<Shader>>,
+    max_concurrent: usize,
     loaded: Arc<AtomicU64>,
     backend: Arc<AtomicU32>,
     native: NativeShaderBytes,
@@ -1047,7 +1161,11 @@ fn cleanup_view_allocations(
     }
 }
 
-pub(crate) fn install(app: &mut App, compiler: SlangCompiler) {
+pub(crate) fn install(
+    app: &mut App,
+    compiler: SlangCompiler,
+    max_concurrent_pipeline_compiles: usize,
+) {
     if app.get_sub_app(RenderApp).is_none() {
         return;
     }
@@ -1080,6 +1198,7 @@ pub(crate) fn install(app: &mut App, compiler: SlangCompiler) {
     app.sub_app_mut(RenderApp)
         .insert_resource(PipelineShaders {
             handles,
+            max_concurrent: max_concurrent_pipeline_compiles.max(1),
             loaded,
             backend,
             native,
@@ -1258,7 +1377,9 @@ fn init_pipelines(
             ),
         ),
     );
-    composite_layout.entries.retain(|entry| entry.binding != 6);
+    composite_layout
+        .entries
+        .retain(|entry| !matches!(entry.binding, 1 | 6));
     let composite = cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("split_rc_composite".into()),
         layout: vec![composite_layout.clone()],
@@ -1272,7 +1393,18 @@ fn init_pipelines(
             entry_point: Some("fragment".into()),
             targets: vec![Some(ColorTargetState {
                 format: TextureFormat::Rgba16Float,
-                blend: None,
+                blend: Some(BlendState {
+                    color: BlendComponent {
+                        src_factor: BlendFactor::One,
+                        dst_factor: BlendFactor::One,
+                        operation: BlendOperation::Add,
+                    },
+                    alpha: BlendComponent {
+                        src_factor: BlendFactor::Zero,
+                        dst_factor: BlendFactor::One,
+                        operation: BlendOperation::Add,
+                    },
+                }),
                 write_mask: ColorWrites::ALL,
             })],
             ..default()
@@ -1296,6 +1428,7 @@ fn init_pipelines(
         native_jobs: Vec::new(),
         native_cache,
         native_cache_path,
+        native_vulkan: adapter.backend == wgpu::Backend::Vulkan,
         timing: default(),
         composite,
         refit,
@@ -2819,7 +2952,7 @@ struct ViewBindings {
     surface_groups: [BindGroup; 2],
     denoise: [BindGroup; LEVELS],
     temporal: BindGroup,
-    composite: [(TextureViewId, BindGroup); 2],
+    composite: BindGroup,
     frame: RenderedFrame,
 }
 
@@ -2872,7 +3005,7 @@ fn view_bytes(size: UVec2, settings: RadianceCascades) -> u64 {
         + buckets * PROBE_SIZE * 2
         + cache_head_bytes(buckets) * 2
         + cache_entry_bytes(pixels, layers, buckets)
-        + cache_history_bytes(buckets)
+        + cache_history_bytes(buckets, layers)
 }
 
 impl ViewBuffers {
@@ -2997,7 +3130,7 @@ impl ViewBuffers {
         });
         let history_entries = device.create_buffer(&BufferDescriptor {
             label: Some("split_rc_interval_history"),
-            size: cache_history_bytes(u64::from(buckets)),
+            size: cache_history_bytes(u64::from(buckets), u64::from(ray_layers)),
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -3150,6 +3283,8 @@ fn prepare(
             Option<&crate::receiver::ReceiverTexture>,
             Option<&bevy::pbr::ScreenSpaceAmbientOcclusionResources>,
             Option<&bevy::pbr::SsaoPipelineId>,
+            Option<&bevy::render::camera::TemporalJitter>,
+            Option<&bevy::camera::MainPassResolutionOverride>,
             Option<&mut ViewBuffers>,
         )>,
     )>,
@@ -3271,8 +3406,9 @@ fn prepare(
             }
         }
     }
-    // Keep two device pipeline creations in flight; larger batches compete
-    // with Bevy's frame rendering on the same async compute pool.
+    // Larger batches can compete with Bevy's frame rendering and consume
+    // substantial driver memory, especially for traversal kernels.
+    let max_concurrent = shaders.max_concurrent.max(1);
     let mut compiling = pipelines
         .compute
         .iter()
@@ -3294,7 +3430,7 @@ fn prepare(
         .chain((0..COMPUTE_ENTRIES.len()).filter(|i| !matches!(i, 7 | 12 | 15)))
     {
         let entry = &COMPUTE_ENTRIES[i];
-        if compiling >= 2 {
+        if compiling >= max_concurrent {
             break;
         }
         if required & (1 << i) != 0
@@ -3317,6 +3453,7 @@ fn prepare(
                 ];
                 let entry = *entry;
                 let pipeline_cache = pipelines.native_cache.clone();
+                let vulkan = pipelines.native_vulkan;
                 pipelines.native_started |= 1 << i;
                 info!(entry, "GI native compute pipeline creation started");
                 pipelines
@@ -3327,13 +3464,30 @@ fn prepare(
                         // pipeline-cache tasks on the async pool.
                         std::thread::spawn(move || {
                             let start = std::time::Instant::now();
-                            let result = block_on(native_compute_pipeline(
-                                device, layouts, bytes, entry, pipeline_cache,
-                            ));
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    native_compute_pipeline(
+                                        device,
+                                        layouts,
+                                        bytes,
+                                        entry,
+                                        pipeline_cache,
+                                        vulkan,
+                                    )
+                                }))
+                                .unwrap_or_else(|_| {
+                                    Err("wgpu rejected the native compute pipeline".into())
+                                });
                             (i, result, start.elapsed())
-                        }).join().unwrap_or_else(|_| (
-                            i, Err("native pipeline worker panicked".into()), std::time::Duration::ZERO,
-                        ))
+                        })
+                        .join()
+                        .unwrap_or_else(|_| {
+                            (
+                                i,
+                                Err("native pipeline worker panicked".into()),
+                                std::time::Duration::ZERO,
+                            )
+                        })
                     }));
                 compiling += 1;
                 continue;
@@ -4394,6 +4548,8 @@ fn prepare(
         receiver,
         ssao,
         ssao_pipeline,
+        temporal_jitter,
+        resolution_override,
         existing,
     ) in &mut views
     {
@@ -4699,9 +4855,22 @@ fn prepare(
         let previous_irradiance = &buffers.irradiance_views[(frame.wrapping_add(1) % 2) as usize];
         let metadata = &buffers.metadata_views[(frame % 2) as usize];
         let previous_metadata = &buffers.metadata_views[(frame.wrapping_add(1) % 2) as usize];
-        let clip_from_world = view.clip_from_world.unwrap_or_else(|| {
-            view.clip_from_view * Mat4::from(view.world_from_view.affine().inverse())
-        });
+        // Match Bevy's raster projection, including TAA's subpixel jitter.
+        // Reconstructing jittered depth with the unjittered projection shifts
+        // software receivers and rejects otherwise valid temporal history.
+        let view_from_world = Mat4::from(view.world_from_view.affine().inverse());
+        let clip_from_world = if let Some(jitter) = temporal_jitter {
+            let mut projection = view.clip_from_view;
+            let viewport_size = resolution_override
+                .map_or(view.viewport.zw().as_vec2(), |resolution| {
+                    resolution.0.as_vec2()
+                });
+            jitter.jitter_projection(&mut projection, viewport_size);
+            projection * view_from_world
+        } else {
+            view.clip_from_world
+                .unwrap_or(view.clip_from_view * view_from_world)
+        };
         let params = Parameters {
             world_from_clip: clip_from_world.inverse(),
             previous_clip_from_world: rendered.clip_from_world,
@@ -4911,34 +5080,28 @@ fn prepare(
         } else {
             &buffers.irradiance_views[2 + (settings.spatial_filter_steps as usize - 1) % 2]
         };
-        let composite =
-            [target.main_texture_view(), target.main_texture_other_view()].map(|source| {
-                (
-                    source.id(),
-                    device.create_bind_group(
-                        "split_rc_composite",
-                        &cache.get_bind_group_layout(&pipelines.composite_layout),
-                        &BindGroupEntries::sequential((
-                            &uniforms[0],
-                            source,
-                            display,
-                            depth,
-                            normal,
-                            gbuffer,
-                            display,
-                            &receiver.view,
-                            ssao.map_or(fallback_view, |ssao| {
-                                &ssao.screen_space_ambient_occlusion_texture.default_view
-                            }),
-                            &buffers.surface_group_views[((frame + 1) & 1) as usize],
-                        ))
-                        .iter()
-                        .filter(|entry| entry.binding != 6)
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    ),
-                )
-            });
+        let composite = device.create_bind_group(
+            "split_rc_composite",
+            &cache.get_bind_group_layout(&pipelines.composite_layout),
+            &BindGroupEntries::sequential((
+                &uniforms[0],
+                display,
+                display,
+                depth,
+                normal,
+                gbuffer,
+                display,
+                &receiver.view,
+                ssao.map_or(fallback_view, |ssao| {
+                    &ssao.screen_space_ambient_occlusion_texture.default_view
+                }),
+                &buffers.surface_group_views[((frame + 1) & 1) as usize],
+            ))
+            .iter()
+            .filter(|entry| !matches!(entry.binding, 1 | 6))
+            .cloned()
+            .collect::<Vec<_>>(),
+        );
         let required = required_pipelines(settings);
         let pipelines_ready = (0..COMPUTE_ENTRIES.len())
             .all(|i| required & (1 << i) == 0 || pipelines.pipeline(i, &cache).is_some())
@@ -5273,10 +5436,11 @@ fn render(
         bucket_groups,
         1,
     );
-    let entry_count = cache_work_slots(
-        u64::from(buffers.size.x) * u64::from(buffers.size.y),
-        u64::from(buffers.ray_layers),
-    ) + 2 * u64::from(buffers.buckets);
+    let entry_count =
+        cache_work_slots(
+            u64::from(buffers.size.x) * u64::from(buffers.size.y),
+            u64::from(buffers.ray_layers),
+        ) + CACHE_HISTORY_PER_BUCKET * u64::from(buffers.ray_layers) * u64::from(buffers.buckets);
     for level in (0..LEVELS).rev() {
         dispatch(
             "merge",
@@ -5394,19 +5558,14 @@ fn render(
         span.end(context.command_encoder());
     }
 
-    let post = target.post_process_write();
-    let group = if bindings.composite[0].0 == post.source.id() {
-        &bindings.composite[0].1
-    } else {
-        &bindings.composite[1].1
-    };
+    // Add diffuse light to the current HDR attachment without swapping the view target.
     let composition_span = diagnostics.time_span(context.command_encoder(), "composition");
     let mut pass = context
         .command_encoder()
         .begin_render_pass(&RenderPassDescriptor {
             label: Some("split_rc_composite"),
             color_attachments: &[Some(RenderPassColorAttachment {
-                view: post.destination,
+                view: target.main_texture_view(),
                 depth_slice: None,
                 resolve_target: None,
                 ops: Operations {
@@ -5417,7 +5576,7 @@ fn render(
             ..default()
         });
     pass.set_pipeline(composite);
-    pass.set_bind_group(0, group, &[]);
+    pass.set_bind_group(0, &bindings.composite, &[]);
     pass.draw(0..3, 0..1);
     drop(pass);
     composition_span.end(context.command_encoder());
@@ -5881,7 +6040,7 @@ mod tests {
                     ),
                 ],
                 &SlangSettings {
-                    target: SlangTarget::SpirV,
+                    target: SlangTarget::Wgsl,
                     entry_points: vec!["checkIrradianceOctPad".into()],
                     optimization: Some(2),
                     ..default()
@@ -6029,7 +6188,7 @@ mod tests {
         let remap = make_pipeline("remapProbeHeads");
         let lookup = make_pipeline("checkProbeLookup");
         let work_bytes = cache_entry_bytes(1, 1, u64::from(BUCKETS));
-        let history_bytes = cache_history_bytes(u64::from(BUCKETS));
+        let history_bytes = cache_history_bytes(u64::from(BUCKETS), 1);
         let heads_bytes = cache_head_bytes(u64::from(BUCKETS));
         let heads = device.create_buffer(&BufferDescriptor {
             label: Some("split_commit_heads"),
@@ -6153,7 +6312,7 @@ mod tests {
         for (pipeline, group) in [(&commit, &commit_group), (&remap, &remap_group)] {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, group, &[]);
+            pass.set_bind_group(0, &bindings.composite, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&heads, 0, &probe_heads, 0, heads_bytes);
@@ -6309,7 +6468,7 @@ mod tests {
         );
         assert_eq!(
             cache_entry_bytes(samples, 2, buckets),
-            (cache_work_slots(samples, 2) + 2 * buckets) * ENTRY_SIZE
+            (cache_work_slots(samples, 2) + 4 * buckets) * ENTRY_SIZE
         );
         assert_eq!(
             view_bytes(UVec2::new(samples as u32, 1), settings),
@@ -6320,7 +6479,7 @@ mod tests {
                 + buckets * PROBE_SIZE * 2
                 + cache_head_bytes(buckets) * 2
                 + entries
-                + cache_history_bytes(buckets)
+                + cache_history_bytes(buckets, 1)
         );
     }
 
@@ -6560,7 +6719,11 @@ mod tests {
                 let (_, probe) = module
                     .types
                     .iter()
-                    .find(|(_, ty)| ty.name.as_deref().is_some_and(|name| name.starts_with("IrradianceProbe")))
+                    .find(|(_, ty)| {
+                        ty.name
+                            .as_deref()
+                            .is_some_and(|name| name.starts_with("IrradianceProbe"))
+                    })
                     .expect("split irradiance probe type");
                 let naga::TypeInner::Struct { span, .. } = &probe.inner else {
                     panic!("irradiance probe must be a structure");

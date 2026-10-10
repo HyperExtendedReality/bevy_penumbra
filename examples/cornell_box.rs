@@ -79,7 +79,7 @@ fn main() -> AppExit {
         number(&args, "--width=", if benchmark { 1920 } else { 640 }),
         number(&args, "--height=", if benchmark { 1080 } else { 480 }),
     );
-    let requested_divisor = number(&args, "--resolution-divisor=", 2).clamp(1, 64);
+    let requested_divisor = number(&args, "--resolution-divisor=", 6).clamp(1, 64);
     let requested_max_rays = number(&args, "--max-rays=", 131_072);
     // Keep raw capture's exact-size copy grid within WGPU's guaranteed storage binding limits.
     let max_rays = requested_max_rays.min(if raw_capture { 32_768 } else { 131_072 });
@@ -245,6 +245,11 @@ fn setup(
             Vec3::new(0.0, 2.0, -3.05),
             white.clone(),
         ),
+        (
+            Vec3::new(6.0, 0.1, 6.0),
+            Vec3::new(0.0, 4.05, 0.0),
+            white.clone(),
+        ),
         (Vec3::new(0.1, 4.0, 6.0), Vec3::new(-3.05, 2.0, 0.0), red),
         (Vec3::new(0.1, 4.0, 6.0), Vec3::new(3.05, 2.0, 0.0), green),
         (
@@ -253,13 +258,27 @@ fn setup(
             emitter,
         ),
     ] {
+        let ceiling_emitter = size.y < 0.1 && position.y > 3.9;
+        let mesh = if ceiling_emitter {
+            meshes.add(Rectangle::new(size.x, size.z))
+        } else {
+            meshes.add(Cuboid::from_size(size))
+        };
+        let transform = if ceiling_emitter {
+            // Emit into the room only. A glowing box also emits upward across
+            // the tiny ceiling gap, producing noisy near-contact light samples.
+            Transform::from_translation(position)
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+        } else {
+            Transform::from_translation(position)
+        };
         let mut entity = commands.spawn((
-            Mesh3d(meshes.add(Cuboid::from_size(size))),
+            Mesh3d(mesh),
             MeshMaterial3d(material),
-            Transform::from_translation(position),
+            transform,
             RadianceCascadesGeometry,
         ));
-        if size.y < 0.1 && position.y > 3.9 {
+        if ceiling_emitter {
             entity.insert(LightMover);
         }
     }
@@ -275,18 +294,6 @@ fn setup(
         ));
     }
 
-    // Keep the room visible while the async split GI pipelines initialize.
-    // The emissive panel above remains the indirect-light source for cascades.
-    commands.spawn((
-        PointLight {
-            intensity: 2_400.0,
-            range: 8.0,
-            ..default()
-        },
-        Transform::from_xyz(0.0, 3.85, -0.8),
-        LightMover,
-    ));
-
     let mut camera = commands.spawn((
         Camera3d::default(),
         ShadowLodOrigin,
@@ -299,9 +306,14 @@ fn setup(
         Tonemapping::Linear,
         RadianceCascades {
             intensity: 1.0,
+            temporal_blend: 0.98,
+            history_frames: 64,
+            // Accumulate panel samples over time rather than tracing 32 shadow
+            // rays per hit every frame. Geometry-aware filtering handles upscaling.
+            emissive_samples: 8,
             resolution_divisor: capture
                 .as_ref()
-                .map_or(2, |capture| capture.resolution_divisor),
+                .map_or(6, |capture| capture.resolution_divisor),
             max_rays: capture.as_ref().map_or(131_072, |capture| capture.max_rays),
             bounce_feedback: 0.0,
             ..default()
@@ -417,6 +429,14 @@ fn benchmark_frame(
         return;
     }
     info!("{report}");
+    for diagnostic in diagnostics
+        .iter()
+        .filter(|d| d.path().as_str().ends_with("elapsed_gpu"))
+    {
+        if let Some(value) = diagnostic.value() {
+            info!(path = %diagnostic.path(), gpu_ms = value, "Cornell GPU stage");
+        }
+    }
     benchmark.repetition += 1;
     if benchmark.repetition >= benchmark.repetitions {
         exit.write(AppExit::Success);

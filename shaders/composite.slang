@@ -1,7 +1,7 @@
 #include "common.slang"
+#include "receiver_metadata.slang"
 
 [[vk::binding(0, 0)]] ConstantBuffer<Parameters> params;
-[[vk::binding(1, 0)]] Texture2D<float4> sourceTexture;
 [[vk::binding(2, 0)]] Texture2D<float4> irradiance;
 [[vk::binding(3, 0)]] DepthTexture2D depthTexture;
 [[vk::binding(4, 0)]] Texture2D<float4> normalTexture;
@@ -22,17 +22,15 @@ VertexOutput vertex(uint index : SV_VertexID) {
 [shader("fragment")]
 float4 fragment(VertexOutput input) : SV_Target {
     uint2 pixel = uint2(input.position.xy);
-    float4 source = sourceTexture.Load(int3(pixel, 0));
-    // Copy the complete source when flipping Bevy's ping-pong target, including
-    // pixels outside this camera's viewport (split-screen/shared render targets).
+    float4 source = float4(0);
+    // Contribute zero outside this camera's viewport on shared render targets.
     if (any(pixel < params.viewport.xy) || any(pixel >= params.viewport.xy + params.viewport.zw)) return source;
     float depth = depthTexture.Load(int3(pixel, 0));
-    uint4 receiver = receiverIdentity.Load(int3(pixel,0));
     uint4 deferred = gbuffer.Load(int3(pixel, 0));
-    if (depth <= 0.0 || receiver.z == 0) return source;
+    if (depth <= 0.0) return source;
     if (((deferred.x & 0xffffffu) == 0 || ((deferred.z >> 8) & 255u) == 255u)) return source;
-    float3 normal = normalize(normalTexture.Load(int3(pixel, 0)).xyz * 2.0 - 1.0);
-    float3 shadingNormal = deferredShadingNormal(deferred);
+    float3 normal = receiverGeometricNormal(receiverIdentity.Load(int3(pixel,0)).z,
+        normalize(normalTexture.Load(int3(pixel, 0)).xyz * 2.0 - 1.0));
     float3 position = worldPosition(input.position.xy, depth, params);
     float2 grid = irradianceGrid(input.position.xy, params);
     int2 base = int2(floor(grid)); float2 fraction = frac(grid);
@@ -44,10 +42,9 @@ float4 fragment(VertexOutput input) : SV_Target {
         float4 value = irradiance.Load(int3(low, 0));
         if (value.w <= 0.0) continue;
         uint2 full = fullPixel(uint2(low), params);
-        uint4 otherReceiver = receiverIdentity.Load(int3(full,0));
-        if (otherReceiver.z == 0 || any(otherReceiver.xy != receiver.xy)) continue;
         float3 other = worldPosition(float2(full) + 0.5, value.w, params);
-        float3 otherNormal = normalize(normalTexture.Load(int3(full, 0)).xyz * 2.0 - 1.0);
+        float3 otherNormal = receiverGeometricNormal(receiverIdentity.Load(int3(full,0)).z,
+            normalize(normalTexture.Load(int3(full, 0)).xyz * 2.0 - 1.0));
         if (dot(normal, otherNormal) < 0.95 || abs(dot(position - other, normal)) > surfaceTolerance(params)) continue;
         float distance = dot(position - other, position - other);
         if (distance < nearestSurface) {
@@ -62,10 +59,9 @@ float4 fragment(VertexOutput input) : SV_Target {
         if (value.w <= 0.0) continue;
         uint2 full = fullPixel(uint2(low), params);
         if (params.layers.w != 0 && surfaceGroups.Load(int3(low,0)) != selectedSurfaceGroup) continue;
-        uint4 otherReceiver = receiverIdentity.Load(int3(full,0));
-        if (otherReceiver.z == 0 || any(otherReceiver.xy != receiver.xy)) continue;
         float3 other = worldPosition(float2(full) + 0.5, value.w, params);
-        float3 otherNormal = normalize(normalTexture.Load(int3(full, 0)).xyz * 2.0 - 1.0);
+        float3 otherNormal = receiverGeometricNormal(receiverIdentity.Load(int3(full,0)).z,
+            normalize(normalTexture.Load(int3(full, 0)).xyz * 2.0 - 1.0));
         if (dot(normal, otherNormal) < 0.95 || abs(dot(position - other, normal)) > surfaceTolerance(params)) continue;
         float2 weights = lerp(1.0 - fraction, fraction, float2(bit));
         float weight = weights.x * weights.y * pow(max(0.0, dot(normal, otherNormal)), 16.0)
@@ -91,5 +87,5 @@ float4 fragment(VertexOutput input) : SV_Target {
     float3 gi = total > 0.00001 ? sum / total : float3(0.0);
     gi *= albedo;
     gi *= diffuseOcclusion;
-    return float4(source.xyz + gi * params.tuning.w * params.environment.w, source.w);
+    return float4(gi * params.tuning.w * params.environment.w, 0);
 }

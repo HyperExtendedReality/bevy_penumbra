@@ -140,11 +140,15 @@ float3 outgoingRadiance(float3 origin, float3 direction, Hit hit) {
     return max(0.0, triangle.albedo.xyz * diffuse);
 }
 
-float4 splitRasterMetadata(uint2 full) {
-    uint4 raster = rasterReceiver.Load(int3(full,0));
+float4 splitRasterMetadata(uint2 full, uint sample) {
+    uint2 identity = entries[sample * CASCADES].identity;
     uint4 material = gbuffer.Load(int3(full,0));
-    return float4(asfloat(raster.xy),receiverPackedNormal(deferredShadingNormal(material)),
-                  receiverPackedHistory(deferredPerceptualRoughness(material),raster.z != 0 ? 1u : 0u));
+    uint4 raster = rasterReceiver.Load(int3(full,0));
+    float3 geometricNormal = all(raster.xy == identity)
+        ? receiverGeometricNormal(raster.z, deferredShadingNormal(material))
+        : deferredShadingNormal(material);
+    return float4(asfloat(identity),receiverPackedNormal(geometricNormal),
+                  receiverPackedHistory(deferredPerceptualRoughness(material),1u));
 }
 bool splitReceiverCompatible(float4 a, float4 b) {
     return receiverSame(a,b) && dot(receiverNormal(a),receiverNormal(b)) > 0.97 &&
@@ -158,14 +162,15 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
     float4 center = currentIrradiance.Load(int3(pixel, 0));
     uint2 full = fullPixel(thread.xy, params);
     uint surfaceGroup = surfaceGroups.Load(int3(pixel,0));
-    float4 receiver = splitRasterMetadata(full);
+    uint sample = uint(pixel.x + pixel.y * params.size.x);
+    float4 receiver = splitRasterMetadata(full,sample);
     if (center.w <= 0 || receiverHistoryLength(receiver) == 0) {
         irradiance.Store(pixel, 0); historyMetadata.Store(pixel, 0); receiverHistory.Store(pixel,0); return;
     }
     receiverHistory.Store(pixel,receiver);
-    float3 normal = normalize(normalTexture.Load(int3(full, 0)).xyz * 2 - 1);
+    float3 normal = receiverNormal(receiver);
     float3 position = worldPosition(float2(full) + 0.5, center.w, params);
-    float3 mean = 0, square = 0, maximum = center.xyz;
+    float3 mean = 0, square = 0;
     float count = 0;
     [loop] for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
         int2 neighbor = pixel + int2(x, y);
@@ -173,13 +178,13 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
         float4 value = currentIrradiance.Load(int3(neighbor, 0));
         if (value.w <= 0) continue;
         uint2 otherFull = fullPixel(uint2(neighbor), params);
-        if (!splitReceiverCompatible(receiver,splitRasterMetadata(otherFull)) ||
+        uint otherSample = uint(neighbor.x + neighbor.y * int(params.size.x));
+        if (!splitReceiverCompatible(receiver,splitRasterMetadata(otherFull,otherSample)) ||
             surfaceGroups.Load(int3(neighbor,0)) != surfaceGroup) continue;
-        float3 otherNormal = normalize(normalTexture.Load(int3(otherFull, 0)).xyz * 2 - 1);
+        float3 otherNormal = receiverNormal(splitRasterMetadata(otherFull,otherSample));
         float3 otherPosition = worldPosition(float2(otherFull) + 0.5, value.w, params);
         if (dot(normal, otherNormal) < 0.95 || abs(dot(otherPosition - position, normal)) > surfaceTolerance(params)) continue;
         mean += value.xyz; square += value.xyz * value.xyz; count += 1;
-        maximum = max(maximum, value.xyz);
     }
     mean /= max(count, 1); square /= max(count, 1);
     float3 variance = max(0.0, square - mean * mean);
@@ -216,8 +221,10 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
                     surfaceGroups.Load(int3(pixel,0)) != surfaceGroup ||
                     previousSurfaceGroups.Load(int3(oldPixel,0)) != surfaceGroup) continue;
                 if (hasMotion) {
-                    // Native prepass includes rigid and deformed previous positions.
-                    float expected = asfloat(rasterReceiver.Load(int3(full,0)).w);
+                    // Compare depths in the same camera space. Current depth
+                    // changes when the camera moves even on a static surface.
+                    float4 previousClip = mul(params.previousClipFromWorld, float4(position, 1));
+                    float expected = previousClip.z / previousClip.w;
                     if (!isfinite(expected) || expected <= 0) continue;
                     float tolerance = max(0.000002,abs(expected)*0.0001);
                     [loop] for (uint axis = 0; axis < 2; ++axis) {
@@ -248,7 +255,9 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
         float3 radius = 2.5 * max(deviation, float3(sqrt(temporalVariance))) + 0.0001;
         float3 low = max(0.0, mean - radius), high = mean + radius;
         float3 clipped = clamp(history.xyz, low, high);
-        if (luminance(maximum) < 0.00001) clipped = 0;
+        // An empty stochastic neighborhood is not evidence of disocclusion.
+        // Identity, normal and depth validation above already reject stale
+        // receivers; preserve their accumulated light through sparse samples.
         float change = abs(luminance(clipped) - luminance(center.xyz))
                        / max(max(luminance(clipped), luminance(center.xyz)), 0.001);
         // Noise in an unchanged scene is precisely what accumulation removes.
@@ -271,8 +280,9 @@ void denoise(uint3 thread : SV_DispatchThreadID) {
     float4 center = previousIrradiance.Load(int3(pixel, 0));
     if (center.w <= 0) { irradiance.Store(pixel, center); return; }
     uint2 full = fullPixel(thread.xy, params);
-    float4 receiver = splitRasterMetadata(full);
-    float3 normal = normalize(normalTexture.Load(int3(full, 0)).xyz * 2 - 1);
+    uint sample = uint(pixel.x + pixel.y * int(params.size.x));
+    float4 receiver = splitRasterMetadata(full,sample);
+    float3 normal = receiverNormal(receiver);
     float3 position = worldPosition(float2(full) + 0.5, center.w, params);
     float variance = currentIrradiance.Load(int3(pixel, 0)).w;
     float3 sum = 0; float total = 0;
@@ -284,9 +294,10 @@ void denoise(uint3 thread : SV_DispatchThreadID) {
         float4 value = previousIrradiance.Load(int3(otherPixel, 0));
         if (value.w <= 0) continue;
         uint2 otherFull = fullPixel(uint2(otherPixel), params);
-        if (!splitReceiverCompatible(receiver,splitRasterMetadata(otherFull)) ||
+        uint otherSample = uint(otherPixel.x + otherPixel.y * int(params.size.x));
+        if (!splitReceiverCompatible(receiver,splitRasterMetadata(otherFull,otherSample)) ||
             surfaceGroups.Load(int3(pixel,0)) != surfaceGroups.Load(int3(otherPixel,0))) continue;
-        float3 otherNormal = normalize(normalTexture.Load(int3(otherFull, 0)).xyz * 2 - 1);
+        float3 otherNormal = receiverNormal(splitRasterMetadata(otherFull,otherSample));
         float3 otherPosition = worldPosition(float2(otherFull) + 0.5, value.w, params);
         float planeDistance = abs(dot(otherPosition - position, normal));
         if (dot(normal, otherNormal) < 0.95 || planeDistance > surfaceTolerance(params)) continue;

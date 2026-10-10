@@ -46,7 +46,7 @@ fn fragment(in: prepass_io::VertexOutput) -> ReceiverOutput {
     pbr_prepass_functions::prepass_sample_color_and_alpha_discard(in);
     var result: ReceiverOutput;
     result.identity = receiver.value;
-    result.identity.z = select(0u, packed_normal, receiver.value.z != 0u);
+    result.identity.z = packed_normal;
     @if(UNCLIPPED_DEPTH_ORTHO_EMULATION)
     result.depth = in.unclipped_depth;
     @if(MOTION_VECTOR_PREPASS)

@@ -68,7 +68,7 @@ fn main() -> AppExit {
     let mut hour = 12.0;
     let mut capture = false;
     let mut benchmark = false;
-    let mut max_rays = 8192;
+    let mut max_rays = 32_768;
     let mut motion_capture = false;
     for arg in std::env::args().skip(1) {
         if let Some(value) = arg.strip_prefix("--scene=") {
@@ -100,7 +100,7 @@ fn main() -> AppExit {
             );
         } else {
             panic!(
-                "Unknown argument {arg}; use --scene=path.gltf, --time=10, --max-rays=8192, --capture, --capture-motion, or --benchmark"
+                "Unknown argument {arg}; use --scene=path.gltf, --time=10, --max-rays=32768, --capture, --capture-motion, or --benchmark"
             );
         }
     }
@@ -244,22 +244,24 @@ fn setup(
     ));
     let settings = RadianceCascades {
         intensity: 1.0,
-        probe_spacing: 0.4,
+        probe_spacing: 0.8,
         interval_length: 0.6,
         resolution_divisor: 4,
         max_rays: demo.max_rays,
         emissive_samples: 4,
-        bounce_feedback: 0.0,
-        history_frames: 16,
+        bounce_feedback: 0.8,
+        history_frames: 64,
         temporal_blend: 0.98,
-        spatial_filter_steps: 2,
+        spatial_filter_steps: 3,
         ..default()
     };
     let mut camera = commands.spawn((
         Camera3d::default(),
+        Msaa::Off,
+        bevy::anti_alias::taa::TemporalAntiAliasing::default(),
         settings,
         ShadowLodOrigin,
-        Exposure { ev100: 8.0 },
+        Exposure::default(),
         Projection::Perspective(PerspectiveProjection {
             fov: std::f32::consts::FRAC_PI_3,
             ..default()
@@ -296,7 +298,9 @@ fn setup(
         let raw = images.add(raw);
         camera.insert(RadianceCascadesRawOutput(raw.clone()));
         commands.spawn(Readback::texture(raw)).observe(
-            |event: On<ReadbackComplete>, mut demo: ResMut<Demo>| {
+            |event: On<ReadbackComplete>,
+             mut demo: ResMut<Demo>,
+             views: Query<&RadianceCascades>| {
                 let valid = event.data.as_chunks::<16>().0.iter().any(|pixel| {
                     let values: [f32; 4] = std::array::from_fn(|i| {
                         f32::from_le_bytes(pixel[i * 4..i * 4 + 4].try_into().unwrap())
@@ -306,7 +310,8 @@ fn setup(
                         && values[..3].iter().any(|v| *v > 0.001)
                 });
                 demo.gi_frames = if valid { demo.gi_frames + 1 } else { 0 };
-                demo.gi_ready = demo.gi_frames >= 32;
+                let history_frames = views.iter().map(|gi| gi.history_frames).max().unwrap_or(32);
+                demo.gi_ready = demo.gi_frames >= history_frames.max(32);
             },
         );
     } else {
@@ -334,8 +339,10 @@ fn load_scene(assets: &AssetServer, path: &str) -> Handle<WorldAsset> {
         .with_settings(|settings: &mut GltfLoaderSettings| {
             // The demo owns its view; Sponza includes six active authoring cameras.
             settings.load_cameras = false;
-            // Prevent uploading 4K source images before the demo preset is applied.
-            settings.load_materials = RenderAssetUsages::MAIN_WORLD;
+            settings.load_lights = false;
+            // Materials must be available to the native renderer as well as GI.
+            // The texture-cache loader limits images before their GPU upload.
+            settings.load_materials = RenderAssetUsages::default();
         })
         .load(GltfAssetLabel::Scene(0).from_asset(path.to_owned()))
 }
@@ -345,7 +352,7 @@ fn prepare_scene(
     assets: Res<AssetServer>,
     pending: Query<(Entity, &PendingScene)>,
     meshes: Query<(Entity, &MeshMaterial3d<StandardMaterial>), With<Mesh3d>>,
-    materials: Res<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut commands: Commands,
     mut demo: ResMut<Demo>,
@@ -360,7 +367,13 @@ fn prepare_scene(
             let Ok((_, material)) = meshes.get(*entity) else {
                 continue;
             };
-            let material = materials.get(&material.0).expect("Loaded glTF material");
+            let mut material = materials
+                .get_mut(&material.0)
+                .expect("Loaded glTF material");
+            // The supplied scene mixes mirrored transforms and thin surfaces.
+            // Match software GI's two-sided visibility in the native renderer.
+            material.cull_mode = None;
+            material.double_sided = true;
             for texture in [
                 &material.base_color_texture,
                 &material.normal_map_texture,
@@ -469,7 +482,10 @@ fn controls(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     mut demo: ResMut<Demo>,
-    mut cameras: Query<&mut RadianceCascades>,
+    mut cameras: Query<(
+        &mut RadianceCascades,
+        &mut bevy::anti_alias::taa::TemporalAntiAliasing,
+    )>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if demo.capture || demo.benchmark {
@@ -498,7 +514,7 @@ fn controls(
     demo.hour = (demo.hour
         + time.delta_secs() * (scrub * 2.0 + if demo.playing { 0.1 } else { 0.0 }))
     .rem_euclid(24.0);
-    for mut gi in &mut cameras {
+    for (mut gi, mut taa) in &mut cameras {
         if keys.just_pressed(KeyCode::KeyG) {
             gi.intensity = if gi.intensity > 0.0 { 0.0 } else { 1.0 };
             jump = true;
@@ -509,6 +525,7 @@ fn controls(
         }
         if jump {
             gi.reset_history();
+            taa.reset = true;
         }
     }
 }
@@ -540,7 +557,14 @@ fn lighting(
             1.0,
         );
     }
-    clear.0 = Color::linear_rgb(500.0 * sky + 0.02, 700.0 * sky + 0.03, 1000.0 * sky + 0.06);
+    // ClearColor bypasses PBR's exposure multiplication. Match the radiance
+    // supplied to GI so visible sky is not an unexposed, clipped white field.
+    let exposure = Exposure::default().exposure();
+    clear.0 = Color::linear_rgb(
+        (500.0 * sky + 0.02) * exposure,
+        (700.0 * sky + 0.03) * exposure,
+        (1000.0 * sky + 0.06) * exposure,
+    );
 }
 
 fn performance(
@@ -863,7 +887,7 @@ mod tests {
             requested: false,
             settle_until: 0.0,
             benchmark: false,
-            max_rays: 8192,
+            max_rays: 32_768,
             motion_capture: false,
             motion_frame: 0,
         })

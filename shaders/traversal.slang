@@ -116,6 +116,7 @@ BvhNode sceneNode(uint index) {
     BvhNode node; node.minimum = asfloat(a.xyz); node.first = a.w;
     node.maximum = asfloat(b.xyz); node.count = b.w; return node;
 }
+[ForceInline]
 uint instanceBase(uint instance) { return sceneWord(0).y + instance * sceneWord(0).w; }
 uint2 hitInstanceIdentity(Hit hit) { return sceneWord(instanceBase(hit.instance) + 7).xy; }
 bool instanceVisible(uint instance) {
@@ -127,10 +128,12 @@ bool instanceVisible(uint instance) {
     }
     return false;
 }
+[ForceInline]
 float3 transformPoint(uint base, float3 value, bool direction = false) {
     float4 h = float4(value, direction ? 0 : 1);
     return float3(dot(asfloat(sceneWord(base)), h), dot(asfloat(sceneWord(base+1)), h), dot(asfloat(sceneWord(base+2)), h));
 }
+[ForceInline]
 float3 transformDirection(uint base, float3 value, bool transpose = false) {
     float3 a = asfloat(sceneWord(base)).xyz;
     float3 b = asfloat(sceneWord(base + 1)).xyz;
@@ -234,6 +237,7 @@ float sourceCosine(Light light, float3 direction) {
     return light.position.w == -2 ? abs(c) : c;
 }
 
+[ForceInline]
 float boxEntryDistance(float3 origin, float3 direction, BvhNode node, float limit) {
     float near = 0.0, far = limit;
     [loop] for (uint axis = 0; axis < 3; ++axis) {
@@ -249,9 +253,11 @@ float boxEntryDistance(float3 origin, float3 direction, BvhNode node, float limi
     }
     return near <= far ? near : -1.0;
 }
+[ForceInline]
 bool intersectBox(float3 origin, float3 direction, BvhNode node, float limit) {
     return boxEntryDistance(origin, direction, node, limit) >= 0.0;
 }
+[ForceInline]
 float orientedEdge(float2 a, float2 b) {
     // Evaluate a shared edge in a canonical order and apply its sign afterwards.
     // GPU contraction of a*b-c*d can otherwise give opposite directed edges
@@ -433,6 +439,7 @@ bool occludedTriangle(float3 origin, float3 direction, uint triangleIndex, uint 
     candidate.barycentric = float3(1-intersection.y-intersection.z,intersection.yz);
     candidate.footprint = 0;
     float cutoff = materialAlphaCutoff(candidate);
+    if (cutoff < 0) return true;
     return materialAccepts(candidate,cutoff);
 }
 

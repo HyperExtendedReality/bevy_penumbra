@@ -54,7 +54,21 @@ pub(crate) fn material_requires_tangents(material: &StandardMaterial) -> bool {
     !material.unlit && material.normal_map_texture.is_some()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn material_mesh_support(
+    material: &StandardMaterial,
+    mesh: &Mesh,
+) -> Result<(), &'static str> {
+    material_mesh_layout_support(material, mesh)?;
+    if let Some(VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+    {
+        crate::scene::validate_mesh_vertices(mesh, positions)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn material_mesh_layout_support(
     material: &StandardMaterial,
     mesh: &Mesh,
 ) -> Result<(), &'static str> {
@@ -64,7 +78,6 @@ pub(crate) fn material_mesh_support(
     }
     let vertex_count = match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
         Some(VertexAttributeValues::Float32x3(positions)) if !positions.is_empty() => {
-            crate::scene::validate_mesh_vertices(mesh, positions)?;
             positions.len()
         }
         _ => return Err("GI requires Float32x3 positions"),
@@ -242,6 +255,10 @@ impl Default for TextureOptions {
 pub(crate) struct TextureCache {
     keys: Vec<(AssetId<Image>, u64)>,
     pub atlas: Arc<TextureAtlas>,
+    failed: Option<(Vec<AssetId<Image>>, String)>,
+    /// All textures are resident but the atlas still can't be built
+    /// (budget, format, missing pixel data), so waiting won't help.
+    pub permanent_failure: bool,
 }
 
 fn address_mode(mode: ImageAddressMode) -> Result<u32, &'static str> {
@@ -1032,6 +1049,35 @@ impl TextureCache {
     ) -> Result<(), String> {
         ids.sort();
         ids.dedup();
+        if !changed
+            && let Some((failed, reason)) = &self.failed
+            && failed == &ids
+        {
+            return Err(reason.clone());
+        }
+        match self.rebuild(ids.clone(), images, options, changed) {
+            Ok(()) => {
+                self.failed = None;
+                self.permanent_failure = false;
+                Ok(())
+            }
+            Err(reason) => {
+                self.permanent_failure = ids
+                    .iter()
+                    .all(|id| images.is_some_and(|images| images.get(*id).is_some()));
+                self.failed = Some((ids, reason.clone()));
+                Err(reason)
+            }
+        }
+    }
+
+    fn rebuild(
+        &mut self,
+        ids: Vec<AssetId<Image>>,
+        images: Option<&Assets<Image>>,
+        options: &TextureOptions,
+        changed: bool,
+    ) -> Result<(), String> {
         if !changed && self.keys.iter().map(|&(id, _)| id).eq(ids.iter().copied()) {
             return Ok(());
         }
@@ -1108,7 +1154,8 @@ impl TextureCache {
         };
         let mut shelves = Vec::new();
         // shortcut: area-first shelves can still fragment, upgrade to bin packing if failures persist.
-        ids.sort_by_key(|&id| {
+        let mut atlas_ids = ids;
+        atlas_ids.sort_by_key(|&id| {
             let size = images
                 .and_then(|images| images.get(id))
                 .expect("checked resident images")
@@ -1116,7 +1163,7 @@ impl TextureCache {
                 .size;
             std::cmp::Reverse(u64::from(size.width) * u64::from(size.height))
         });
-        for &id in &ids {
+        for &id in &atlas_ids {
             let image = images
                 .and_then(|images| images.get(id))
                 .expect("checked resident images");
