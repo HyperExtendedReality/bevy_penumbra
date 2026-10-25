@@ -216,11 +216,12 @@ void storeEntryMergedDependency(inout Entry entry, DependencyContext context) {
     entry.mergedDependencyMax = float4(context.maximum, context.hasBounds ? 1.0 : 0.0);
 }
 
-// Probe-major Split radiance stores the 32 directional bins plus the aggregate
-// dependency used to invalidate packed history conservatively.
+// Probe-major Split irradiance stores a 6x6 octahedral table. Each texel holds
+// conditional diffuse irradiance in rgb and angular coverage in w; aggregate
+// dependencies preserve conservative invalidation of packed history.
 struct DirectionalProbe {
-    float4 radiance[32];
-    float4 dependencyMin; // aggregate dependency for all packed directional records
+    float4 irradiance[36];
+    float4 dependencyMin; // aggregate dependency for supported raw directional bins
     float4 dependencyMax;
 };
 

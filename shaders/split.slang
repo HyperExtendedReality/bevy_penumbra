@@ -1099,29 +1099,77 @@ void seedProbes(uint3 thread : SV_DispatchThreadID) {
     heads[2u * params.size.w + 2u].add(1u);
 }
 
+groupshared float4 packProbeRadiance[32];
+groupshared uint packProbeSource[32];
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
-void packProbes(uint3 thread : SV_DispatchThreadID) {
-    uint slot = thread.x;
-    uint directoryCapacity = probeDirectoryCapacity(params);
-    if (slot >= directoryCapacity) return;
-    uint index = heads[probeDirectoryHead(0u, slot, params)].load();
-    if (index == EMPTY || index == TOMBSTONE) return;
-    heads[2u * params.size.w + 9u].add(1u);
-    int4 key = entries[index].key;
-    uint lodBits = uint(key.w) & PROBE_LOD;
-    uint output = (params.frame.x & 1u) * directoryCapacity + slot;
-    DependencyContext packedDependency = dependencyEmpty();
-    [loop] for (uint direction = 0u; direction < 32u; ++direction) {
-        int4 directionKey = int4(key.xyz, int(direction | lodBits));
-        uint source = findEntry(directionKey, false);
-        Entry current = source == EMPTY ? (Entry)0 : entries[source];
-        float4 radiance = source == EMPTY ? 0.0 : current.merged;
-        directionalProbes[output].radiance[direction] = radiance;
-        if (source != EMPTY && radiance.w > 0.0)
-            dependencyUnion(packedDependency, entryMergedDependency(current));
+void packProbes(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex) {
+    uint ordinal = groupId.x + 256u * groupId.y;
+    bool active = ordinal < currentCapacity() / CASCADES;
+    uint index = EMPTY;
+    uint slot = EMPTY;
+    int4 key = 0;
+    if (active) {
+        index = ordinal * CASCADES;
+        key = entries[index].key;
+        slot = findProbeNodeSlot(key);
+        active = slot != EMPTY
+            && heads[probeDirectoryHead(0u, slot, params)].load() == index;
     }
-    storeProbeDependency(directionalProbes[output], packedDependency);
+
+    if (lane < 32u) {
+        uint source = EMPTY;
+        float4 value = 0.0;
+        if (active) {
+            uint lodBits = uint(key.w) & PROBE_LOD;
+            int4 directionKey = int4(key.xyz, int(lane | lodBits));
+            source = findEntry(directionKey, false);
+            if (source != EMPTY) value = entries[source].merged;
+        }
+        packProbeSource[lane] = source;
+        packProbeRadiance[lane] = value;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (!active) return;
+
+    uint directoryCapacity = probeDirectoryCapacity(params);
+    uint output = (params.frame.x & 1u) * directoryCapacity + slot;
+    if (lane < 36u) {
+        uint x = lane % 6u;
+        uint y = lane / 6u;
+        float3 normal = decodeNormal((float2(x, y) + 0.5) / 6.0);
+        float3 sum = 0.0;
+        float nominalCosine = 0.0;
+        float observedCosine = 0.0;
+        [loop] for (uint direction = 0u; direction < 32u; ++direction) {
+            float cosine = max(dot(normal, binDirection(direction, 0u)), 0.0);
+            nominalCosine += cosine;
+            float4 sample = packProbeRadiance[direction];
+            if (cosine <= 0.0 || !(sample.w > 0.0) || !all(isfinite(sample))) continue;
+            float weight = cosine * saturate(sample.w);
+            sum += sample.xyz * weight;
+            observedCosine += weight;
+        }
+        float4 value = 0.0;
+        if (observedCosine > 1e-6 && nominalCosine > 1e-6) {
+            value = float4(sum / observedCosine
+                * (nominalCosine * (4.0 / 32.0)),
+                saturate(observedCosine / nominalCosine));
+        }
+        directionalProbes[output].irradiance[lane] = value;
+    }
+    if (lane == 0u) {
+        DependencyContext packedDependency = dependencyEmpty();
+        [loop] for (uint direction = 0u; direction < 32u; ++direction) {
+            uint source = packProbeSource[direction];
+            float4 sample = packProbeRadiance[direction];
+            if (source != EMPTY && sample.w > 0.0 && all(isfinite(sample)))
+                dependencyUnion(packedDependency, entryMergedDependency(entries[source]));
+        }
+        storeProbeDependency(directionalProbes[output], packedDependency);
+        heads[2u * params.size.w + 9u].add(1u);
+    }
 }
 [shader("compute")]
 [numthreads(64, 1, 1)]

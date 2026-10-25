@@ -436,6 +436,8 @@ fn gpu_composite_upsample_respects_receiver_geometry_and_support() {
         ("source ineligible", [2.0, 3.0, 5.0]),
         ("black", [1.0, 1.5, 2.5]),
         ("no compatible fallback", [0.0; 3]),
+        ("compatible neighbor outside bilinear footprint", [2.0, 3.0, 5.0]),
+        ("supported black bilinear suppresses fallback", [0.0; 3]),
         ("target identity", [0.0; 3]),
         ("target normal", [0.0; 3]),
         ("target depth", [0.0; 3]),
@@ -476,6 +478,20 @@ fn gpu_composite_upsample_respects_receiver_geometry_and_support() {
                 .receivers
                 .iter_mut()
                 .for_each(|receiver| receiver[0] = 7.0),
+            "compatible neighbor outside bilinear footprint" => {
+                // At target (4, 2), the 2x2 bilinear footprint is grid x=0..1.
+                // Only grid x=2 has a compatible, supported sample. This catches
+                // a black seam when sparse anchors miss a narrow receiver facet.
+                fixture
+                    .receivers
+                    .iter_mut()
+                    .for_each(|receiver| receiver[0] = 7.0);
+                fixture.receivers[2][0] = 1.0;
+            }
+            "supported black bilinear suppresses fallback" => {
+                fixture.irradiance.fill([0.0, 0.0, 0.0, 0.5]);
+                fixture.irradiance[2] = [100.0, 200.0, 300.0, 0.5];
+            }
             "target identity" => fixture.raster[full][0] = 7.0f32.to_bits(),
             "target normal" => fixture.raster[full][2] = 0xa000_7fff, // packed +X
             "target depth" => fixture.depth[full][0] = 0.9,

@@ -54,7 +54,10 @@ const CACHE_WORK_GROUPS: u64 = 2;
 const CACHE_HISTORY_PER_BUCKET: u64 = 4;
 const SPARSE_HISTORY_RESET_FLAG: u32 = 1 << 31;
 const SPARSE_UPDATES_DISABLED_FLAG: u32 = 1 << 30;
-const PROBE_SIZE: u64 = 544;
+// Directional irradiance and per-cell coverage are 6×6 float4s, followed by
+// the two aggregate dependency bounds used for history invalidation.
+pub(crate) const PROBE_SIZE: u64 = 608;
+const PACK_PROBE_GROUPS_PER_ROW: u64 = 256;
 const CACHE_COMMIT: usize = 14;
 const COMPUTE_ENTRIES: [&str; 17] = [
     "clear",
@@ -80,6 +83,17 @@ const HISTORY_DIAGNOSTIC_WORDS: u64 = 26;
 
 fn probe_directory_capacity(samples: u64) -> u64 {
     samples.saturating_mul(4).max(1).next_power_of_two()
+}
+
+fn pack_probe_dispatch_groups(samples: u64) -> Option<(u32, u32)> {
+    let descriptors = samples.checked_mul(2)?;
+    if descriptors == 0 || descriptors > u64::from(u32::MAX) {
+        return None;
+    }
+    let groups_x = descriptors.min(PACK_PROBE_GROUPS_PER_ROW);
+    let groups_y =
+        descriptors.checked_add(PACK_PROBE_GROUPS_PER_ROW - 1)? / PACK_PROBE_GROUPS_PER_ROW;
+    Some((u32::try_from(groups_x).ok()?, u32::try_from(groups_y).ok()?))
 }
 
 fn cache_head_bytes(buckets: u64, samples: u64) -> u64 {
@@ -274,6 +288,8 @@ fn view_fits_device(
         .max_storage_buffer_binding_size
         .min(limits.max_buffer_size);
     let workgroups = u64::from(limits.max_compute_workgroups_per_dimension);
+    let pack_probe_groups_fit = pack_probe_dispatch_groups(pixels)
+        .is_some_and(|(x, y)| u64::from(x) <= workgroups && u64::from(y) <= workgroups);
     size.max_element() <= limits.max_texture_dimension_2d
         && shading_size.max_element() <= limits.max_texture_dimension_2d
         && viewport_size.max_element() <= limits.max_texture_dimension_2d
@@ -284,6 +300,7 @@ fn view_fits_device(
         && u64::from(viewport_size.x.div_ceil(8)) <= workgroups
         && u64::from(viewport_size.y.div_ceil(8)) <= workgroups
         && buckets.max(probe_directory * LEVELS as u64).div_ceil(64) <= workgroups
+        && pack_probe_groups_fit
         && cache_entry_bytes(pixels, buckets) <= binding_limit
         && cache_history_bytes(buckets) <= binding_limit
         && cache_head_bytes(buckets, pixels) <= binding_limit
@@ -4097,17 +4114,15 @@ impl CandidateSchedule {
             self.cursor = 0;
         }
 
-        let fair_quota = budget.min(candidate_count.saturating_sub(self.cursor));
+        let fair_quota = budget.min(candidate_count);
         self.pending_fair_advance = fair_quota;
         (self.cursor, fair_quota)
     }
 
     fn advance_after_successful_update(&mut self) {
         if self.candidate_count > 0 {
-            self.cursor += self.pending_fair_advance;
-            if self.cursor >= self.candidate_count {
-                self.cursor = 0;
-            }
+            self.cursor = ((u64::from(self.cursor) + u64::from(self.pending_fair_advance))
+                % u64::from(self.candidate_count)) as u32;
         }
     }
 }
@@ -7538,9 +7553,11 @@ fn render(
     let shading_x = buffers.shading_size.x.div_ceil(8);
     let shading_y = buffers.shading_size.y.div_ceil(8);
     let bucket_groups = buffers.buckets.div_ceil(64);
-    let probe_directory =
-        probe_directory_capacity(u64::from(buffers.size.x) * u64::from(buffers.size.y)) as u32;
+    let samples = u64::from(buffers.size.x) * u64::from(buffers.size.y);
+    let probe_directory = probe_directory_capacity(samples) as u32;
     let probe_directory_groups = probe_directory.div_ceil(64);
+    let (pack_probe_groups_x, pack_probe_groups_y) = pack_probe_dispatch_groups(samples)
+        .expect("the validated receiver count must fit the pack-probe dispatch grid");
     let clear_groups = buffers
         .buckets
         .max(probe_directory.saturating_mul(LEVELS as u32))
@@ -7620,7 +7637,7 @@ fn render(
         bucket_groups,
         1,
     );
-    let current_capacity = cache_work_slots(u64::from(buffers.size.x) * u64::from(buffers.size.y));
+    let current_capacity = cache_work_slots(samples);
     let entry_count = current_capacity + CACHE_HISTORY_PER_BUCKET * u64::from(buffers.buckets);
     for level in (0..LEVELS).rev() {
         dispatch(
@@ -7638,7 +7655,7 @@ fn render(
             current_capacity.div_ceil(64 * LEVELS as u64) as u32,
             LEVELS as u32,
         ),
-        ("packProbes", 11, probe_directory_groups, 1),
+        ("packProbes", 11, pack_probe_groups_x, pack_probe_groups_y),
     ] {
         dispatch(
             name,
@@ -9586,6 +9603,44 @@ mod tests {
     }
 
     #[test]
+    fn pack_probe_dispatch_covers_canonical_descriptors_in_a_bounded_2d_grid() {
+        for samples in [1u64, 2, 127, 128, 129, 32_767, 32_768, 32_769, 131_072] {
+            let descriptors = samples * 2;
+            let (groups_x, groups_y) =
+                pack_probe_dispatch_groups(samples).expect("bounded probe dispatch");
+            assert_eq!(
+                u64::from(groups_x),
+                descriptors.min(PACK_PROBE_GROUPS_PER_ROW)
+            );
+            assert_eq!(
+                u64::from(groups_y),
+                descriptors.div_ceil(PACK_PROBE_GROUPS_PER_ROW)
+            );
+            assert!(groups_x > 0 && u64::from(groups_x) <= PACK_PROBE_GROUPS_PER_ROW);
+            assert!(u64::from(groups_x) * u64::from(groups_y) >= descriptors);
+
+            let mut visited = vec![false; descriptors as usize];
+            for group_y in 0..u64::from(groups_y) {
+                for group_x in 0..u64::from(groups_x) {
+                    let ordinal = group_x + PACK_PROBE_GROUPS_PER_ROW * group_y;
+                    if ordinal >= descriptors {
+                        continue;
+                    }
+                    assert!(!visited[ordinal as usize], "descriptor {ordinal} repeated");
+                    visited[ordinal as usize] = true;
+                }
+            }
+            assert!(visited.into_iter().all(|covered| covered));
+        }
+
+        assert_eq!(pack_probe_dispatch_groups(0), None);
+        assert_eq!(
+            pack_probe_dispatch_groups(u64::from(u32::MAX) / 2 + 1),
+            None
+        );
+    }
+
+    #[test]
     fn composite_uses_post_denoise_receiver_metadata_only_when_filtering() {
         let temporal = "temporal receiver history";
         let filtered = "post-denoise receiver metadata";
@@ -9906,7 +9961,7 @@ mod tests {
         ));
         assert_eq!(
             changed_word_ranges(&previous_tail, &current_tail),
-            Some(vec![1..2]),
+            Some(std::iter::once(1..2).collect()),
             "an emission-only edit stages only the changed material word"
         );
 
@@ -9965,7 +10020,7 @@ mod tests {
         ));
         assert_eq!(
             changed_word_ranges(&scene.material_words, &original),
-            Some(vec![1..2]),
+            Some(std::iter::once(1..2).collect()),
             "reverting to the old scene must patch back every word already applied"
         );
     }
@@ -10214,7 +10269,12 @@ mod tests {
             return false;
         }
         let rank = reference_candidate_rank(sample, width, height, candidate_count);
-        rank >= cursor && rank - cursor < quota
+        let distance = if rank >= cursor {
+            rank - cursor
+        } else {
+            candidate_count - cursor + rank
+        };
+        distance < quota
     }
 
     #[test]
@@ -10239,10 +10299,16 @@ mod tests {
 
             for budget in budgets {
                 let mut schedule = CandidateSchedule::default();
-                let mut selected_count = vec![0u8; candidate_count as usize];
-                while selected_count.contains(&0) {
+                let mut selected_count = vec![0u32; candidate_count as usize];
+                let updates_per_frame = if budget == 0 || budget >= candidate_count {
+                    candidate_count
+                } else {
+                    budget
+                };
+                for _ in 0..candidate_count.div_ceil(updates_per_frame) {
                     let (cursor, fair_quota) =
                         schedule.phase_for(width, height, candidate_count, budget);
+                    assert_eq!(fair_quota, budget.min(candidate_count));
                     let mut this_frame = 0;
                     for sample in 0..candidate_count {
                         let selected = if budget == 0 || budget >= candidate_count {
@@ -10262,21 +10328,54 @@ mod tests {
                             this_frame += 1;
                         }
                     }
-                    let expected = if budget == 0 || budget >= candidate_count {
-                        candidate_count
-                    } else {
-                        fair_quota
-                    };
-                    assert_eq!(this_frame, expected, "{width}x{height}, budget {budget}");
+                    assert_eq!(
+                        this_frame, updates_per_frame,
+                        "{width}x{height}, budget {budget}"
+                    );
                     assert!(budget == 0 || this_frame <= budget);
                     schedule.advance_after_successful_update();
-                    if budget == 0 || budget >= candidate_count {
-                        break;
-                    }
                 }
-                assert!(selected_count.into_iter().all(|count| count == 1));
+                let min = selected_count.iter().min().copied().unwrap();
+                let max = selected_count.iter().max().copied().unwrap();
+                assert!(max - min <= 1, "{width}x{height}, budget {budget}");
             }
         }
+    }
+
+    #[test]
+    fn transport_candidate_schedule_wraps_full_budget_across_uneven_tail() {
+        const WIDTH: u32 = 160;
+        const HEIGHT: u32 = 90;
+        const CANDIDATE_COUNT: u32 = WIDTH * HEIGHT;
+        const BUDGET: u32 = 512;
+        let mut schedule = CandidateSchedule::default();
+        let mut selected_count = vec![0u32; CANDIDATE_COUNT as usize];
+        let batches = CANDIDATE_COUNT.div_ceil(BUDGET);
+
+        for batch in 0..batches {
+            let (cursor, quota) = schedule.phase_for(WIDTH, HEIGHT, CANDIDATE_COUNT, BUDGET);
+            assert_eq!(quota, BUDGET, "batch {batch}");
+            if batch == 28 {
+                assert_eq!(cursor, 14_336);
+            }
+            let mut selected = 0;
+            for sample in 0..CANDIDATE_COUNT {
+                if reference_fair_selected(sample, CANDIDATE_COUNT, WIDTH, HEIGHT, cursor, quota) {
+                    selected_count[sample as usize] += 1;
+                    selected += 1;
+                }
+            }
+            assert_eq!(selected, BUDGET, "batch {batch}");
+            schedule.advance_after_successful_update();
+        }
+
+        let min = selected_count.iter().min().copied().unwrap();
+        let max = selected_count.iter().max().copied().unwrap();
+        assert_eq!((min, max), (1, 2));
+        assert_eq!(
+            schedule.phase_for(WIDTH, HEIGHT, CANDIDATE_COUNT, BUDGET),
+            (448, BUDGET)
+        );
     }
 
     #[test]
@@ -10338,7 +10437,7 @@ mod tests {
         let mut schedule = CandidateSchedule::default();
         for (expected_cursor, frame_x) in [0, 3, 6, 9, 12].into_iter().zip(wrapped_frame_values) {
             let (cursor, fair_quota) = schedule.phase_for(width, height, candidate_count, budget);
-            assert_eq!(fair_quota, 3.min(candidate_count - expected_cursor));
+            assert_eq!(fair_quota, 3);
             assert_eq!(cursor, expected_cursor, "frame.x={frame_x}");
             // Preparing without a successful render does not consume a phase.
             assert_eq!(
@@ -10448,13 +10547,11 @@ mod tests {
         schedule.advance_after_successful_update();
         let (cursor, fair_quota) = schedule.phase_for(width, height, candidate_count, 0x8000_0000);
         assert_eq!(cursor, 0x8000_0000);
-        assert_eq!(fair_quota, candidate_count - 0x8000_0000);
+        assert_eq!(fair_quota, 0x8000_0000);
         schedule.advance_after_successful_update();
         assert_eq!(
-            schedule
-                .phase_for(width, height, candidate_count, 0x8000_0000)
-                .0,
-            0
+            schedule.phase_for(width, height, candidate_count, 0x8000_0000),
+            (1, 0x8000_0000)
         );
     }
 

@@ -1,25 +1,36 @@
+int2 wrapIrradianceTexel(int2 pixel) {
+    if (pixel.x < 0) pixel = int2(-pixel.x - 1, 5 - pixel.y);
+    else if (pixel.x >= 6) pixel = int2(11 - pixel.x, 5 - pixel.y);
+    if (pixel.y < 0) pixel = int2(5 - pixel.x, -pixel.y - 1);
+    else if (pixel.y >= 6) pixel = int2(5 - pixel.x, 11 - pixel.y);
+    return pixel;
+}
+
 float3 diffuseProbeIrradiance(uint slot, float3 normal, out float coverage) {
     coverage = 0.0;
     uint page = (params.frame.x & 1u) * probeDirectoryCapacity(params) + slot;
+    float2 grid = encodeNormal(normal) * 6.0 - 0.5;
+    int2 base = int2(floor(grid));
+    float2 fraction = frac(grid);
     float3 sum = 0.0;
-    float observedCosine = 0.0;
-    float nominalCosine = 0.0;
-    [loop] for (uint direction = 0u; direction < 32u; ++direction) {
-        float3 omega = binDirection(direction, 0u);
-        float cosine = max(dot(normal, omega), 0.0);
-        nominalCosine += cosine;
-        if (cosine <= 0.0) continue;
-        float4 sample = directionalProbes[page].radiance[direction];
+    float observedWeight = 0.0;
+    [unroll] for (uint corner = 0u; corner < 4u; ++corner) {
+        int2 bit = int2(corner & 1u, corner >> 1u);
+        float2 axisWeight = lerp(1.0 - fraction, fraction, float2(bit));
+        float bilinearWeight = axisWeight.x * axisWeight.y;
+        if (bilinearWeight <= 0.0) continue;
+        int2 pixel = wrapIrradianceTexel(base + bit);
+        float4 sample = directionalProbes[page].irradiance[pixel.y * 6 + pixel.x];
         if (!(sample.w > 0.0) || !all(isfinite(sample))) continue;
-        float weight = cosine * saturate(sample.w);
+        float weight = bilinearWeight * saturate(sample.w);
         sum += sample.xyz * weight;
-        observedCosine += weight;
+        observedWeight += weight;
     }
-    if (observedCosine <= 1e-6 || nominalCosine <= 1e-6) return 0.0;
-    coverage = saturate(observedCosine / nominalCosine);
-    // The 32 bins are equal-area: Δω/π = 4/32. Renormalize the observed
-    // angular support, then report its coverage separately from valid black.
-    return sum / observedCosine * (nominalCosine * (4.0 / 32.0));
+    if (observedWeight <= 1e-6) return 0.0;
+    coverage = saturate(observedWeight);
+    // The table stores conditional irradiance; coverage stays separate so a
+    // supported black texel remains distinguishable from missing angular data.
+    return sum / observedWeight;
 }
 
 float3 diffuseAtLod(float3 position, float3 normal, uint lod,

@@ -1,7 +1,7 @@
 //! Ignored GPU checks for the production transport helpers.
 use bevy::{
     asset::RenderAssetUsages,
-    math::{Mat4, UVec2, UVec4, Vec3, Vec4},
+    math::{Mat4, UVec2, UVec4, Vec2, Vec3, Vec4},
     prelude::{Image, default},
     render::{
         render_resource::*,
@@ -2181,6 +2181,7 @@ fn gpu_visible_zero_ray_probe_packs_cached_radiance() {
     const DIRECTORY_CAPACITY: u32 = 4;
     const ENTRY_WORDS: usize = 208 / 4;
     let key = [3i32, -2, 1, 0];
+    let empty_key = [7i32, 4, -3, 0];
     let hash_key = |key: [i32; 4], buckets: u32| {
         let key = key.map(|value| value as u32);
         let mut hash = key[0].wrapping_mul(0x8da6_b343)
@@ -2192,8 +2193,78 @@ fn gpu_visible_zero_ray_probe_packs_cached_radiance() {
         hash ^= hash >> 15;
         hash & (buckets - 1)
     };
-    let cache_bucket = hash_key(key, CACHE_BUCKETS) as usize;
     let directory_slot = hash_key(key, DIRECTORY_CAPACITY) as usize;
+    let empty_directory_slot = hash_key(empty_key, DIRECTORY_CAPACITY) as usize;
+    assert_ne!(directory_slot, empty_directory_slot);
+
+    let bin_direction = |direction: usize| {
+        let x = direction % 8;
+        let y = direction / 8;
+        let phi = (x as f32 + 0.5) * std::f32::consts::TAU / 8.0;
+        let vertical = (y as f32 + 0.5) * 0.5 - 1.0;
+        let radius = (1.0 - vertical * vertical).max(0.0).sqrt();
+        Vec3::new(radius * phi.cos(), vertical, radius * phi.sin())
+    };
+    let decode_normal = |uv: Vec2| {
+        let p = uv * 2.0 - Vec2::ONE;
+        let mut normal = Vec3::new(p.x, p.y, 1.0 - p.x.abs() - p.y.abs());
+        let fold = (-normal.z).clamp(0.0, 1.0);
+        normal.x += if normal.x >= 0.0 { -fold } else { fold };
+        normal.y += if normal.y >= 0.0 { -fold } else { fold };
+        normal.normalize()
+    };
+    let raw_bins: [[f32; 4]; 32] = std::array::from_fn(|direction| {
+        let support = match direction % 4 {
+            0 => 0.0,
+            1 => 0.25,
+            2 => 0.5,
+            _ => 1.0,
+        };
+        let color = if direction == 5 {
+            [0.0; 3]
+        } else {
+            [
+                0.5 + direction as f32,
+                (31 - direction) as f32 * 0.25,
+                (direction % 7) as f32 + 0.125,
+            ]
+        };
+        [color[0], color[1], color[2], support]
+    });
+    let expected_table: [[f32; 4]; 36] = std::array::from_fn(|texel| {
+        let x = texel % 6;
+        let y = texel / 6;
+        let normal = decode_normal(Vec2::new(
+            (x as f32 + 0.5) / 6.0,
+            (y as f32 + 0.5) / 6.0,
+        ));
+        let mut sum = [0.0; 3];
+        let mut nominal = 0.0;
+        let mut observed = 0.0;
+        for (direction, sample) in raw_bins.iter().enumerate() {
+            let cosine = normal.dot(bin_direction(direction)).max(0.0);
+            nominal += cosine;
+            if cosine <= 0.0 || sample[3] <= 0.0 {
+                continue;
+            }
+            let weight = cosine * sample[3].clamp(0.0, 1.0);
+            for (sum, component) in sum.iter_mut().zip(&sample[..3]) {
+                *sum += component * weight;
+            }
+            observed += weight;
+        }
+        if observed <= 1e-6 || nominal <= 1e-6 {
+            [0.0; 4]
+        } else {
+            let scale = nominal * (4.0 / 32.0) / observed;
+            [
+                sum[0] * scale,
+                sum[1] * scale,
+                sum[2] * scale,
+                (observed / nominal).clamp(0.0, 1.0),
+            ]
+        }
+    });
 
     let mut shader_source = String::from(
         r#"
@@ -2207,6 +2278,13 @@ fn gpu_visible_zero_ray_probe_packs_cached_radiance() {
 "#,
     );
     let production = include_str!("../shaders/split.slang");
+    let pack_shader = section(
+        production,
+        "groupshared float4 packProbeRadiance[32];",
+        "void commitCache(",
+    );
+    let pack_shader =
+        &pack_shader[..pack_shader.rfind("[shader").expect("next production shader entry")];
     for source in [
         section(
             production,
@@ -2218,10 +2296,19 @@ fn gpu_visible_zero_ray_probe_packs_cached_radiance() {
             "uint probeDirectoryCapacity(",
             "uint probeDescriptorIndex(",
         ),
+        section(
+            production,
+            "uint findProbeNodeSlot(",
+            "uint insertProbeDescriptor(",
+        ),
         section(production, "uint findEntry(", "uint findIrradianceProbe("),
         section(production, "uint currentCapacity()", "[shader"),
-        section(production, "void seedProbes(", "[shader"),
-        section(production, "void packProbes(", "[shader"),
+        section(
+            production,
+            "void seedProbes(",
+            "groupshared float4 packProbeRadiance[32];",
+        ),
+        pack_shader,
     ] {
         shader_source.push_str(source);
         shader_source.push('\n');
@@ -2233,10 +2320,6 @@ fn gpu_visible_zero_ray_probe_packs_cached_radiance() {
 void seedProbeStage(uint3 id : SV_DispatchThreadID) {
     seedProbes(uint3(id.x / 4u, id.x % 4u, 0u));
 }
-
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void packProbeStage(uint3 id : SV_DispatchThreadID) { packProbes(id); }
 "#,
     );
     let shader = SlangCompiler::default()
@@ -2248,7 +2331,7 @@ void packProbeStage(uint3 id : SV_DispatchThreadID) { packProbes(id); }
             ],
             &SlangSettings {
                 target: SlangTarget::Wgsl,
-                entry_points: ["seedProbeStage", "packProbeStage"]
+                entry_points: ["seedProbeStage", "packProbes"]
                     .into_iter()
                     .map(str::to_owned)
                     .collect(),
@@ -2283,7 +2366,7 @@ void packProbeStage(uint3 id : SV_DispatchThreadID) { packProbes(id); }
         })
     };
     let seed = make_pipeline("seedProbeStage");
-    let pack = make_pipeline("packProbeStage");
+    let pack = make_pipeline("packProbes");
 
     let mut parameters = temporal_test_parameters(0);
     parameters.size = UVec4::new(1, 1, 1, CACHE_BUCKETS);
@@ -2293,7 +2376,50 @@ void packProbeStage(uint3 id : SV_DispatchThreadID) { packProbes(id); }
 
     let mut heads_words =
         vec![u32::MAX; (2 * CACHE_BUCKETS + 36 + 8 * DIRECTORY_CAPACITY) as usize];
-    heads_words[cache_bucket] = 0;
+    let mut entry_words = vec![0u32; 64 * ENTRY_WORDS];
+    for index in 0..64 {
+        entry_words[index * ENTRY_WORDS + 16] = u32::MAX;
+    }
+    for (probe, probe_key) in [key, empty_key].into_iter().enumerate() {
+        for (direction, source_radiance) in raw_bins.iter().copied().enumerate() {
+            let index = match (probe, direction) {
+                (0, 0) => 0,
+                (1, 0) => 4,
+                (0, _) => direction + 1,
+                _ => direction + 32,
+            };
+            let base = index * ENTRY_WORDS;
+            let mut direction_key = probe_key;
+            direction_key[3] = direction as i32;
+            for (word, value) in direction_key.iter().enumerate() {
+                entry_words[base + word] = *value as u32;
+            }
+            let radiance = if probe == 0 {
+                source_radiance
+            } else {
+                [9.0, 8.0, 7.0, 0.0]
+            };
+            for (component, value) in radiance.iter().enumerate() {
+                entry_words[base + 8 + component] = value.to_bits();
+            }
+            if direction == 0 {
+                entry_words[base + 23] = 1; // visible initialized candidate, even with no ray
+            }
+            if probe == 0 && radiance[3] > 0.0 {
+                entry_words[base + 44] = (direction as f32).to_bits();
+                entry_words[base + 45] = (-2.0f32).to_bits();
+                entry_words[base + 46] = 1.0f32.to_bits();
+                entry_words[base + 47] = 1.0f32.to_bits();
+                entry_words[base + 48] = (direction as f32 + 1.0).to_bits();
+                entry_words[base + 49] = 2.0f32.to_bits();
+                entry_words[base + 50] = 3.0f32.to_bits();
+                entry_words[base + 51] = 1.0f32.to_bits();
+            }
+            let bucket = hash_key(direction_key, CACHE_BUCKETS) as usize;
+            entry_words[base + 16] = heads_words[bucket];
+            heads_words[bucket] = index as u32;
+        }
+    }
     let heads_bytes: Vec<u8> = heads_words
         .iter()
         .flat_map(|word| word.to_le_bytes())
@@ -2303,20 +2429,6 @@ void packProbeStage(uint3 id : SV_DispatchThreadID) { packProbes(id); }
         contents: &heads_bytes,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
     });
-
-    let mut entry_words = vec![0u32; 8 * ENTRY_WORDS];
-    for index in 0..8 {
-        entry_words[index * ENTRY_WORDS + 16] = u32::MAX;
-    }
-    for axis in 0..4 {
-        entry_words[axis] = key[axis] as u32;
-    }
-    entry_words[8] = 4.0f32.to_bits();
-    entry_words[9] = 2.0f32.to_bits();
-    entry_words[10] = 1.0f32.to_bits();
-    entry_words[11] = 1.0f32.to_bits();
-    entry_words[17] = 0; // valid zero prefix
-    entry_words[23] = 1; // visible initialized candidate, even with no ray
     let entry_bytes: Vec<u8> = entry_words
         .iter()
         .flat_map(|word| word.to_le_bytes())
@@ -2340,7 +2452,8 @@ void packProbeStage(uint3 id : SV_DispatchThreadID) { packProbes(id); }
         contents: &entry_bytes,
         usage: BufferUsages::STORAGE,
     });
-    let directional_bytes = (2 * DIRECTORY_CAPACITY * 544) as usize;
+    let directional_bytes =
+        2 * DIRECTORY_CAPACITY as usize * crate::render::PROBE_SIZE as usize;
     let directional_probes = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("split_visible_zero_probe_radiance"),
         contents: &vec![0u8; directional_bytes],
@@ -2410,13 +2523,37 @@ void packProbeStage(uint3 id : SV_DispatchThreadID) { packProbes(id); }
         &pack_group,
         &directional_probes,
         directional_bytes as u64,
-        1,
+        2,
+    );
+    let probe_words = crate::render::PROBE_SIZE as usize / 16;
+    let first = directory_slot * probe_words;
+    for (texel, expected) in expected_table.iter().enumerate() {
+        let actual = output_vec4(&packed, first + texel);
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= expected.abs().max(1.0) * 2e-4,
+                "packed texel {texel}: {actual:?} != {expected:?}"
+            );
+        }
+    }
+    assert_eq!(
+        output_vec4(&packed, first + 36),
+        [1.0, -2.0, 1.0, 1.0],
+        "supported raw bins retain their aggregate dependency minimum"
     );
     assert_eq!(
-        output_vec4(&packed, directory_slot * (544 / 16)),
-        [4.0, 2.0, 1.0, 1.0],
-        "a visible zero-ray grid probe must still pack its cached directional radiance"
+        output_vec4(&packed, first + 37),
+        [32.0, 2.0, 3.0, 1.0],
+        "supported raw bins retain their aggregate dependency maximum"
     );
+    let empty = empty_directory_slot * probe_words;
+    for texel in 0..36 {
+        assert_eq!(
+            output_vec4(&packed, empty + texel),
+            [0.0; 4],
+            "zero-support probe must pack no irradiance at texel {texel}"
+        );
+    }
 }
 #[test]
 #[ignore = "requires slangc and a desktop GPU; dispatches production Split interval deposition"]

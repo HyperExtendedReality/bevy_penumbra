@@ -19,6 +19,43 @@ VertexOutput vertex(uint index : SV_VertexID) {
     return output;
 }
 
+bool compositeCompatibleCandidate(int2 samplePixel, uint2 targetIdentity,
+                                  float3 targetPosition, float3 targetNormal,
+                                  float tolerance, out float3 value) {
+    value = 0.0;
+    uint2 extent = giResolveExtent(params);
+    if (any(samplePixel < 0) || any(samplePixel >= int2(extent))) return false;
+    uint scale = giResolveScale(params);
+    float4 candidate = irradiance.Load(int3(samplePixel, 0));
+    // Alpha remains receiver depth, not a lighting-validity bit. Receiver
+    // metadata carries support after temporal resolve and any denoise pass.
+    if (!(candidate.w > 0.0) || !isfinite(candidate.w)
+        || !all(isfinite(candidate.xyz))) return false;
+    float4 receiver = receiverHistory.Load(int3(samplePixel, 0));
+    if (receiverHistoryLength(receiver) == 0u
+        || receiverScreenHistorySupportMask(receiver) == 0u
+        || any(asuint(receiver.xy) != targetIdentity)) return false;
+    uint2 sampleLocal = min(uint2(samplePixel) * scale + scale / 2u,
+                            params.viewport.zw - 1u);
+    uint2 full = params.viewport.xy + sampleLocal;
+    uint4 sampleRaster = rasterReceiver.Load(int3(full, 0));
+    if ((sampleRaster.z & 0x80000000u) == 0u
+        || any(sampleRaster.xy != targetIdentity)) return false;
+    uint4 sampleDeferred = gbuffer.Load(int3(full, 0));
+    if ((sampleDeferred.w & (1u << 24u)) != 0u) return false;
+    float3 sampleNormal = receiverNormal(receiver);
+    float3 rasterNormal = receiverGeometricNormal(sampleRaster.z, deferredShadingNormal(sampleDeferred));
+    if (dot(targetNormal, sampleNormal) <= 0.97
+        || dot(targetNormal, rasterNormal) <= 0.97
+        || dot(sampleNormal, rasterNormal) <= 0.97) return false;
+    float3 samplePosition = worldPosition(float2(full) + 0.5, candidate.w, params);
+    if (!all(isfinite(samplePosition))
+        || surfacePlaneDistance(samplePosition - targetPosition, targetNormal, rasterNormal) > tolerance)
+        return false;
+    value = candidate.xyz;
+    return true;
+}
+
 float3 reconstructCompositeGi(uint2 pixel) {
     float depth = depthTexture.Load(int3(pixel, 0));
     uint4 targetRaster = rasterReceiver.Load(int3(pixel, 0));
@@ -47,37 +84,43 @@ float3 reconstructCompositeGi(uint2 pixel) {
     [unroll] for (uint tap = 0u; tap < 4u; ++tap) {
         int2 bit = int2(tap & 1u, tap >> 1u);
         int2 samplePixel = base + bit;
-        if (any(samplePixel < 0) || any(samplePixel >= int2(extent))) continue;
         float2 axisWeight = lerp(1.0 - fraction, fraction, float2(bit));
         float weight = axisWeight.x * axisWeight.y;
         if (!(weight > 0.0)) continue;
-        float4 candidate = irradiance.Load(int3(samplePixel, 0));
-        // Alpha remains receiver depth, not a lighting-validity bit. Receiver
-        // metadata carries support after temporal resolve and any denoise pass.
-        if (!(candidate.w > 0.0) || !isfinite(candidate.w)
-            || !all(isfinite(candidate.xyz))) continue;
-        float4 receiver = receiverHistory.Load(int3(samplePixel, 0));
-        if (receiverHistoryLength(receiver) == 0u
-            || receiverScreenHistorySupportMask(receiver) == 0u
-            || any(asuint(receiver.xy) != targetRaster.xy)) continue;
-        uint2 sampleLocal = min(uint2(samplePixel) * scale + scale / 2u,
-                                params.viewport.zw - 1u);
-        uint2 full = params.viewport.xy + sampleLocal;
-        uint4 sampleRaster = rasterReceiver.Load(int3(full, 0));
-        if ((sampleRaster.z & 0x80000000u) == 0u
-            || any(sampleRaster.xy != targetRaster.xy)) continue;
-        uint4 sampleDeferred = gbuffer.Load(int3(full, 0));
-        if ((sampleDeferred.w & (1u << 24u)) != 0u) continue;
-        float3 sampleNormal = receiverNormal(receiver);
-        float3 rasterNormal = receiverGeometricNormal(sampleRaster.z, deferredShadingNormal(sampleDeferred));
-        if (dot(normal, sampleNormal) <= 0.97
-            || dot(normal, rasterNormal) <= 0.97
-            || dot(sampleNormal, rasterNormal) <= 0.97) continue;
-        float3 samplePosition = worldPosition(float2(full) + 0.5, candidate.w, params);
-        if (!all(isfinite(samplePosition))
-            || surfacePlaneDistance(samplePosition - position, normal, rasterNormal) > tolerance) continue;
-        sum += candidate.xyz * weight;
+        float3 candidate;
+        if (!compositeCompatibleCandidate(samplePixel, targetRaster.xy,
+                                          position, normal, tolerance, candidate)) continue;
+        sum += candidate * weight;
         support += weight;
+    }
+    // Bilinear anchors can all land on adjacent facets around a thin receiver.
+    // Only when no compatible bilinear support exists, use the nearest supported
+    // sample within two resolve cells; a supported black result remains black.
+    if (support <= 1e-6) {
+        float nearestDistanceSquared = 4.0;
+        float3 nearest = 0.0;
+        bool found = false;
+        [loop] for (int y = -2; y <= 2; ++y) {
+            [loop] for (int x = -2; x <= 2; ++x) {
+                int2 samplePixel = base + int2(x, y);
+                if (any(samplePixel < 0) || any(samplePixel >= int2(extent))) continue;
+                uint2 sampleLocal = min(uint2(samplePixel) * scale + scale / 2u,
+                                        params.viewport.zw - 1u);
+                float2 delta = (float2(sampleLocal) - local) / float(scale);
+                float distanceSquared = dot(delta, delta);
+                if (distanceSquared > nearestDistanceSquared) continue;
+                float3 candidate;
+                if (!compositeCompatibleCandidate(samplePixel, targetRaster.xy,
+                                                  position, normal, tolerance, candidate)) continue;
+                nearestDistanceSquared = distanceSquared;
+                nearest = candidate;
+                found = true;
+            }
+        }
+        if (found) {
+            sum = nearest;
+            support = 1.0;
+        }
     }
     return support > 1e-6 ? sum / support : 0.0;
 }
