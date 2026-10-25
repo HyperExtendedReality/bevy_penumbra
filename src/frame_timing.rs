@@ -22,6 +22,18 @@ pub struct FrameTimingPlugin;
 #[derive(Resource, Clone, Default)]
 struct Completed(Arc<Mutex<Vec<(Instant, f64)>>>);
 
+#[derive(Resource, Clone, Default)]
+struct RenderCpuCompleted(Arc<Mutex<Vec<(Instant, f64)>>>);
+
+#[derive(Resource, Default)]
+struct CpuTiming {
+    start: Option<Instant>,
+    completed: Vec<(Instant, f64)>,
+}
+
+#[derive(Resource, Default)]
+struct RenderCpuStart(Option<Instant>);
+
 struct Slot {
     queries: wgpu::QuerySet,
     resolve: wgpu::Buffer,
@@ -73,15 +85,22 @@ impl FromWorld for Timing {
 impl Plugin for FrameTimingPlugin {
     fn build(&self, app: &mut App) {
         let completed = Completed::default();
+        let render_cpu_completed = RenderCpuCompleted::default();
         app.insert_resource(completed.clone())
-            .add_systems(PreUpdate, publish);
+            .insert_resource(render_cpu_completed.clone())
+            .init_resource::<CpuTiming>()
+            .add_systems(First, begin_cpu)
+            .add_systems(Last, end_cpu)
+            .add_systems(PreUpdate, (publish, publish_cpu, publish_render_cpu));
         if let Some(render) = app.get_sub_app_mut(RenderApp) {
             render
                 .insert_resource(completed)
+                .insert_resource(render_cpu_completed)
                 .init_gpu_resource::<Timing>()
+                .init_resource::<RenderCpuStart>()
                 .add_systems(
                     Render,
-                    begin
+                    (begin, begin_render_cpu)
                         .after(RenderSystems::ExtractCommands)
                         .before(RenderSystems::PrepareAssets)
                         .before(RenderSystems::PrepareMeshes)
@@ -89,10 +108,35 @@ impl Plugin for FrameTimingPlugin {
                 )
                 .add_systems(
                     Render,
-                    end.after(RenderSystems::Render)
+                    (end, end_render_cpu)
+                        .after(RenderSystems::Render)
                         .before(RenderSystems::Cleanup),
                 );
         }
+    }
+}
+
+fn begin_cpu(mut timing: ResMut<CpuTiming>) {
+    timing.start = Some(Instant::now());
+}
+
+fn end_cpu(mut timing: ResMut<CpuTiming>) {
+    if let Some(start) = timing.start.take() {
+        timing
+            .completed
+            .push((Instant::now(), start.elapsed().as_secs_f64() * 1_000.0));
+    }
+}
+
+fn begin_render_cpu(mut timing: ResMut<RenderCpuStart>) {
+    timing.0 = Some(Instant::now());
+}
+
+fn end_render_cpu(mut timing: ResMut<RenderCpuStart>, completed: Res<RenderCpuCompleted>) {
+    if let Some(start) = timing.0.take()
+        && let Ok(mut rows) = completed.0.lock()
+    {
+        rows.push((Instant::now(), start.elapsed().as_secs_f64() * 1_000.0));
     }
 }
 
@@ -136,10 +180,10 @@ fn end(world: &mut World) {
                     .expect("timestamp buffer mapping should be valid");
                 let begin = u64::from_le_bytes(mapped[..8].try_into().unwrap());
                 let end = u64::from_le_bytes(mapped[8..16].try_into().unwrap());
-                if let Some(ms) = elapsed_ms(begin, end, period) {
-                    if let Ok(mut rows) = completed.0.lock() {
-                        rows.push((Instant::now(), ms));
-                    }
+                if let Some(ms) = elapsed_ms(begin, end, period)
+                    && let Ok(mut rows) = completed.0.lock()
+                {
+                    rows.push((Instant::now(), ms));
                 }
                 drop(mapped);
                 read.unmap();
@@ -161,6 +205,37 @@ fn elapsed_ms(begin: u64, end: u64, period_ns: f32) -> Option<f64> {
 
 fn publish(completed: Res<Completed>, mut store: ResMut<DiagnosticsStore>) {
     let path = DiagnosticPath::new("render/penumbra_frame/elapsed_gpu");
+    if store.get(&path).is_none() {
+        store.add(Diagnostic::new(path.clone()).with_suffix("ms"));
+    }
+    if let Ok(mut rows) = completed.0.lock() {
+        for (time, value) in rows.drain(..) {
+            store
+                .get_mut(&path)
+                .unwrap()
+                .add_measurement(DiagnosticMeasurement { time, value });
+        }
+    }
+}
+
+fn publish_cpu(mut timing: ResMut<CpuTiming>, mut store: ResMut<DiagnosticsStore>) {
+    let path = DiagnosticPath::new("render/penumbra_frame/main_schedule_cpu");
+    if store.get(&path).is_none() {
+        store.add(Diagnostic::new(path.clone()).with_suffix("ms"));
+    }
+    for &(time, value) in &timing.completed {
+        store
+            .get_mut(&path)
+            .unwrap()
+            .add_measurement(DiagnosticMeasurement { time, value });
+    }
+    // Keep only measurements from the current frame; the diagnostics store
+    // owns its rolling history.
+    timing.completed.clear();
+}
+
+fn publish_render_cpu(completed: Res<RenderCpuCompleted>, mut store: ResMut<DiagnosticsStore>) {
+    let path = DiagnosticPath::new("render/penumbra_frame/render_schedule_cpu");
     if store.get(&path).is_none() {
         store.add(Diagnostic::new(path.clone()).with_suffix("ms"));
     }

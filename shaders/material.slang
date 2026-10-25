@@ -29,18 +29,26 @@ float textureUv(float uv, uint mode) {
     return saturate(uv);
 }
 float4 textureTexel(uint4 mip, int2 texel, uint flags) {
+    // A zero-sized mip record means this slot has no usable texture data. Index
+    // arithmetic on it would overflow into an out-of-range scene/material read,
+    // which can fault the GPU instead of returning a texel.
+    if (mip.x == 0 || mip.y == 0) return 1;
     int2 wrapped = int2(textureIndex(texel.x, int(mip.x), flags & 3),
                         textureIndex(texel.y, int(mip.y), (flags >> 2) & 3));
     uint width, height, pages; materialAtlas.GetDimensions(width, height, pages);
+    if (width <= 2 || pages == 0) return 1;
     uint tileSide = width - 2;
     uint2 tile = uint2(wrapped) / tileSide;
     uint4 rectangle = sceneWord(sceneWord(0).x + mip.w + tile.y * mip.z + tile.x);
+    if (rectangle.z >= pages) return 1;
     uint2 pixel = rectangle.xy + 1 + uint2(wrapped) % tileSide;
     return materialAtlas.Load(int4(int2(pixel), int(rectangle.z), 0));
 }
 float4 textureMip(uint texture, uint level, float2 uv, bool linear) {
     uint base = sceneWord(0).x;
     uint4 record = sceneWord(base + texture);
+    if (record.y == 0) return 1;
+    level = min(level, record.y - 1);
     uint4 mip = sceneWord(base + record.x + level);
     uv = float2(textureUv(uv.x, record.z & 3), textureUv(uv.y, (record.z >> 2) & 3));
     float2 position = uv * float2(mip.xy);
@@ -56,8 +64,14 @@ float4 sampleTexture(uint texture, float2 uv, float lod = 0) {
     uint base = sceneWord(0).x;
     uint4 record = sceneWord(base + texture);
     uint4 size = sceneWord(base + texture + 1);
+    // Without a mip chain there is no valid level, and a non-finite LOD would
+    // convert to an out-of-range unsigned index below. Fall back to the
+    // neutral texel both cases would otherwise invent an address for.
+    if (record.y == 0) return 1;
+    if (!isfinite(lod)) lod = 0;
     float maximum = min(asfloat(size.w), float(record.y - 1));
     lod = clamp(lod, min(asfloat(size.z), maximum), maximum);
+    if (!(lod >= 0.0)) lod = 0;
     bool linear = (record.z & (lod > 0 ? 32 : 16)) != 0;
     if ((record.z & 64) == 0) return textureMip(texture, uint(floor(lod + 0.5)), uv, linear);
     uint low = uint(floor(lod)), high = min(low + 1, record.y - 1);
@@ -97,6 +111,11 @@ float4 materialSample(Hit hit, uint slot) {
 }
 float4 materialBaseColor(Hit hit) {
     return asfloat(sceneWord(materialBase(hit))) * hitVertexAttribute(hit, 4) * materialSample(hit, 0);
+}
+float materialPerceptualRoughness(Hit hit) {
+    uint base = materialBase(hit);
+    float roughness = asfloat(sceneWord(base + 2).y) * materialSample(hit, 2).g;
+    return isfinite(roughness) ? saturate(roughness) : 1.0;
 }
 float materialAlphaCutoff(Hit hit) {
     return asfloat(sceneWord(materialBase(hit) + 1).w);

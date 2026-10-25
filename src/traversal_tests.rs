@@ -582,7 +582,9 @@ fn gpu_deformation_and_blas_refit_match_cpu() {
         .get_mapped_range()
         .expect("readback buffer mapping should be valid");
     let page_bytes = mapped
-        .chunks_exact(256)
+        .as_chunks::<256>()
+        .0
+        .iter()
         .flat_map(|row| row[..64].iter().copied())
         .collect::<Vec<_>>();
     // Immutable input layers must survive, while sparse destination vertices use appended layers.
@@ -1208,18 +1210,13 @@ fn check_attributes(data: &SceneData, ray: Ray, words: &[u32]) -> Result<(), Str
     }
     let albedo =
         (instance.albedo.as_dvec3() * color.truncate()).extend(f64::from(instance.flags & 3));
-    let probability = data
-        .emissive_lights
-        .iter()
-        .find(|light| light.source.x == words[2] && light.source.y == words[1])
-        .map_or(0.0, |light| f64::from(light.edge1.w));
     let emission = (instance.emission.as_dvec3()
         * if instance.flags & 16 != 0 {
             color.truncate()
         } else {
             DVec3::ONE
         })
-    .extend(probability);
+    .extend(0.0);
     for (offset, expected, name) in [
         (12, geometric.extend(0.0), "geometric normal"),
         (16, normal.extend(0.0), "interpolated normal"),
@@ -1228,7 +1225,7 @@ fn check_attributes(data: &SceneData, ray: Ray, words: &[u32]) -> Result<(), Str
         (28, color, "vertex color"),
         (32, shading.extend(0.0), "shading normal"),
         (36, albedo, "material albedo"),
-        (40, emission, "emission and hit-side light PDF"),
+        (40, emission, "emission and reserved zero"),
     ] {
         let actual = DVec4::from_array(std::array::from_fn(|i| {
             f64::from(f32::from_bits(words[offset + i]))
@@ -1488,13 +1485,22 @@ fn forced_deep_scene(data: &SceneData, blas: bool) -> SceneData {
     let mut deep = data.clone();
     let chain = |nodes: &mut Vec<BvhNode>, min, max, first, count| {
         let root = nodes.len() as u32;
-        for i in 0..=160 {
-            let leaf = i % 2 == 1 || i == 160;
+        // Lay out a valid binary tree whose first-child path is 64 internal
+        // nodes deep. Each sibling is a leaf, so DFS accumulates one pending
+        // node per level and exercises the 49-entry stack overflow fallback.
+        const INTERNALS: usize = 64;
+        const NODE_COUNT: usize = INTERNALS * 2 + 1;
+        for i in 0..NODE_COUNT {
+            let internal = i == 0 || (i % 2 == 1 && i < INTERNALS * 2 - 1);
             nodes.push(BvhNode {
                 min,
                 max,
-                first: if leaf { first } else { root + i + 1 },
-                count: if leaf { count } else { 0 },
+                first: if internal {
+                    root + if i == 0 { 1 } else { i as u32 + 2 }
+                } else {
+                    first
+                },
+                count: if internal { 0 } else { count },
             });
         }
         root
@@ -1543,21 +1549,9 @@ fn forced_deep_scene(data: &SceneData, blas: bool) -> SceneData {
         &deep.instances,
         deep.nodes.len(),
         base,
-        &HashMap::new(),
         &deep.material_words,
         &deep.textures.words,
     ));
-    // The forced topology fixture intentionally has no hit-side MIS table.
-    // Keep light source identities but make the CPU expectation match that.
-    deep.emissive_lights = Arc::new(
-        deep.emissive_lights
-            .iter()
-            .map(|light| GiLight {
-                edge1: light.edge1.with_w(0.0),
-                ..*light
-            })
-            .collect(),
-    );
     deep
 }
 
@@ -1753,8 +1747,22 @@ fn check_masked_traversal(
             } else {
                 forced_deep_scene(&data, errors == 1)
             };
-            let records = trace_gpu(&data, &rays, device, queue, pipeline, refit_pipeline);
-            for (ray, record) in rays.iter().zip(records.as_chunks::<176>().0.iter()) {
+            // Exercise the expensive stack-overflow fallback at representative
+            // accepted and rejected alpha samples. The full ray grid remains
+            // covered for the normal topology above; dispatching all of it
+            // through a deliberately 48-deep tree can trigger a GPU watchdog.
+            let query_indices: Vec<usize> = if errors == 0 {
+                (0..rays.len()).collect()
+            } else {
+                vec![0, 3, 15]
+            };
+            let query_rays: Vec<_> = query_indices.iter().map(|index| rays[*index]).collect();
+            let records = trace_gpu(&data, &query_rays, device, queue, pipeline, refit_pipeline);
+            for (ray_index, (ray, record)) in query_rays
+                .iter()
+                .zip(records.as_chunks::<176>().0.iter())
+                .enumerate()
+            {
                 let words: Vec<_> = record
                     .as_chunks::<4>()
                     .0
@@ -1780,14 +1788,35 @@ fn check_masked_traversal(
                     accepted || ray.limit > 3.0,
                     "phase {phase} {ray:?} alpha {alpha}"
                 );
-                assert_eq!(words[3], errors);
+                assert_eq!(
+                    words[3],
+                    errors,
+                    "traversal overflow diagnostic mismatch: phase={phase}, topology={errors} (1=BLAS, 2=TLAS), ray_index={}, ray={ray:?}, hit={hit}, triangle={}, instance={}, brute_triangle={}, brute_instance={}, instance_flags={:#010x}",
+                    query_indices[ray_index],
+                    words[1],
+                    words[2],
+                    words[5],
+                    words[6],
+                    data.instances
+                        .get(words[2] as usize)
+                        .map_or(0, |instance| instance.flags),
+                );
                 assert_eq!(
                     hit,
                     words[5] != u32::MAX,
-                    "acceleration/brute mask mismatch"
+                    "acceleration/brute mask mismatch: phase={phase}, topology={errors}, ray_index={}, ray={ray:?}, acceleration_hit={hit}, acceleration_triangle={}, acceleration_instance={}, brute_triangle={}, brute_instance={}, acceleration_errors={}, brute_errors={}",
+                    query_indices[ray_index],
+                    words[1],
+                    words[2],
+                    words[5],
+                    words[6],
+                    words[3],
+                    words[7],
                 );
                 if !hit {
-                    misses += 1;
+                    if errors == 0 {
+                        misses += 1;
+                    }
                     continue;
                 }
                 let entity = data.instances[words[2] as usize].entity;
@@ -1831,7 +1860,9 @@ fn check_masked_traversal(
                     "texture/color emission {emission:?} vs {expected:?}"
                 );
                 if is_front {
-                    front_hits += 1;
+                    if errors == 0 {
+                        front_hits += 1;
+                    }
                     let mapped = Vec3::new(180.0, 100.0, 240.0) / 255.0 * 2.0 - Vec3::ONE;
                     let expected = Vec3::new(mapped.x, mapped.y, -mapped.z).normalize();
                     let normal = Vec3::new(
@@ -1843,7 +1874,7 @@ fn check_masked_traversal(
                         (normal - expected).abs().max_element() < 2e-5,
                         "mirrored double-sided normal map {normal:?} vs {expected:?}"
                     );
-                } else {
+                } else if errors == 0 {
                     back_hits += 1;
                 }
             }
@@ -2144,6 +2175,228 @@ fn gpu_traversal_matches_brute_force_through_motion_and_asset_edits() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "requires slangc and a desktop GPU; no demo scene is launched"]
+fn gpu_tracked_traversal_bounds_primary_and_nee_dependencies() {
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .init_resource::<Assets<Mesh>>()
+        .init_resource::<Assets<StandardMaterial>>()
+        .init_resource::<GiScene>()
+        .add_systems(Update, update_scene);
+
+    let mesh = app
+        .world_mut()
+        .resource_mut::<Assets<Mesh>>()
+        .add(Rectangle::new(2.0, 2.0));
+    let material = app
+        .world_mut()
+        .resource_mut::<Assets<StandardMaterial>>()
+        .add(StandardMaterial {
+            cull_mode: None,
+            double_sided: true,
+            ..default()
+        });
+    app.world_mut().spawn((
+        Mesh3d(mesh.clone()),
+        MeshMaterial3d(material.clone()),
+        RadianceCascadesGeometry,
+        InheritedVisibility::VISIBLE,
+        GlobalTransform::from(Transform::from_xyz(0.0, 0.0, 1.0)),
+    ));
+    // This separated panel expands the scene root without covering the center
+    // primary ray or the unblocked shadow ray at y=0.
+    app.world_mut().spawn((
+        Mesh3d(mesh),
+        MeshMaterial3d(material),
+        RadianceCascadesGeometry,
+        InheritedVisibility::VISIBLE,
+        GlobalTransform::from(
+            Transform::from_xyz(5.0, 1.5, 2.0)
+                .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+        ),
+    ));
+    wait_for_blas_builds(&mut app, 1);
+    wait_for_scene_instances(&mut app, 2);
+    let data = app.world().resource::<GiScene>().data.as_ref().clone();
+
+    let options = WgpuSettings::default();
+    let resources = block_on(initialize_renderer(
+        options.backends.unwrap_or(Backends::PRIMARY),
+        None,
+        &options,
+    ));
+    let device = &resources.0;
+    let queue = &resources.1;
+    let tracked = traversal_pipeline(device, "checkTrackedTraversal");
+    let shader = SlangCompiler::default()
+        .compile_bundle(
+            "acceleration.slang",
+            &[(
+                "acceleration.slang",
+                include_str!("../shaders/acceleration.slang"),
+            )],
+            &SlangSettings {
+                target: SlangTarget::Wgsl,
+                entry_points: vec!["refitTlas".into()],
+                optimization: Some(2),
+                ..default()
+            },
+        )
+        .unwrap();
+    let bevy::shader::Source::Wgsl(source) = shader.source else {
+        panic!("expected WGSL");
+    };
+    let module = device.create_and_validate_shader_module(ShaderModuleDescriptor {
+        label: Some("tracked_traversal_refit"),
+        source: ShaderSource::Wgsl(source),
+    });
+    let layout = crate::render::refit_layout();
+    let layout = device.create_bind_group_layout("tracked_traversal_refit", &layout.entries);
+    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("tracked_traversal_refit"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let refit = device.create_compute_pipeline(&RawComputePipelineDescriptor {
+        label: Some("tracked_traversal_refit"),
+        layout: Some(&pipeline_layout),
+        module: &module,
+        entry_point: Some("refitTlas"),
+        compilation_options: default(),
+        cache: None,
+    });
+    let rays = [
+        // The primary receiver is hit at z=1; the unrelated blocker is outside
+        // that first-hit dependency.
+        Ray {
+            origin: Vec3::ZERO,
+            direction: Vec3::Z,
+            limit: 10.0,
+            any_hit: false,
+        },
+        // A shadow ray through the separated panel is blocked.
+        Ray {
+            origin: Vec3::new(0.0, 1.5, 2.0),
+            direction: Vec3::X,
+            limit: 10.0,
+            any_hit: false,
+        },
+        // The same scene-root segment at y=0 is clear. A newly inserted
+        // blocker at (3,0,2) lies in this tracked interval.
+        Ray {
+            origin: Vec3::new(0.0, 0.0, 2.0),
+            direction: Vec3::X,
+            limit: 10.0,
+            any_hit: false,
+        },
+        // A ray clipped out by the scene root is measured empty, not unknown.
+        Ray {
+            origin: Vec3::new(0.0, 4.0, 2.0),
+            direction: Vec3::X,
+            limit: 10.0,
+            any_hit: false,
+        },
+    ];
+    let bytes = trace_gpu_for_layers(
+        &data,
+        &rays,
+        device,
+        queue,
+        &tracked,
+        &refit,
+        &RenderLayers::default(),
+    );
+    let word = |ray: usize, slot: usize, channel: usize| {
+        let index = (ray * 11 + slot) * 16 + channel * 4;
+        u32::from_le_bytes(bytes[index..index + 4].try_into().unwrap())
+    };
+    let scalar = |ray: usize, slot: usize, channel: usize| f32::from_bits(word(ray, slot, channel));
+    let contains = |ray: usize, point: Vec3| {
+        (0..3).all(|axis| {
+            let minimum = scalar(ray, 1, axis);
+            let maximum = scalar(ray, 2, axis);
+            point[axis] >= minimum - 1e-5 && point[axis] <= maximum + 1e-5
+        })
+    };
+
+    assert_ne!(word(0, 0, 1), u32::MAX, "primary ray must hit its receiver");
+    assert_eq!(
+        word(0, 1, 3),
+        3,
+        "primary hit dependency is bounded and known"
+    );
+    assert!(
+        scalar(0, 2, 2) < 1.01,
+        "primary dependency stops at its first hit"
+    );
+    assert!(
+        !contains(0, Vec3::new(5.0, 1.5, 2.0)),
+        "far panel is outside the primary dependency"
+    );
+    assert_eq!(
+        word(0, 6, 3),
+        1.0f32.to_bits(),
+        "stored dependency marks the primary observation known"
+    );
+    assert_eq!(
+        word(0, 7, 3),
+        1.0f32.to_bits(),
+        "stored primary dependency has bounds"
+    );
+    assert_eq!(word(0, 8, 3), 0, "unknown union clears the known marker");
+    assert_eq!(word(0, 9, 3), 0, "unknown union cannot retain stale bounds");
+
+    assert_eq!(word(1, 3, 0), 1, "the NEE shadow ray must be blocked");
+    assert_eq!(word(1, 3, 1), 1, "the NEE query must be supported");
+    assert_eq!(
+        word(1, 3, 2),
+        3,
+        "blocked shadow dependency is bounded and known"
+    );
+
+    assert_eq!(word(2, 3, 0), 0, "the separated NEE ray remains unblocked");
+    assert_eq!(word(2, 3, 1), 1, "the clear NEE query must be supported");
+    assert_eq!(
+        word(2, 3, 2),
+        3,
+        "clear in-root ray retains a measured segment"
+    );
+    assert_eq!(
+        word(2, 0, 1),
+        u32::MAX,
+        "the in-root primary ray misses geometry"
+    );
+    assert_eq!(
+        word(2, 1, 3),
+        3,
+        "in-root primary miss remains bounded and known"
+    );
+    assert!(
+        contains(2, Vec3::new(3.0, 0.0, 2.0)),
+        "dependency must cover a possible new blocker on the ray"
+    );
+    assert!(
+        !contains(2, Vec3::splat(100.0)),
+        "disjoint geometry must stay outside the dependency"
+    );
+
+    assert_eq!(word(3, 1, 3), 1, "root-clipped primary miss is known empty");
+    assert_eq!(
+        word(3, 6, 3),
+        1.0f32.to_bits(),
+        "known-empty dependency survives Entry serialization"
+    );
+    assert_eq!(word(3, 7, 3), 0, "known-empty dependency has no bounds");
+    assert_eq!(word(3, 3, 0), 0, "root-clipped shadow ray is unblocked");
+    assert_eq!(word(3, 3, 1), 1, "root-clipped shadow query is supported");
+    assert_eq!(
+        word(3, 3, 2),
+        1,
+        "root-clipped shadow dependency is known empty"
+    );
 }
 
 #[test]

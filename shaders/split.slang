@@ -6,141 +6,401 @@ bool gpuSortLess(uint left, uint right) {
     if (a.y != b.y) return a.y < b.y;
     if (a.z != b.z) return a.z < b.z;
     if (a.w != b.w) return a.w < b.w;
-    uint2 x = entries[left].identity, y = entries[right].identity;
-    if (x.x != y.x) return x.x < y.x;
-    if (x.y != y.y) return x.y < y.y;
-    if (entries[left].padding.y != entries[right].padding.y)
-        return entries[left].padding.y < entries[right].padding.y;
     return left < right;
 }
 #include "linked_merge_sort.slang"
 
-float splitDistanceLod(float3 position) {
-    // ponytail: four distance LODs, transition every doubling after 32 base
-    // spacings; expose the transition distance if real scenes need tuning.
-    return clamp(log2(max(length(position - params.cameraPosition.xyz) / (32 * params.tuning.x), 1.0)), 0.0, 3.0);
+bool dependencyIntersectsDirty(DependencyContext dependency) {
+    if (params.dirtyMin.w <= 0.0) return false;
+    if (!all(isfinite(params.dirtyMin.xyz)) || !all(isfinite(params.dirtyMax.xyz))
+        || any(params.dirtyMin.xyz > params.dirtyMax.xyz)) return true;
+    // An untracked dependency cannot prove the observation is independent of
+    // changed geometry. A measured-empty set remains valid under the root-revision
+    // precondition enforced by the host.
+    if (!dependency.known) return true;
+    if (!dependency.hasBounds) return false;
+    return all(dependency.minimum <= params.dirtyMax.xyz)
+        && all(dependency.maximum >= params.dirtyMin.xyz);
 }
 
-float4 findMerged(int4 key, bool previous, uint2 identity, uint surfaceGroup, out float3 origin) {
-    origin = 0.0;
-    if (previous && params.history.z == 0.0) return 0.0;
-    uint bucket = (hashKey(key, params.size.w) ^ surfaceGroup) & (params.size.w - 1);
-    uint index = previous ? previousHeads[bucket] : heads[bucket].load();
-    [loop] while (index != EMPTY) {
-        Entry entry = previous ? previousEntries[index] : entries[index];
-        if (all(entry.key == key) && all(entry.identity == identity) && entry.padding.y == surfaceGroup) {
-            origin = entry.origin.xyz;
-            return entry.merged;
-        }
-        index = entry.next;
-    }
-    return 0.0;
-}
-float4 interpolate(float3 position, uint direction, uint level, bool previous, bool secondary, uint surface, uint2 identity, uint surfaceGroup) {
-    float3 grid = position / spacing(params, level, secondary, (surface & PROBE_LOD) >> 18) - 0.5;
-    int3 base = int3(floor(grid)); float3 fraction = frac(grid);
-    float3 sum = 0.0; float total = 0.0;
-    [loop] for (uint corner = 0; corner < 8; ++corner) {
-        uint3 bit = uint3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
-        float3 weights = lerp(1.0 - fraction, fraction, float3(bit));
-        float weight = weights.x * weights.y * weights.z;
-        if (weight <= 0.00001) continue;
-        int4 key = int4(base + int3(bit), int(direction | (level << 12) | (secondary ? SECONDARY : 0) | surface));
-        float3 origin;
-        float4 value = findMerged(key, previous, identity, surfaceGroup, origin);
-        if (value.w > 0) {
-            float3 delta = origin - position;
-            float distance = length(delta);
-            if (distance > params.tuning.z * 2 && traceOccluded(position, delta / distance, distance - params.tuning.z)) continue;
-            sum += value.xyz * weight;
-            total += weight;
-        }
-    }
-    return total > 0.00001 ? float4(sum / total, 1.0) : float4(0.0);
-}
-// Returns irradiance / pi for the Lambertian BRDF, without the surface albedo.
-float4 diffuseGatherExact(float3 position, float3 normal, bool previous, bool secondary, uint2 identity, uint surfaceGroup, uint lod) {
-    float3 sum = 0.0; float total = 0.0;
-    [loop] for (uint direction = 0; direction < 32; ++direction) {
-        float cosine = max(0.0, dot(normal, binDirection(direction, 0)));
-        if (cosine <= 0.0) continue;
-        float4 value = interpolate(position, direction, 0, previous, secondary, surfaceKey(normal) | (lod << 18), identity, surfaceGroup);
-        if (value.w > 0) { sum += value.xyz * cosine; total += cosine; }
-    }
-    return total > 0.0 ? float4(sum / total, 1) : float4(0);
+bool localPunctualLightHistoryAvailable() {
+    return persistentWorldIntervals(params)
+        && params.lightDirtyMin.w > 0.5
+        && all(isfinite(params.lightDirtyMin.xyz))
+        && all(isfinite(params.lightDirtyMax.xyz))
+        && all(params.lightDirtyMin.xyz <= params.lightDirtyMax.xyz);
 }
 
-uint findIrradianceProbe(int4 key, bool previous, uint2 identity, uint surfaceGroup) {
-    if (previous && params.history.z == 0) return EMPTY;
-    uint slot = (hashKey(key, params.size.w) ^ surfaceGroup) & (params.size.w - 1);
-    [loop] for (uint attempt = 0; attempt < 32; ++attempt) {
-        uint index = previous ? previousHeads[params.size.w + 1 + slot] : heads[params.size.w + 1 + slot].load();
+// Raw and merged lighting bounds store a conservative sphere around only the
+// surfaces where outgoing radiance was evaluated. Radius > 0 is a measured
+// sphere, -1 is proven lighting-independent zero, and all other values are
+// unknown (including zero-initialized legacy/reserved storage).
+float4 emptyLightHitBounds() { return float4(0.0, 0.0, 0.0, -1.0); }
+float4 unknownLightHitBounds() { return 0.0; }
+
+float4 lightHitBoundsAt(float3 position) {
+    if (!all(isfinite(position))) return unknownLightHitBounds();
+    float scale = max(1.0, max(abs(position.x), max(abs(position.y), abs(position.z))));
+    return float4(position, max(scale * 1e-6, 1.1920929e-7));
+}
+
+float4 dependencySegmentSphere(float3 start, float3 end, float padding) {
+    if (!all(isfinite(start)) || !all(isfinite(end)) || !isfinite(padding))
+        return unknownLightHitBounds();
+    float3 delta = end - start;
+    float3 center = start + delta * 0.5;
+    float scale = max(1.0, max(abs(start.x), max(abs(start.y), abs(start.z))));
+    scale = max(scale, max(abs(end.x), max(abs(end.y), abs(end.z))));
+    float radius = length(delta) * 0.5 + max(padding, 0.0)
+        + max(scale * 1e-6, 1.1920929e-7);
+    if (!all(isfinite(center)) || !isfinite(radius) || !(radius > 0.0))
+        return unknownLightHitBounds();
+    return float4(center, radius);
+}
+
+float4 unionConservativeSpheres(float4 left, float4 right) {
+    bool leftFinite = all(isfinite(left));
+    bool rightFinite = all(isfinite(right));
+    bool leftEmpty = leftFinite && left.w == -1.0;
+    bool rightEmpty = rightFinite && right.w == -1.0;
+    bool leftSphere = leftFinite && left.w > 0.0;
+    bool rightSphere = rightFinite && right.w > 0.0;
+    if (leftEmpty) return rightFinite && (rightEmpty || rightSphere)
+        ? right : unknownLightHitBounds();
+    if (rightEmpty) return leftSphere ? left : unknownLightHitBounds();
+    if (!leftSphere || !rightSphere) return unknownLightHitBounds();
+
+    float3 delta = right.xyz - left.xyz;
+    float distance = length(delta);
+    if (!isfinite(distance)) return unknownLightHitBounds();
+    if (left.w >= distance + right.w) return left;
+    if (right.w >= distance + left.w) return right;
+    float radius = 0.5 * (distance + left.w + right.w);
+    float3 center = left.xyz + delta * ((radius - left.w) / max(distance, 1e-20));
+    if (!all(isfinite(center)) || !isfinite(radius) || !(radius > 0.0))
+        return unknownLightHitBounds();
+    return float4(center, radius);
+}
+
+bool dependencySphereIntersectsDirty(float4 bounds) {
+    if (params.dirtyMin.w <= 0.0) return false;
+    if (!all(isfinite(params.dirtyMin.xyz)) || !all(isfinite(params.dirtyMax.xyz))
+        || any(params.dirtyMin.xyz > params.dirtyMax.xyz)) return true;
+    if (!all(isfinite(bounds)) || !(bounds.w > 0.0)) return true;
+    float3 closest = clamp(bounds.xyz, params.dirtyMin.xyz, params.dirtyMax.xyz);
+    float3 delta = bounds.xyz - closest;
+    return dot(delta, delta) <= bounds.w * bounds.w;
+}
+
+bool betaHistoryEligible(DependencyContext combinedDependency, float4 segmentSphere) {
+    bool combinedIntersectsDirty = dependencyIntersectsDirty(combinedDependency);
+    // Reserved zero/malformed spheres came from old or incomplete cache entries.
+    // Fall back to the combined dependency rather than assuming a short segment.
+    if (!all(isfinite(segmentSphere)) || !(segmentSphere.w > 0.0))
+        return !combinedIntersectsDirty;
+    // The AABB is often much tighter than a sphere around a long ray segment.
+    // Either disjoint proof is sufficient; both must overlap to reject beta.
+    return !combinedIntersectsDirty || !dependencySphereIntersectsDirty(segmentSphere);
+}
+
+bool lightHitBoundsIntersectLocalLightDirty(float4 bounds) {
+    if (!localPunctualLightHistoryAvailable()) return false;
+    if (all(isfinite(bounds)) && bounds.w == -1.0) return false;
+    if (!all(isfinite(bounds)) || !(bounds.w > 0.0)) return true;
+    float3 closest = clamp(bounds.xyz, params.lightDirtyMin.xyz, params.lightDirtyMax.xyz);
+    float3 delta = bounds.xyz - closest;
+    return dot(delta, delta) <= bounds.w * bounds.w;
+}
+
+bool radianceHistoryEligible(DependencyContext geometryDependency,
+                             float4 lightHitBounds) {
+    // Bounded geometry reuse permits the global transport flag to stay open,
+    // but it does not make a dependency crossing the changed geometry valid.
+    if (dependencyIntersectsDirty(geometryDependency)) return false;
+    // Empty intervals and escaped Split rays carry measured zero J; their
+    // radiance cannot depend on local lights, emissive sources, or the sky.
+    if (all(isfinite(lightHitBounds)) && lightHitBounds.w == -1.0) return true;
+    if (worldRadianceUnchanged(params)) return true;
+    return localPunctualLightHistoryAvailable()
+        && !lightHitBoundsIntersectLocalLightDirty(lightHitBounds);
+}
+
+bool radianceHistoryMayBeReused() {
+    return worldRadianceUnchanged(params) || localPunctualLightHistoryAvailable();
+}
+
+bool dirtyDependency(Entry entry) {
+    return dependencyIntersectsDirty(entryMergedDependency(entry));
+}
+
+bool dirtyRawCacheEntry(Entry entry) {
+    return dependencyIntersectsDirty(entryDependency(entry));
+}
+
+bool dirtyCacheEntry(Entry entry) {
+    return dirtyDependency(entry);
+}
+
+uint mergeVisibilityAdmissionLimit() {
+    return params.sampling.y;
+}
+
+void splitLodBlend(float3 position, out uint lowLod, out uint highLod,
+                   out float blend) {
+    // Affine view composition preserves an orthographic projection's zero
+    // spatial w row; perspective projections retain a nonzero spatial row.
+    float3 perspectiveProjection = float3(params.clipFromWorld[3][0],
+        params.clipFromWorld[3][1], params.clipFromWorld[3][2]);
+    bool perspective = all(isfinite(perspectiveProjection))
+        && dot(perspectiveProjection, perspectiveProjection) > 1e-12;
+    float3 verticalProjection = float3(params.clipFromWorld[1][0],
+        params.clipFromWorld[1][1], params.clipFromWorld[1][2]);
+    float focalPixels = 0.5 * float(params.viewport.w) * length(verticalProjection);
+    uint targetPixels = max(params.ownerSequence.x, 1u);
+    float lodScale;
+    if (perspective) {
+        float3 offset = abs(position - params.cameraPosition.xyz);
+        float radius = max(offset.x, max(offset.y, offset.z));
+        float baseDistance = max(focalPixels * params.tuning.x / float(targetPixels),
+                                 params.tuning.x);
+        lodScale = radius / baseDistance;
+    } else {
+        // Orthographic world spacing has the same projected size at any depth.
+        lodScale = float(targetPixels) / max(focalPixels * params.tuning.x, 1e-20);
+    }
+    lowLod = uint(clamp(floor(log2(max(lodScale, 1.0))), 0.0, float(MAX_PROBE_LOD)));
+    highLod = lowLod;
+    blend = 0.0;
+    if (lowLod < MAX_PROBE_LOD) {
+        float nextStart = exp2(float(lowLod + 1u));
+        float overlapStart = 0.9 * nextStart;
+        if (lodScale >= overlapStart && lodScale < nextStart) {
+            highLod = lowLod + 1u;
+            blend = saturate((lodScale - overlapStart) / (nextStart - overlapStart));
+        }
+    }
+}
+
+uint transportCacheBucket(int4 key, uint bucketCount) {
+    return hashKey(key, bucketCount);
+}
+
+float splitIntervalEnd(uint level, uint lod) {
+    return params.tuning.y * exp2(float(2u * min(level, CASCADES - 1u)
+        + min(lod, MAX_PROBE_LOD)));
+}
+
+float splitIntervalStart(uint level, uint lod) {
+    return level == 0u ? 0.0 : splitIntervalEnd(level - 1u, lod);
+}
+
+bool splitIntervalContainsHit(float distance, uint level, uint lod) {
+    return distance > splitIntervalStart(level, lod)
+        && distance <= splitIntervalEnd(level, lod);
+}
+
+uint probeDirectoryCapacity(Parameters p) {
+    // Each level can contain at most two LOD descriptors per visible pixel;
+    // 4N slots keep its worst-case occupancy at or below one half.
+    uint value = max(1u, p.size.z * 4u) - 1u;
+    value |= value >> 1u;
+    value |= value >> 2u;
+    value |= value >> 4u;
+    value |= value >> 8u;
+    value |= value >> 16u;
+    return value + 1u;
+}
+
+uint probeDirectoryBase(uint level, Parameters p) {
+    // Existing cache heads, counters and one-lobe diagnostics occupy 2B+36
+    // words. Four independent directories avoid mixing all 8N nodes in B.
+    return 2u * p.size.w + 36u + level * probeDirectoryCapacity(p);
+}
+
+uint probeDirectoryHead(uint level, uint slot, Parameters p) {
+    return probeDirectoryBase(level, p) + slot;
+}
+
+uint probeCountHead(uint level, uint slot, Parameters p) {
+    uint directoryCapacity = probeDirectoryCapacity(p);
+    // The four ray counts follow the four probe-index directories.
+    return probeDirectoryBase(0u, p) + 4u * directoryCapacity
+        + level * directoryCapacity + slot;
+}
+
+uint probeDirectoryBucket(int4 key, Parameters p) {
+    key.w = int(uint(key.w) & (PROBE_LOD | (3u << 12u)));
+    return hashKey(key, probeDirectoryCapacity(p));
+}
+
+uint probeDescriptorIndex(uint sample, uint variant, uint level) {
+    return (variant * params.size.z + sample) * CASCADES + level;
+}
+
+uint findProbeNode(int4 key) {
+    key.w = int(uint(key.w) & (PROBE_LOD | (3u << 12u)));
+    uint level = (uint(key.w) >> 12u) & 3u;
+    uint directoryCapacity = probeDirectoryCapacity(params);
+    uint slot = probeDirectoryBucket(key, params);
+    [loop] for (uint attempt = 0u; attempt < directoryCapacity; ++attempt) {
+        uint index = heads[probeDirectoryHead(level, slot, params)].load();
         if (index == EMPTY) return EMPTY;
         if (index != TOMBSTONE) {
-            int4 candidate = previous ? previousEntries[index].key : entries[index].key;
-            uint2 candidateIdentity = previous ? previousEntries[index].identity : entries[index].identity;
-            uint candidateSurfaceGroup = previous ? previousEntries[index].padding.y : entries[index].padding.y;
-            if (all(candidate.xyz == key.xyz) && (uint(candidate.w) & (SECONDARY | SURFACE | PROBE_LOD)) == uint(key.w) && all(candidateIdentity == identity) && candidateSurfaceGroup == surfaceGroup) return slot;
+            uint descriptorCount = params.size.z * CASCADES * 2u;
+            if (index >= descriptorCount) return EMPTY;
+            if (all(entries[index].key == key)) return index;
         }
-        slot = (slot + 1) & (params.size.w - 1);
+        slot = (slot + 1u) & (directoryCapacity - 1u);
     }
     return EMPTY;
 }
 
-float4 diffuseGatherLod(float3 position, float3 normal, bool previous, bool secondary, uint2 identity, uint surfaceGroup, uint lod) {
-    if (previous && params.history.z == 0) return 0;
-    float3 grid = position / spacing(params, 0, secondary, lod) - 0.5;
-    int3 base = int3(floor(grid)); float3 fraction = frac(grid);
-    float3 sum = 0; float total = 0;
-    uint frame = params.frame.x + (previous ? 1 : 0);
-    [loop] for (uint corner = 0; corner < 8; ++corner) {
-        int3 bit = int3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
-        float3 weights = lerp(1 - fraction, fraction, float3(bit));
-        float weight = weights.x * weights.y * weights.z;
-        if (weight <= 0.00001) continue;
-        uint probe = findIrradianceProbe(int4(base + bit, int((secondary ? SECONDARY : 0) | surfaceKey(normal) | (lod << 18))), previous, identity, surfaceGroup);
-        if (probe == EMPTY) continue;
-        uint probeIndex = (frame & 1) * params.size.w + probe;
-        // Probes live on actual surface samples. Reject reuse through a wall
-        // instead of interpolating from arbitrary cell centers inside solids.
-        float3 delta = irradianceProbes[probeIndex].origin.xyz - position;
-        float distance = length(delta);
-        if (distance > params.tuning.z * 2 && traceOccluded(position, delta / distance, distance - params.tuning.z)) {
-            continue;
-        }
-        float2 oct = encodeNormal(normal) * float(IRRADIANCE_SIDE) + 0.5;
-        int2 texel = int2(floor(oct)); float2 blend = frac(oct);
-        float4 diffuse = 0;
-        [unroll] for (uint tap = 0; tap < 4; ++tap) {
-            int2 bit = int2(tap & 1, tap >> 1);
-            float2 weights = lerp(1 - blend, blend, float2(bit));
-            int2 p = texel + bit;
-            diffuse += irradianceProbes[probeIndex].coefficients[irradianceOctIndex(p)] * weights.x * weights.y;
-        }
-        if (diffuse.w <= 0.00001) continue;
-        sum += diffuse.xyz / diffuse.w * weight; total += weight;
+uint findProbeNodeSlot(int4 key) {
+    key.w = int(uint(key.w) & (PROBE_LOD | (3u << 12u)));
+    uint level = (uint(key.w) >> 12u) & 3u;
+    uint directoryCapacity = probeDirectoryCapacity(params);
+    uint descriptorCount = params.size.z * CASCADES * 2u;
+    uint slot = probeDirectoryBucket(key, params);
+    [loop] for (uint attempt = 0u; attempt < directoryCapacity; ++attempt) {
+        uint index = heads[probeDirectoryHead(level, slot, params)].load();
+        if (index == EMPTY) return EMPTY;
+        if (index != TOMBSTONE && index < descriptorCount
+            && all(entries[index].key == key)) return slot;
+        slot = (slot + 1u) & (directoryCapacity - 1u);
     }
-    // Sparse interpolation ignores absent probes (paper Section 4). Repeating
-    // a 32-direction, eight-corner ray-tested gather here defeated prefiltering
-    // and multiplied the driver's inlined traversal graph during cold startup.
-    return total > 0.00001 ? float4(sum / total, 1) : float4(0);
+    return EMPTY;
 }
-float3 diffuseGather(float3 position, float3 normal, bool previous, bool secondary, uint2 identity, uint surfaceGroup) {
-    float level = splitDistanceLod(position);
-    uint low = uint(level), high = min(low + 1, 3u);
-    float4 value = 0;
-    [loop] for (uint lod = low; lod <= high; ++lod) {
-        float weight = low == high ? 1.0 : (lod == low ? 1.0 - frac(level) : frac(level));
-        if (weight > 0)
-            value += weight * diffuseGatherLod(position, normal, previous, secondary, identity, surfaceGroup, lod);
+
+uint insertProbeDescriptor(int4 key, uint descriptorIndex) {
+    key.w = int(uint(key.w) & (PROBE_LOD | (3u << 12u)));
+    uint level = (uint(key.w) >> 12u) & 3u;
+    uint directoryCapacity = probeDirectoryCapacity(params);
+    uint slot = probeDirectoryBucket(key, params);
+    [loop] for (uint attempt = 0u; attempt < directoryCapacity; ++attempt) {
+        uint head = probeDirectoryHead(level, slot, params);
+        // All descriptor keys are published by the preceding seed dispatch;
+        // the CAS publishes only an immutable descriptor index.
+        uint candidate = heads[head].compareExchange(EMPTY, descriptorIndex);
+        if (candidate == EMPTY) {
+            // WGSL's compare-exchange may fail spuriously while the word is
+            // still EMPTY. A successful publication is visible as our unique
+            // descriptor index; otherwise retry this same slot.
+            uint observed = heads[head].load();
+            if (observed == descriptorIndex) return descriptorIndex;
+            if (observed == EMPTY) continue;
+            candidate = observed;
+        }
+        if (candidate != TOMBSTONE) {
+            uint descriptorCount = params.size.z * CASCADES * 2u;
+            if (candidate >= descriptorCount) return EMPTY;
+            if (all(entries[candidate].key == key)) return candidate;
+        }
+        slot = (slot + 1u) & (directoryCapacity - 1u);
     }
-    return value.w > 0 ? value.xyz / value.w : float3(0);
+    return EMPTY;
+}
+
+uint findEntry(int4 key, bool previous = false) {
+    if (previous && params.history.z <= 0.0) return EMPTY;
+    uint bucket = transportCacheBucket(key, params.size.w);
+    uint index = previous ? previousHeads[bucket] : heads[bucket].load();
+    uint count, stride;
+    if (previous) previousEntries.GetDimensions(count, stride);
+    else entries.GetDimensions(count, stride);
+    uint limit = previous ? min(cacheHistoryQuota(params), count) : count;
+    [loop] for (uint visited = 0u; index != EMPTY && visited < limit; ++visited) {
+        if (index >= count) return EMPTY;
+        Entry entry = previous ? previousEntries[index] : entries[index];
+        if (entry.next == index) return EMPTY;
+        if (all(entry.key == key)) return index;
+        index = entry.next;
+    }
+    return EMPTY;
+}
+
+uint findIrradianceProbe(int4 key, bool previous) {
+    if (previous && params.history.z <= 0.0) return EMPTY;
+    uint directoryCapacity = probeDirectoryCapacity(params);
+    uint slot = probeDirectoryBucket(key, params);
+    uint head = probeDirectoryHead(0u, slot, params);
+    uint index = previous ? previousHeads[head] : heads[head].load();
+    uint count, stride;
+    if (previous) previousEntries.GetDimensions(count, stride);
+    else entries.GetDimensions(count, stride);
+    [loop] for (uint attempt = 0u; attempt < directoryCapacity; ++attempt) {
+        if (index == EMPTY) return EMPTY;
+        if (index != TOMBSTONE) {
+            if (index >= count) return EMPTY;
+            Entry entry = previous ? previousEntries[index] : entries[index];
+            if (all(entry.key.xyz == key.xyz)
+                && (uint(entry.key.w) & PROBE_LOD) == (uint(key.w) & PROBE_LOD)) {
+                if (previous && dirtyCacheEntry(entry)) return EMPTY;
+                if (previous) {
+                    uint page = ((params.frame.x + 1u) & 1u) * directoryCapacity + slot;
+                    DependencyContext packedDependency = probeDependency(
+                        directionalProbes[page].dependencyMin,
+                        directionalProbes[page].dependencyMax);
+                    // Packed probes have only their aggregate geometry bounds;
+                    // unknown hit bounds conservatively reject local-light reuse.
+                    if (!radianceHistoryEligible(packedDependency,
+                            unknownLightHitBounds())) return EMPTY;
+                }
+                return slot;
+            }
+        }
+        slot = (slot + 1u) & (directoryCapacity - 1u);
+        head = probeDirectoryHead(0u, slot, params);
+        index = previous ? previousHeads[head] : heads[head].load();
+    }
+    return EMPTY;
+}
+
+float4 interpolateMergedChildren(int3 base, float3 fraction, uint direction,
+                                 uint level, uint lod, bool previous,
+                                 inout DependencyContext dependency,
+                                 inout float4 lightHitBounds) {
+    float3 sum = 0.0;
+    float total = 0.0;
+    float potential = 0.0;
+    [loop] for (uint corner = 0u; corner < 8u; ++corner) {
+        uint3 bit = uint3(corner & 1u, (corner >> 1u) & 1u, corner >> 2u);
+        float3 axisWeight = lerp(1.0 - fraction, fraction, float3(bit));
+        float weight = axisWeight.x * axisWeight.y * axisWeight.z;
+        if (weight <= 1e-6) continue;
+        potential += weight;
+        int4 key = int4(base + int3(bit), int(direction | (level << 12u) | (lod << 18u)));
+        uint index = findEntry(key, previous);
+        if (index == EMPTY) continue;
+        Entry entry = previous ? previousEntries[index] : entries[index];
+        if (previous && (!intervalHistoryAlive(entry.lastSample, params)
+            || !radianceHistoryEligible(entryMergedDependency(entry), entry.boundaryMerged))) continue;
+        if (entry.merged.w <= 0.0 || !all(isfinite(entry.merged))) continue;
+        // RGB is the conditional mean over the supported fraction, not a
+        // premultiplied value. Carry that fraction through spatial filtering.
+        float supportedWeight = weight * saturate(entry.merged.w);
+        sum += entry.merged.xyz * supportedWeight;
+        total += supportedWeight;
+        dependencyUnion(dependency, entryMergedDependency(entry));
+        lightHitBounds = unionConservativeSpheres(lightHitBounds, entry.boundaryMerged);
+    }
+    if (total <= 1e-6) return 0.0;
+    return float4(sum / total, saturate(total / max(potential, 1e-8)));
 }
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void clear(uint3 thread : SV_DispatchThreadID) {
-    if (thread.x < params.size.w) heads[thread.x].store(EMPTY);
-    if (thread.x < params.size.w) heads[params.size.w + 1 + thread.x].store(EMPTY);
+    if (thread.x < params.size.w) {
+        heads[thread.x].store(EMPTY);
+        heads[params.size.w + 1u + thread.x].store(EMPTY);
+    }
+    uint directoryCapacity = probeDirectoryCapacity(params);
+    uint directorySlots = 4u * directoryCapacity;
+    if (thread.x < directorySlots) {
+        heads[probeDirectoryBase(0u, params) + thread.x].store(EMPTY);
+        uint level = thread.x / directoryCapacity;
+        uint slot = thread.x % directoryCapacity;
+        heads[probeCountHead(level, slot, params)].store(0u);
+    }
     if (thread.x == 0) {
         heads[params.size.w].store(0);
         // The irradiance heads include index 2*size.w; counters start after it.
@@ -148,21 +408,104 @@ void clear(uint3 thread : SV_DispatchThreadID) {
         heads[2 * params.size.w + 2].store(0); // rejected irradiance insertions
         heads[2 * params.size.w + 3].store(0); // entries colliding in prior buckets
         heads[2 * params.size.w + 4].store(0); // persistent cache overflow
+        if (params.ownerSequence.z != 0u) {
+            heads[2 * params.size.w + 5].store(0); // traversal-query attempts
+            heads[2 * params.size.w + 6].store(0); // traversal queries admitted
+            heads[2 * params.size.w + 7].store(0); // selected receiver updates
+            heads[2 * params.size.w + 8].store(params.size.z); // visible pixel candidates
+            heads[2 * params.size.w + 9].store(0); // occupied probe slots
+            // One diffuse lobe: 8 confidence + 9 raw + 9 temporal bins.
+            [loop] for (uint word = 0u; word < 26u; ++word)
+                heads[2 * params.size.w + 10u + word].store(0u);
+        }
+    }
+    if (thread.x == 0u && params.ownerSequence.z != 0u)
+        rootRayOffset[0].store(0u);
+    // Both head clears run before transport. The second one preserves shared
+    // query/owner counters; only the first needs to clear sparse output images,
+    // which otherwise incurs a redundant full-image write on every frame.
+    if (params.ownerSequence.z != 0u) {
+        uint clearThreads = max(params.size.w, directorySlots);
+        uint workgroupThreads = max(((clearThreads + 63u) / 64u) * 64u, 64u);
+        uint resolveCount = giResolveExtent(params).x * giResolveExtent(params).y;
+        [loop] for (uint pixel = thread.x; pixel < resolveCount; pixel += workgroupThreads) {
+            uint2 coordinate = uint2(pixel % giResolveExtent(params).x,
+                                     pixel / giResolveExtent(params).x);
+            irradiance.Store(int2(coordinate), 0.0);
+        }
     }
     // Entries unreachable from a hash head are never read. Avoid clearing the
     // large interval allocation; trace and retain initialize reachable nodes.
 }
 
-uint findEntry(int4 key, uint2 identity, uint surfaceGroup, bool previous = false) {
-    if (previous && params.history.z == 0) return EMPTY;
-    uint bucket = (hashKey(key, params.size.w) ^ surfaceGroup) & (params.size.w - 1);
-    uint index = previous ? previousHeads[bucket] : heads[bucket].load();
-    [loop] while (index != EMPTY) {
-        Entry entry = previous ? previousEntries[index] : entries[index];
-        if (all(entry.key == key) && all(entry.identity == identity) && entry.padding.y == surfaceGroup) break;
-        index = entry.next;
+uint permuteCandidateDomain(uint value, uint mask, uint seed) {
+    // Each xor-shift and odd multiply is invertible modulo 2^k. Mask after
+    // every operation so this remains a permutation of the selected power-of-2
+    // domain rather than only of all 32-bit values.
+    value = (value ^ seed) & mask;
+    value = (value ^ (value >> 16)) & mask;
+    value = (value * 0x7feb352du) & mask;
+    value = (value ^ (value >> 15)) & mask;
+    value = (value * 0x846ca68bu) & mask;
+    value = (value ^ (value >> 16)) & mask;
+    return value;
+}
+
+uint inverseXorShiftRight(uint value, uint shift) {
+    uint result = value;
+    [loop] for (uint offset = shift; offset < 32u; offset += shift)
+        result ^= value >> offset;
+    return result;
+}
+
+uint inversePermuteCandidateDomain(uint value, uint mask, uint seed) {
+    value = inverseXorShiftRight(value, 16u) & mask;
+    value = (value * 0x43021123u) & mask;
+    value = inverseXorShiftRight(value, 15u) & mask;
+    value = (value * 0x1d69e2a5u) & mask;
+    value = inverseXorShiftRight(value, 16u) & mask;
+    return (value ^ seed) & mask;
+}
+
+uint transportCandidateRank(uint sample) {
+    uint candidateCount = params.size.z;
+    if (candidateCount <= 1u) return 0u;
+    // Cycle walking restricts this reversible permutation to an arbitrary
+    // candidate count while preserving exact no-repeat epochs. The power-of-2
+    // domain is at most twice the candidate grid, so rejection is usually rare.
+    uint mask = 0u;
+    while (mask < candidateCount - 1u) mask = (mask << 1u) | 1u;
+    uint seed = (params.size.x * 0x9e3779b9u)
+        ^ (params.size.y * 0x85ebca6bu) ^ candidateCount;
+    seed &= mask;
+    uint rank = permuteCandidateDomain(sample, mask, seed);
+    [loop] while (rank >= candidateCount) {
+        rank = permuteCandidateDomain(rank, mask, seed);
     }
-    return index;
+    return rank;
+}
+
+bool transportCandidateSelected(uint sample) {
+    uint candidateCount = params.size.z;
+    // An explicit per-frame query cap can be too small to complete one
+    // receiver's seed + direct-light estimator. In that case the host records
+    // a disabled-update bit so budget zero is not mistaken for legacy dense
+    // sampling.
+    if ((params.ownerSequence.w & 0x40000000u) != 0u) return false;
+    uint budget = params.sampling.x;
+    if (candidateCount == 0 || budget == 0 || budget >= candidateCount) return true;
+
+    // Fair work is a circular window in the stable rank permutation. The host
+    // advances this cursor by the actual fair quota only after a submitted frame.
+    uint fairStart = (params.ownerSequence.w & 0x03ffffffu) % candidateCount;
+    uint fairQuota = params.ownerSequence.z;
+    uint rank = transportCandidateRank(sample);
+    bool fairSelected = fairQuota > 0u
+        && (rank >= fairStart
+            ? rank - fairStart < fairQuota
+            : candidateCount - fairStart + rank < fairQuota);
+
+    return fairSelected;
 }
 
 [shader("compute")]
@@ -170,136 +513,202 @@ uint findEntry(int4 key, uint2 identity, uint surfaceGroup, bool previous = fals
 void seed(uint3 thread : SV_DispatchThreadID) {
     if (any(thread.xy >= params.size.xy)) return;
     uint sample = thread.x + thread.y * params.size.x;
-    surfaceGroupOutput.Store(int2(thread.xy), EMPTY);
-    [loop] for (uint level = 0; level < CASCADES; ++level) entries[sample * CASCADES + level].valid = 0;
-    entries[sample * CASCADES].samples = 0;
+    [unroll] for (uint variant = 0u; variant < 2u; ++variant)
+        [unroll] for (uint level = 0u; level < CASCADES; ++level) {
+            uint descriptor = probeDescriptorIndex(sample, variant, level);
+            entries[descriptor] = (Entry)0;
+        }
+
     uint2 full = fullPixel(thread.xy, params);
     float depth = depthTexture.Load(int3(full, 0));
-    float3 normal = normalTexture.Load(int3(full, 0)).xyz * 2 - 1;
-    if (depth <= 0 || dot(normal, normal) < 0.01) return;
-    normal = normalize(normal);
+    if (!(depth > 0.0) || !isfinite(depth)) return;
+    uint4 deferred = gbuffer.Load(int3(full, 0));
+    uint4 raster = rasterReceiver.Load(int3(full, 0));
+    float3 shadingNormal = deferredShadingNormal(deferred);
+    if (!(dot(shadingNormal, shadingNormal) > 0.01)
+        || !all(isfinite(shadingNormal))) return;
+    float3 geometricNormal = receiverGeometricNormal(raster.z, shadingNormal);
     float3 surfacePosition = worldPosition(float2(full) + 0.5, depth, params);
-    float3 near = worldPosition(float2(full) + 0.5, 1, params);
-    float distance = length(surfacePosition - near);
-    if (!(distance > 0) || !isfinite(distance)) return;
-    // Reconstruct the visible receiver from the prepass ray itself. This keeps
-    // the entity and triangle identity in lockstep with the GI acceleration
-    // structure, without depending on a second material raster pass.
-    Hit receiverHit = traceRay(near, (surfacePosition - near) / distance, distance + params.tuning.z);
-    if (receiverHit.triangle == EMPTY
-        || abs(receiverHit.distance - distance) > max(params.tuning.z, distance * 0.00001)) return;
-    uint2 receiverIdentity = hitInstanceIdentity(receiverHit);
-    uint surfaceGroup = triangleSurfaceGroup(receiverHit.triangle);
-    float3 geometricNormal = hitAttributes(receiverHit).geometricNormal;
-    if (dot(geometricNormal, normal) < 0) geometricNormal = -geometricNormal;
-    surfaceGroupOutput.Store(int2(thread.xy), surfaceGroup);
-    float3 position = rayOffset(surfacePosition, geometricNormal, params.tuning.z);
-    uint index = sample * CASCADES;
-    Entry entry = (Entry)0;
-    entry.identity = receiverIdentity;
-    entry.padding.y = surfaceGroup;
-    entry.merged = float4(geometricNormal, 0); // receiver normal, consumed before trace deposit
-    entry.key = cacheKey(position, 0, 0, params, false, surfaceKey(normal), uint(splitDistanceLod(position))); entry.samples = 1; entry.valid = 1;
-    entry.next = heads[(hashKey(entry.key, params.size.w) ^ surfaceGroup) & (params.size.w - 1)].exchange(index);
-    entries[index] = entry;
+    float3 cameraNear = worldPosition(float2(full) + 0.5, 1.0, params);
+    if (dot(geometricNormal, cameraNear - surfacePosition) < 0.0)
+        geometricNormal = -geometricNormal;
+
+    uint lowLod, highLod;
+    float lodBlend;
+    splitLodBlend(surfacePosition, lowLod, highLod, lodBlend);
+    uint selectedLod = 0u;
+    if (highLod != lowLod) {
+        uint phaseBits = transportHash(sample ^ (params.frame.x * 0x9e3779b9u));
+        float phase = float(phaseBits >> 8u) * (1.0 / 16777216.0);
+        selectedLod = phase < lodBlend ? 1u : 0u;
+    }
+    bool selectedRay = transportCandidateSelected(sample);
+    [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
+        if (variant == 1u && highLod == lowLod) continue;
+        uint lod = variant == 0u ? lowLod : highLod;
+        [unroll] for (uint level = 0u; level < CASCADES; ++level) {
+            uint index = probeDescriptorIndex(sample, variant, level);
+            int4 key = cacheKey(surfacePosition, 0u, level, params, lod);
+            Entry entry = (Entry)0;
+            entry.key = key;
+            entry.origin = float4((float3(key.xyz) + 0.5)
+                * spacing(params, level, lod), 1.0);
+            entry.valid = 1u;
+            entry.next = EMPTY;
+            // Each screen update traces once. In an LOD overlap, temporal
+            // low-discrepancy assignment balances it between the two fields.
+            entry.padding.x = (level == 0u && selectedRay && variant == selectedLod)
+                ? 1u : 0u;
+            entry.padding.y = 1u;
+            entries[index] = entry;
+        }
+    }
+    if (selectedRay) heads[2u * params.size.w + 7u].add(1u);
 }
 
-// Count parents from unique children, not from every pixel. This bounds the
-// serial chain work in coarse probes that cover thousands of screen pixels.
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void parents(uint3 thread : SV_DispatchThreadID) {
-    if (thread.x >= params.size.z) return;
-    uint index = thread.x * CASCADES + params.frame.y;
-    Entry child = entries[index - 1];
-    if (child.valid == 0) return;
-    Entry entry = (Entry)0;
-    entry.identity = child.identity;
-    entry.key = int4(child.key.xyz >> 1, int((params.frame.y << 12) | (uint(child.key.w) & (SURFACE | PROBE_LOD))));
-    entry.samples = child.samples; entry.valid = 1;
-    entry.next = heads[hashKey(entry.key, params.size.w)].exchange(index);
-    entries[index] = entry;
-}
-
-// Algorithm 3: count rays per probe and assign a local ordinal. The order of
-// pixels within one probe is immaterial; its R2 segment is contiguous.
+// Deduplicate immutable per-pixel descriptors after seed's dispatch barrier.
+// Insertion publishes only a descriptor index; keys are never read while a
+// writer is still constructing the record. Same-cell pixels take one bounded
+// probe-directory lookup instead of forming a screen-sized linked list.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void rank(uint3 thread : SV_DispatchThreadID) {
-    if (thread.x >= params.size.w) return;
-    uint source = gpuSortLinkedList(heads[thread.x].load()), unique = EMPTY;
-    [loop] while (source != EMPTY) {
-        Entry sample = entries[source]; uint next = sample.next;
-        uint match = unique != EMPTY && all(entries[unique].key == sample.key) && all(entries[unique].identity == sample.identity) && entries[unique].padding.y == sample.padding.y ? unique : EMPTY;
-        if (match == EMPTY) {
-            sample.next = unique; sample.lastSample = 0; sample.valid = 1;
-            entries[source] = sample; unique = source;
-        } else {
-            entries[source].lastSample = entries[match].samples;
-            entries[match].samples += sample.samples;
-            entries[source].valid = 0;
+    if (thread.x >= params.size.z) return;
+    uint sample = thread.x;
+    [unroll] for (uint variant = 0u; variant < 2u; ++variant)
+        [unroll] for (uint level = 0u; level < CASCADES; ++level) {
+            uint index = probeDescriptorIndex(sample, variant, level);
+            Entry descriptor = entries[index];
+            if (descriptor.valid == 0u) continue;
+            uint canonical = insertProbeDescriptor(descriptor.key, index);
+            if (canonical == EMPTY) {
+                entries[index].valid = 0u;
+                continue;
+            }
+            entries[index].next = canonical;
+            if (level == 0u && descriptor.padding.x != 0u) {
+                uint slot = findProbeNodeSlot(descriptor.key);
+                if (slot == EMPTY) continue;
+                uint localOrdinal = heads[probeCountHead(0u, slot, params)].add(1u);
+                entries[index].lastSample = localOrdinal;
+            }
         }
-        source = next;
+}
+
+// Every visible point seeds its nearest probe at each level and active LOD;
+// with doubled grid spacing this equals Algorithm 1's nearest-parent chain.
+// Counts flow from each unique child to its already initialized same-LOD parent.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void parents(uint3 thread : SV_DispatchThreadID) {
+    uint parentLevel = params.frame.y;
+    if (parentLevel == 0u || parentLevel >= CASCADES) return;
+    uint parentSlot = thread.x;
+    if (parentSlot >= probeDirectoryCapacity(params)) return;
+    uint parentIndex = heads[probeDirectoryHead(parentLevel, parentSlot, params)].load();
+    if (parentIndex == EMPTY || parentIndex == TOMBSTONE) return;
+    Entry parent = entries[parentIndex];
+    if (((uint(parent.key.w) >> 12u) & 3u) != parentLevel) return;
+
+    uint childLevel = parentLevel - 1u;
+    uint lodBits = uint(parent.key.w) & PROBE_LOD;
+    uint rayCount = 0u;
+    [unroll] for (uint child = 0u; child < 8u; ++child) {
+        int3 bit = int3(child & 1u, (child >> 1u) & 1u, (child >> 2u) & 1u);
+        int4 childKey = int4(parent.key.xyz * 2 + bit,
+            int((childLevel << 12u) | lodBits));
+        uint childSlot = findProbeNodeSlot(childKey);
+        if (childSlot != EMPTY)
+            rayCount += heads[probeCountHead(childLevel, childSlot, params)].load();
     }
-    heads[thread.x].store(unique);
+    heads[probeCountHead(parentLevel, parentSlot, params)].store(rayCount);
 }
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void prefix(uint3 thread : SV_DispatchThreadID) {
-    if (thread.x >= params.size.w) return;
+    if (thread.x >= probeDirectoryCapacity(params)) return;
     uint level = params.frame.y;
-    [loop] for (uint index = heads[thread.x].load(); index != EMPTY; index = entries[index].next) {
-        int4 key = entries[index].key;
-        if ((uint(key.w) >> 12 & 3u) != level) continue;
-        // Independent roots may use independent sequence phases. Descendants
-        // share contiguous segments at every cascade, including negative cells.
-        uint offset = hashKey(key, 65536);
-        if (level + 1 < CASCADES) {
-            int3 parent = key.xyz >> 1;
-            uint parentIndex = findEntry(int4(parent, int(((level + 1) << 12) | (uint(key.w) & (SURFACE | PROBE_LOD)))), entries[index].identity, 0);
-            offset = parentIndex == EMPTY ? 0 : entries[parentIndex].valid;
-            int3 local = key.xyz - parent * 2;
-            uint ordinal = uint(local.x + local.y * 2 + local.z * 4);
-            [loop] for (uint sibling = 0; sibling < ordinal; ++sibling) {
-                int3 bit = int3(sibling & 1, (sibling >> 1) & 1, (sibling >> 2) & 1);
-                uint child = findEntry(int4(parent * 2 + bit, int((level << 12) | (uint(key.w) & (SURFACE | PROBE_LOD)))), entries[index].identity, level == 0 ? entries[index].padding.y : 0);
-                if (child != EMPTY) offset += entries[child].samples;
-            }
+    uint index = heads[probeDirectoryHead(level, thread.x, params)].load();
+    if (index == EMPTY || index == TOMBSTONE) return;
+    Entry probe = entries[index];
+    int4 key = probe.key;
+    level = (uint(key.w) >> 12u) & 3u;
+    if (level != params.frame.y) return;
+    uint rayCount = heads[probeCountHead(level, thread.x, params)].load();
+
+    uint offset = 0u;
+    if (level + 1u == CASCADES) {
+        // Root iteration order is unspecified; atomic ranges are disjoint and
+        // form one contiguous prefix over the actual selected rays.
+        offset = rootRayOffset[0].add(rayCount);
+    } else {
+        int3 parent = key.xyz >> 1;
+        uint lodBits = uint(key.w) & PROBE_LOD;
+        uint parentIndex = findProbeNode(int4(parent,
+            int(((level + 1u) << 12u) | lodBits)));
+        if (parentIndex != EMPTY) offset = entries[parentIndex].valid;
+        int3 local = key.xyz - parent * 2;
+        uint ordinal = uint(local.x + local.y * 2 + local.z * 4);
+        [loop] for (uint sibling = 0u; sibling < ordinal; ++sibling) {
+            int3 bit = int3(sibling & 1u, (sibling >> 1u) & 1u,
+                            (sibling >> 2u) & 1u);
+            int4 childKey = int4(parent * 2 + bit,
+                int((level << 12u) | lodBits));
+            uint childSlot = findProbeNodeSlot(childKey);
+            if (childSlot != EMPTY)
+                offset += heads[probeCountHead(level, childSlot, params)].load();
         }
-        entries[index].valid = offset;
     }
+    entries[index].valid = offset;
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void generateDirections(uint3 thread : SV_DispatchThreadID) {
     if (any(thread.xy >= params.size.xy)) return;
-    uint2 full = fullPixel(thread.xy, params);
-    if (depthTexture.Load(int3(full, 0)) <= 0) return;
-    uint index = (thread.x + thread.y * params.size.x) * CASCADES;
-    if (entries[index].samples == 0) return;
-    uint probe = findEntry(entries[index].key, entries[index].identity, entries[index].padding.y);
-    entries[index].lastSample = probe == EMPTY ? 0 : entries[probe].valid + entries[index].lastSample;
+    uint sample = thread.x + thread.y * params.size.x;
+    [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
+        uint index = probeDescriptorIndex(sample, variant, 0u);
+        if (entries[index].padding.x == 0u || entries[index].next == EMPTY) continue;
+        uint canonical = entries[index].next;
+        entries[index].lastSample += entries[canonical].valid;
+    }
 }
 
 uint currentCapacity() {
-    return params.size.z * CASCADES * (params.history.y > 0 ? 4 : 2);
+    // Two LOD variants × four levels × one visible-pixel descriptor.
+    return params.size.z * CASCADES * 2u;
 }
+
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void retain(uint3 thread : SV_DispatchThreadID) {
-    if (thread.x >= params.size.w || params.history.z == 0 || params.history.x == 0 || params.history.w == 0) return;
+    if (thread.x >= params.size.w || params.history.z == 0
+        || (params.history.x == 0 && params.intervalHistory.x == 0)
+        || params.history.w == 0) return;
     uint capacity = currentCapacity();
-    uint bucketQuota = params.history.y > 0 ? 4 : 2;
+    uint bucketQuota = cacheHistoryQuota(params);
     uint bucketBase = thread.x * bucketQuota;
     uint bucketRetained = 0;
     uint bucketLoad = 0;
-    [loop] for (uint index = previousHeads[thread.x]; index != EMPTY; index = previousEntries[index].next) {
+    uint previousCount, previousStride;
+    previousEntries.GetDimensions(previousCount, previousStride);
+    [loop] for (uint index = previousHeads[thread.x]; index != EMPTY && bucketLoad < bucketQuota; index = previousEntries[index].next) {
+        if (index >= previousCount) break;
         Entry entry = previousEntries[index];
+        if (entry.next == index) break;
         bucketLoad++;
-        if (params.frame.x - entry.lastSample > uint(params.history.w)) continue;
+        if (!intervalHistoryAlive(entry.lastSample, params)) continue;
+        if (!betaHistoryEligible(entryDependency(entry), entry.normal)) continue;
+        if (persistentWorldIntervals(params)
+            && !radianceHistoryEligible(entryMergedDependency(entry), entry.boundaryMerged)) {
+            // A changed dependency invalidates composed I, not independent clean J/beta.
+            entry.merged = 0.0;
+            storeEntryMergedDependency(entry, dependencyUnknown());
+            entry.boundaryMerged = unknownLightHitBounds();
+        }
         heads[params.size.w].add(1);
         if (bucketRetained >= bucketQuota) {
             heads[2 * params.size.w + 1].add(1);
@@ -314,110 +723,110 @@ void retain(uint3 thread : SV_DispatchThreadID) {
     if (bucketLoad > 1) heads[2 * params.size.w + 3].add(bucketLoad - 1);
 }
 
-void deposit(uint first, float3 position, float3 normal, float3 direction, Hit hit, float3 radiance, bool secondary, uint2 identity, uint surfaceGroup, uint lod) {
-    [loop] for (uint level = 0; level < CASCADES; ++level) {
+void deposit(uint first, float3 samplePosition, float3 rayOrigin,
+             float3 direction, Hit hit, float3 radiance, uint lod,
+             DependencyContext rayDependency, float dependencyStart,
+             float dependencyDistance, float dependencyPadding,
+             DependencyContext outgoingDependency) {
+    if ((hit.errors & HIT_QUERY_UNSUPPORTED) != 0u) return;
+    [loop] for (uint level = 0u; level < CASCADES; ++level) {
         uint index = first + level;
-        float end = params.tuning.y * float(1u << (2u * level + lod)) * (secondary ? 4.0 : 1.0);
-        bool terminates = hit.distance <= end || level == CASCADES - 1;
+        float end = splitIntervalEnd(level, lod);
+        float intervalStart = splitIntervalStart(level, lod);
+        // The last cascade owns the unbounded tail, including supported-zero
+        // escapes. Its nominal cutoff only determines the preceding interval.
+        bool terminal = level + 1u == CASCADES;
+        bool terminates = terminal || splitIntervalContainsHit(hit.distance, level, lod);
         Entry entry = (Entry)0;
-        entry.identity = identity;
-        entry.padding.y = level == 0 ? surfaceGroup : 0;
-        entry.key = cacheKey(position, directionIndex(direction, level), level, params, secondary, surfaceKey(normal), lod);
-        entry.interval = terminates ? float4(radiance, 0.0) : float4(0, 0, 0, 1);
-        entry.merged = 0.0;
-        entry.origin = float4(position, 1);
-        // An epoch distinguishes live records from untouched physical slots.
-        // Reduction clears duplicate records, leaving canonical entries stamped.
+        entry.key = cacheKey(samplePosition, directionIndex(direction, level),
+                             level, params, lod);
+        entry.origin = float4((float3(entry.key.xyz) + 0.5)
+            * spacing(params, level, lod), 1.0);
+        entry.interval = terminates ? float4(radiance, 0.0) : float4(0.0, 0.0, 0.0, 1.0);
+        DependencyContext intervalDependency = rayDependency.known
+            ? dependencyEmpty() : dependencyUnknown();
+        float intervalEnd = terminal ? dependencyDistance
+            : min(dependencyDistance, max(end, 0.0));
+        float intervalDependencyStart = max(dependencyStart, intervalStart);
+        entry.normal = unknownLightHitBounds();
+        if (rayDependency.known && rayDependency.hasBounds
+            && intervalEnd >= intervalDependencyStart) {
+            float3 segmentStart = rayOrigin + direction * intervalDependencyStart;
+            float3 segmentEnd = rayOrigin + direction * intervalEnd;
+            dependencyIncludeSegment(intervalDependency,
+                segmentStart, segmentEnd, dependencyPadding);
+            entry.normal = dependencySegmentSphere(segmentStart, segmentEnd,
+                dependencyPadding);
+        }
+        if (terminates) dependencyUnion(intervalDependency, outgoingDependency);
+        storeEntryDependency(entry, intervalDependency);
+        storeEntryMergedDependency(entry, intervalDependency);
+        float4 lightHitBounds = terminates && hit.triangle != EMPTY
+            ? lightHitBoundsAt(rayOrigin + direction * hit.distance)
+            : emptyLightHitBounds();
+        entry.boundaryInterval = lightHitBounds;
+        entry.boundaryMerged = lightHitBounds;
         entry.valid = params.frame.x | 0x80000000u;
-        entry.lastSample = params.frame.x; entry.samples = 1;
-        entry.next = heads[(hashKey(entry.key, params.size.w) ^ entry.padding.y) & (params.size.w - 1)].exchange(index);
+        entry.lastSample = params.frame.x;
+        entry.samples = 1u;
+        entry.next = heads[transportCacheBucket(entry.key, params.size.w)].exchange(index);
         entries[index] = entry;
-        // Do not deposit an occluded ray in higher cascades (paper Section 5).
+        // Paper §5 leaves all farther intervals unfilled after the first hit.
         if (terminates) break;
+    }
+}
+
+void traceTransport(uint3 thread) {
+    uint2 pixel = thread.xy;
+    if (any(pixel >= params.size.xy)) return;
+    uint sample = pixel.x + pixel.y * params.size.x;
+    uint2 full = fullPixel(pixel, params);
+    float depth = depthTexture.Load(int3(full, 0));
+    if (!(depth > 0.0) || !isfinite(depth)) return;
+    uint4 deferred = gbuffer.Load(int3(full, 0));
+    uint4 raster = rasterReceiver.Load(int3(full, 0));
+    float3 shadingNormal = deferredShadingNormal(deferred);
+    if (!(dot(shadingNormal, shadingNormal) > 0.01)
+        || !all(isfinite(shadingNormal))) return;
+    float3 geometricNormal = receiverGeometricNormal(raster.z, shadingNormal);
+    float3 surfacePosition = worldPosition(float2(full) + 0.5, depth, params);
+    float3 cameraNear = worldPosition(float2(full) + 0.5, 1.0, params);
+    if (dot(geometricNormal, cameraNear - surfacePosition) < 0.0)
+        geometricNormal = -geometricNormal;
+
+    float2 jitter = r2(transportHash(params.frame.x ^ 0x5a17c9e3u));
+    [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
+        uint first = probeDescriptorIndex(sample, variant, 0u);
+        Entry descriptor = entries[first];
+        if (descriptor.padding.x == 0u || descriptor.next == EMPTY) continue;
+        uint lod = (uint(descriptor.key.w) & PROBE_LOD) >> 18u;
+        uint sequence = descriptor.lastSample;
+        float2 uv = frac(0.5 + r2(sequence + 1u) + jitter);
+        float3 direction = decodeDirection(uv);
+        if (dot(direction, geometricNormal) < 0.0) direction = -direction;
+        float3 rayOrigin = rayOffset(surfacePosition, geometricNormal, params.tuning.z);
+        DependencyContext rayDependency = dependencyUnknown();
+        DependencyContext outgoingDependency = dependencyEmpty();
+        float dependencyStart = 0.0, dependencyDistance = 0.0;
+        float dependencyPadding = 0.0;
+        float coneWidth = params.tuning.x * 0.5;
+        Hit hit = traceRayTracked(rayOrigin, direction, 1e20, rayDependency,
+            dependencyStart, dependencyDistance, dependencyPadding,
+            false, coneWidth, 0.5);
+        bool radianceSupported;
+        float3 radiance = outgoingRadianceTracked(rayOrigin, direction, hit,
+            radianceSupported, outgoingDependency, mergeVisibilityAdmissionLimit());
+        if (!radianceSupported) continue;
+        deposit(first, surfacePosition, rayOrigin, direction, hit, radiance, lod,
+            rayDependency, dependencyStart, dependencyDistance, dependencyPadding,
+            outgoingDependency);
     }
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void trace(uint3 thread : SV_DispatchThreadID) {
-    uint2 pixel = thread.xy;
-    if (any(pixel >= params.size.xy)) return;
-    uint sample = pixel.x + pixel.y * params.size.x;
-    bool receiverValid = entries[sample * CASCADES].samples > 0;
-    float3 geometricNormal = entries[sample * CASCADES].merged.xyz;
-    uint rank = entries[sample * CASCADES].lastSample;
-    [loop] for (uint level = 0; level < CASCADES; ++level) {
-        entries[sample * CASCADES + level].valid = 0;
-        if (params.history.y > 0) entries[(params.size.z + sample) * CASCADES + level].valid = 0;
-    }
-    uint2 full = fullPixel(pixel, params);
-    float depth = depthTexture.Load(int3(full, 0));
-    if (depth <= 0.0 || !receiverValid) return;
-    float3 normal = normalTexture.Load(int3(full, 0)).xyz * 2.0 - 1.0;
-    if (dot(normal, normal) < 0.01) return;
-    normal = normalize(normal);
-    float3 surfacePosition = worldPosition(float2(full) + 0.5, depth, params);
-    float3 position = rayOffset(surfacePosition, geometricNormal, params.tuning.z);
-    // Like Chandra's randomized frame rotation: adding R2(frame) to R2(rank)
-    // only shifts the same sequence by one and repeats N-1 of a probe's N rays.
-    float2 jitter = r2(hashKey(int4(int(params.frame.x), 29, 968, 0), 0x80000000u));
-    float2 uv = frac(0.5 + r2(rank + 1) + jitter);
-    float3 direction = decodeDirection(uv);
-    if (dot(direction, normal) < 0) direction = -direction;
-    // The last cascade covers the remainder of the ray. A finite cutoff
-    // mistakes distant occluders for open sky and leaks environment lighting.
-    float3 pixelNeighbor = worldPosition(float2(full) + 0.5 + float2(float(params.viewport.z) / float(params.size.x), 0), depth, params);
-    float coneWidth = length(pixelNeighbor - surfacePosition);
-    Hit hit = traceRay(position, direction, 1e20, false, coneWidth, 0.5);
-    float3 radiance = outgoingRadiance(position, direction, hit);
-    if (params.history.y > 0 && hit.triangle != EMPTY && any(worldTriangle(hit).albedo.xyz > 0)) {
-        HitAttributes attributes = hitAttributes(hit);
-        float3 hitNormal = hitShadingNormal(hit, attributes, direction);
-        float3 geometricNormal = attributes.geometricNormal;
-        if (dot(geometricNormal, direction) > 0) geometricNormal = -geometricNormal;
-        float3 secondaryPosition = rayOffset(position + direction * hit.distance, geometricNormal, params.tuning.z);
-        // Independent phase: a fixed rotation of the primary R2 sample couples
-        // both path vertices and can miss an emitter across a whole moving frame.
-        uint secondaryPhase = hashKey(int4(int(sample), int(params.frame.x), int(rank), 0), 0x80000000u);
-        float3 secondaryDirection = decodeDirection(frac(0.5 + r2(secondaryPhase)));
-        if (dot(secondaryDirection, geometricNormal) < 0) secondaryDirection = -secondaryDirection;
-        // Reuse this ray's reserved secondary interval record as a descriptor.
-        // The next pass consumes it before deposit replaces it with intervals.
-        uint secondary = (params.size.z + sample) * CASCADES;
-        entries[secondary].origin = float4(secondaryPosition, hit.footprint);
-        entries[secondary].interval = float4(secondaryDirection, 0);
-        entries[secondary].merged = float4(hitNormal, 0);
-        entries[secondary].valid = 1;
-        entries[secondary].identity = hitInstanceIdentity(hit);
-        entries[secondary].padding.y = triangleSurfaceGroup(hit.triangle);
-        // Emitter sampling at the primary hit already supplies a fresh reflected
-        // bounce during motion. A second unfiltered path here adds third-bounce
-        // flashes; secondary samples instead feed the next frame's probe cache.
-    }
-    uint2 identity = entries[sample * CASCADES].identity;
-    uint surfaceGroup = entries[sample * CASCADES].padding.y;
-    uint lod = uint(splitDistanceLod(position));
-    deposit(sample * CASCADES, position, normal, direction, hit, radiance, false, identity, surfaceGroup, lod);
-    uint transition = (params.size.z * (params.history.y > 0 ? 2 : 1) + sample) * CASCADES;
-    if (lod < 3) deposit(transition, position, normal, direction, hit, radiance, false, identity, surfaceGroup, lod + 1);
-}
-
-[shader("compute")]
-[numthreads(8, 8, 1)]
-void traceSecondary(uint3 thread : SV_DispatchThreadID) {
-    if (params.history.y <= 0 || any(thread.xy >= params.size.xy)) return;
-    uint first = (params.size.z + thread.x + thread.y * params.size.x) * CASCADES;
-    Entry descriptor = entries[first];
-    if (descriptor.valid == 0) return;
-    entries[first].valid = 0;
-    Hit hit = traceRay(descriptor.origin.xyz, descriptor.interval.xyz, 1e20,
-                       false, descriptor.origin.w, 0.5);
-    float3 radiance = outgoingRadiance(descriptor.origin.xyz, descriptor.interval.xyz, hit);
-    uint lod = uint(splitDistanceLod(descriptor.origin.xyz));
-    deposit(first, descriptor.origin.xyz, descriptor.merged.xyz, descriptor.interval.xyz, hit, radiance, true, descriptor.identity, descriptor.padding.y, lod);
-    uint sample = thread.x + thread.y * params.size.x;
-    uint transition = (params.size.z * 3 + sample) * CASCADES;
-    if (lod < 3) deposit(transition, descriptor.origin.xyz, descriptor.merged.xyz, descriptor.interval.xyz, hit, radiance, true, descriptor.identity, descriptor.padding.y, lod + 1);
+    traceTransport(thread);
 }
 
 [shader("compute")]
@@ -425,98 +834,231 @@ void traceSecondary(uint3 thread : SV_DispatchThreadID) {
 void reduce(uint3 thread : SV_DispatchThreadID) {
     uint bucket = thread.x;
     if (bucket >= params.size.w) return;
-    uint source = gpuSortLinkedList(heads[bucket].load()), unique = EMPTY;
-    // Sorting makes equal full keys contiguous, so reduction is a linear pass.
+    uint source = gpuSortLinkedList(heads[bucket].load());
+    uint unique = EMPTY;
     [loop] while (source != EMPTY) {
-        Entry sample = entries[source];
-        uint next = sample.next;
-        uint match = unique != EMPTY && all(entries[unique].key == sample.key) && all(entries[unique].identity == sample.identity) && entries[unique].padding.y == sample.padding.y ? unique : EMPTY;
-        if (match == EMPTY) {
-            sample.next = unique;
-            entries[source] = sample;
+        Entry firstEntry = entries[source];
+        int4 key = firstEntry.key;
+        uint cursor = source;
+        uint freshCount = 0u;
+        uint freshSource = EMPTY;
+        float4 intervalSum = 0.0;
+        DependencyContext freshDependency = dependencyEmpty();
+        float4 freshLightHitBounds = emptyLightHitBounds();
+        float4 freshBetaSegmentSphere = emptyLightHitBounds();
+        Entry retained = (Entry)0;
+        bool hasRetained = false;
+        [loop] while (cursor != EMPTY && all(entries[cursor].key == key)) {
+            Entry sample = entries[cursor];
+            uint next = sample.next;
+            if (sample.samples > 0u) {
+                if (freshSource == EMPTY) freshSource = cursor;
+                intervalSum += sample.interval * float(sample.samples);
+                freshCount += sample.samples;
+                dependencyUnion(freshDependency, entryDependency(sample));
+                freshLightHitBounds = unionConservativeSpheres(
+                    freshLightHitBounds, sample.boundaryInterval);
+                freshBetaSegmentSphere = unionConservativeSpheres(
+                    freshBetaSegmentSphere, sample.normal);
+            } else if (!hasRetained && sample.valid == (params.frame.x | 0x80000000u)) {
+                retained = sample;
+                hasRetained = true;
+            }
+            if (cursor != source) entries[cursor].valid = 0u;
+            cursor = next;
+        }
+        uint nextGroup = cursor;
+        if (freshCount > 0u) {
+            Entry aggregate = firstEntry;
+            aggregate.interval = intervalSum / float(freshCount);
+            aggregate.key = key;
+            uint level = (uint(key.w) >> 12u) & 3u;
+            uint lod = (uint(key.w) & PROBE_LOD) >> 18u;
+            aggregate.origin = float4((float3(key.xyz) + 0.5)
+                * spacing(params, level, lod), 1.0);
+            aggregate.samples = freshCount;
+            aggregate.valid = params.frame.x | 0x80000000u;
+            aggregate.lastSample = params.frame.x;
+            aggregate.merged = 0.0;
+            aggregate.next = unique;
+            storeEntryDependency(aggregate, freshDependency);
+            storeEntryMergedDependency(aggregate, dependencyUnknown());
+            aggregate.boundaryInterval = freshLightHitBounds;
+            aggregate.boundaryMerged = unknownLightHitBounds();
+            aggregate.normal = freshBetaSegmentSphere;
+            entries[source] = aggregate;
+            unique = source;
+        } else if (hasRetained) {
+            retained.next = unique;
+            retained.valid = params.frame.x | 0x80000000u;
+            retained.samples = 0u;
+            entries[source] = retained;
             unique = source;
         } else {
-            if (sample.samples > 0) {
-                float3 center = (float3(sample.key.xyz) + 0.5) * spacing(params, uint(sample.key.w) >> 12 & 3u, (uint(sample.key.w) & SECONDARY) != 0, (uint(sample.key.w) & PROBE_LOD) >> 18);
-                if (entries[match].samples == 0) {
-                    entries[match].interval = 0; entries[match].origin = sample.origin;
-                } else if (length(sample.origin.xyz - center) < length(entries[match].origin.xyz - center)) {
-                    entries[match].origin = sample.origin;
-                }
-                entries[match].interval += sample.interval;
-                entries[match].samples += sample.samples;
-                entries[match].lastSample = params.frame.x;
-            }
-            entries[source].valid = 0;
+            entries[source].valid = 0u;
         }
-        source = next;
+        source = nextGroup;
     }
     heads[bucket].store(unique);
-    [loop] for (uint index = unique; index != EMPTY; index = entries[index].next) {
-        if (entries[index].samples > 0) {
-            entries[index].interval /= float(entries[index].samples);
-        }
-    }
 }
 
 void mergeEntry(uint index) {
-    // Retained raw intervals must also recompose when coarse dependencies change.
     uint level = params.frame.y;
     int4 key = entries[index].key;
-    if ((uint(key.w) >> 12 & 3u) != level) return;
-    bool secondary = (uint(key.w) & SECONDARY) != 0;
+    if (((uint(key.w) >> 12u) & 3u) != level) return;
+
     float4 interval = entries[index].interval;
-    uint previous = params.history.x > 0 ? findEntry(key, entries[index].identity, entries[index].padding.y, true) : EMPTY;
+    float4 rawLightHitBounds = entries[index].boundaryInterval;
+    float4 betaSegmentSphere = entries[index].normal;
     float samples = float(entries[index].samples);
-    if (previous != EMPTY && entries[index].samples > 0) {
+    // A batch of n observations retains blend^n of old mass and contributes
+    // 1 + blend + ... + blend^(n-1) new mass. Thus history is bounded by
+    // 1/(1-blend), and batches have the same response as repeated observations.
+    float radianceBlend = min(saturate(params.history.x), 0.999);
+    float transmittanceBlend = min(saturate(params.intervalHistory.x), 0.999);
+    float radianceMassLimit = 1.0 / (1.0 - radianceBlend);
+    float transmittanceMassLimit = 1.0 / (1.0 - transmittanceBlend);
+    float radianceRetention = samples > 0.0 ? pow(radianceBlend, samples) : 1.0;
+    float transmittanceRetention = samples > 0.0 ? pow(transmittanceBlend, samples) : 1.0;
+    float radianceSamples = samples > 0.0
+        ? (1.0 - radianceRetention) * radianceMassLimit : 0.0;
+    float transmittanceSamples = samples > 0.0
+        ? (1.0 - transmittanceRetention) * transmittanceMassLimit : 0.0;
+    DependencyContext rawDependency = entryDependency(entries[index]);
+    uint previous = (params.history.x > 0.0 || params.intervalHistory.x > 0.0)
+        && params.history.z > 0.0 && params.history.w > 0.0
+        ? findEntry(key, true) : EMPTY;
+    if (previous != EMPTY) {
         Entry old = previousEntries[previous];
-        // Chandra accumulates weighted fluence and decays its sample weight.
-        // Accumulate J/beta before merging, so a one-ray update cannot carry
-        // the same confidence as a whole probe's fresh samples.
-        float oldSamples = old.origin.w * pow(params.history.x, float(params.frame.x - old.lastSample));
-        interval = (interval * samples + old.interval * oldSamples) / (samples + oldSamples);
-        samples += oldSamples;
+        bool oldAlive = intervalHistoryAlive(old.lastSample, params);
+        bool oldRadianceGeometryValid = oldAlive && !dirtyRawCacheEntry(old);
+        bool oldBetaGeometryValid = oldAlive
+            && betaHistoryEligible(entryDependency(old), old.normal);
+        float oldRadianceSamples = asfloat(old.samples);
+        float oldTransmittanceSamples = old.origin.w;
+        if (!isfinite(oldRadianceSamples) || oldRadianceSamples < 0.0)
+            oldRadianceSamples = 0.0;
+        if (!isfinite(oldTransmittanceSamples) || oldTransmittanceSamples < 0.0)
+            oldTransmittanceSamples = 0.0;
+        bool reuseRadiance = oldRadianceGeometryValid && params.history.x > 0.0
+            && radianceHistoryEligible(entryDependency(old), old.boundaryInterval);
+        bool reuseTransmittance = oldBetaGeometryValid && params.intervalHistory.x > 0.0;
+        if (samples > 0.0) {
+            // Clamp incoming mass when observations resume, including after a
+            // retention-setting change. Unobserved world state never decays.
+            oldRadianceSamples = min(oldRadianceSamples, radianceMassLimit)
+                * radianceRetention;
+            oldTransmittanceSamples = min(oldTransmittanceSamples, transmittanceMassLimit)
+                * transmittanceRetention;
+            if (reuseRadiance && oldRadianceSamples > 0.0) {
+                interval.xyz = (interval.xyz * radianceSamples
+                    + old.interval.xyz * oldRadianceSamples)
+                    / (radianceSamples + oldRadianceSamples);
+                radianceSamples += oldRadianceSamples;
+                dependencyUnion(rawDependency, entryDependency(old));
+                // A temporally blended J depends on every receiver position
+                // represented by both means, not only the newest observations.
+                rawLightHitBounds = unionConservativeSpheres(
+                    rawLightHitBounds, old.boundaryInterval);
+            }
+            if (reuseTransmittance && oldTransmittanceSamples > 0.0) {
+                interval.w = (interval.w * transmittanceSamples
+                    + old.interval.w * oldTransmittanceSamples)
+                    / (transmittanceSamples + oldTransmittanceSamples);
+                transmittanceSamples += oldTransmittanceSamples;
+                // Keep the raw AABB as a second conservative beta proof too;
+                // the segment sphere alone can be loose for long rays.
+                dependencyUnion(rawDependency, entryDependency(old));
+                betaSegmentSphere = unionConservativeSpheres(
+                    betaSegmentSphere, old.normal);
+            }
+        } else {
+            if (reuseRadiance && oldRadianceSamples > 0.0) {
+                interval.xyz = old.interval.xyz;
+                radianceSamples = oldRadianceSamples;
+                rawLightHitBounds = old.boundaryInterval;
+                dependencyUnion(rawDependency, entryDependency(old));
+            } else {
+                interval.xyz = 0.0;
+                radianceSamples = 0.0;
+            }
+            if (reuseTransmittance && oldTransmittanceSamples > 0.0) {
+                interval.w = old.interval.w;
+                transmittanceSamples = oldTransmittanceSamples;
+                dependencyUnion(rawDependency, entryDependency(old));
+                betaSegmentSphere = old.normal;
+            } else {
+                interval.w = 1.0;
+                transmittanceSamples = 0.0;
+            }
+        }
+    } else if (samples == 0.0) {
+        interval.xyz = 0.0;
+        interval.w = 1.0;
+        radianceSamples = 0.0;
+        transmittanceSamples = 0.0;
     }
+
     entries[index].interval = interval;
-    if (entries[index].samples > 0) entries[index].origin.w = samples;
-    float3 radiance = interval.xyz;
-    bool known = interval.w < 1.0;
-    if (interval.w > 0.0 && level + 1 < CASCADES) {
+    entries[index].boundaryInterval = rawLightHitBounds;
+    entries[index].normal = betaSegmentSphere;
+    storeEntryDependency(entries[index], rawDependency);
+    entries[index].samples = asuint(radianceSamples);
+    entries[index].origin.w = transmittanceSamples;
+
+    // Carry one invariant throughout the hierarchy: RGB is a conditional mean
+    // and alpha is its supported mass. Raw J is already premultiplied by the
+    // opaque fraction; beta without J cannot invent a supported black surface.
+    float transmittance = transmittanceSamples > 0.0 ? saturate(interval.w) : 0.0;
+    float support = radianceSamples > 0.0 && transmittanceSamples > 0.0
+        ? 1.0 - transmittance : 0.0;
+    float3 radiance = support > 0.0 ? interval.xyz : 0.0;
+    float4 mergedLightHitBounds = support > 0.0
+        ? entries[index].boundaryInterval : emptyLightHitBounds();
+    DependencyContext mergedDependency = rawDependency;
+    if (transmittance > 0.0 && level + 1u < CASCADES) {
         float3 position = entries[index].origin.xyz;
         uint direction = uint(key.w) & 4095u;
         uint theta = BASE_THETA << level;
-        uint2 xy = uint2(direction % (2 * theta), direction / (2 * theta));
-        uint fineDirections[4];
-        [loop] for (uint child = 0; child < 4; ++child) {
-            uint2 fine = xy * 2 + uint2(child & 1, child >> 1);
-            fineDirections[child] = fine.x + fine.y * (4 * theta);
+        uint2 xy = uint2(direction % (2u * theta), direction / (2u * theta));
+        float3 sum = 0.0;
+        float childSupport = 0.0;
+        [unroll] for (uint child = 0u; child < 4u; ++child) {
+            uint2 fine = xy * 2u + uint2(child & 1u, child >> 1u);
+            uint fineDirection = fine.x + fine.y * (4u * theta);
+            uint lod = (uint(key.w) & PROBE_LOD) >> 18u;
+            float3 grid = position / spacing(params, level + 1u, lod) - 0.5;
+            DependencyContext childDependency = dependencyEmpty();
+            float4 childLightHitBounds = emptyLightHitBounds();
+            float4 value = interpolateMergedChildren(int3(floor(grid)), frac(grid),
+                fineDirection, level + 1u, lod, false, childDependency,
+                childLightHitBounds);
+            dependencyUnion(mergedDependency, childDependency);
+            if (value.w > 0.0) {
+                sum += value.xyz * value.w;
+                childSupport += value.w;
+                mergedLightHitBounds = unionConservativeSpheres(
+                    mergedLightHitBounds, childLightHitBounds);
+            }
         }
-        // Validate each reused angular endpoint, rather than one representative
-        // origin whose visibility cannot prove visibility of sibling directions.
-        float3 sum = 0.0; float count = 0;
-        [loop] for (uint child = 0; child < 4; ++child) {
-            float4 value = interpolate(position, fineDirections[child], level + 1, false, secondary, uint(key.w) & (SURFACE | PROBE_LOD), entries[index].identity, 0);
-            if (value.w > 0) { sum += value.xyz; count += 1; }
+        if (childSupport > 0.0) {
+            radiance += transmittance * sum * 0.25;
+            support += transmittance * childSupport * 0.25;
         }
-        if (count > 0) { radiance += interval.w * sum / count; known = true; }
     }
-    // Separate compute passes provide storage barriers between cascade levels.
-    entries[index].merged = float4(radiance, known ? 1.0 : 0.0);
+    entries[index].merged = support > 0.0
+        ? float4(radiance / support, saturate(support)) : 0.0;
+    storeEntryMergedDependency(entries[index], mergedDependency);
+    entries[index].boundaryMerged = mergedLightHitBounds;
 }
-
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void merge(uint3 thread : SV_DispatchThreadID) {
     uint index = thread.x * CASCADES + thread.y;
-    if (index >= currentCapacity() + (params.history.y > 0 ? 4 : 2) * params.size.w) return;
+    if (index >= currentCapacity() + cacheHistoryQuota(params) * params.size.w) return;
     Entry entry = entries[index];
     if (entry.valid != (params.frame.x | 0x80000000u)
-        || params.frame.x - entry.lastSample > uint(params.history.w)) return;
-    // A retained interval already contains its composed lighting estimate.
-    // Refresh it when sampled again; rebuilding every old angular interval
-    // traced the same neighbor visibility repeatedly and dominated steady GI.
-    // Unknown intervals still merge so newly available parents can fill them.
-    if (entry.samples == 0 && entry.merged.w > 0) return;
+        || !intervalHistoryAlive(entry.lastSample, params)) return;
     // One thread per canonical entry avoids serial ray traversals along a bucket.
     // Retained physical offsets need not agree with the key's cascade level.
     mergeEntry(index);
@@ -524,116 +1066,111 @@ void merge(uint3 thread : SV_DispatchThreadID) {
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
-void seedIrradiance(uint3 thread : SV_DispatchThreadID) {
-    if (thread.x >= params.size.w) return;
-    [loop] for (uint index = heads[thread.x].load(); index != EMPTY; index = entries[index].next) {
-        int4 key = entries[index].key;
-        if ((uint(key.w) >> 12 & 3u) != 0) continue;
-        key.w = int(uint(key.w) & (SECONDARY | SURFACE | PROBE_LOD));
-        uint surfaceGroup = entries[index].padding.y;
-        uint slot = (hashKey(key, params.size.w) ^ surfaceGroup) & (params.size.w - 1);
-        bool inserted = false;
-        [loop] for (uint attempt = 0; attempt < 32; ++attempt) {
-            uint candidate = heads[params.size.w + 1 + slot].compareExchange(EMPTY, index);
-            if (candidate == EMPTY) { inserted = true; break; }
-            int4 other = entries[candidate].key;
-            if (all(other.xyz == key.xyz) && (uint(other.w) & (SECONDARY | SURFACE | PROBE_LOD)) == uint(key.w) && all(entries[candidate].identity == entries[index].identity) && entries[candidate].padding.y == surfaceGroup) { inserted = true; break; }
-            slot = (slot + 1) & (params.size.w - 1);
+void seedProbes(uint3 thread : SV_DispatchThreadID) {
+    if (thread.y >= CASCADES) return;
+    uint index = thread.x * CASCADES + thread.y;
+    if (index >= currentCapacity()) return;
+    Entry entry = entries[index];
+    // Include every initialized visible descriptor, including candidates with
+    // zero prefix offsets; retained cache entries are read while packing radiance.
+    bool initialized = entry.padding.y != 0u;
+    bool traced = entry.valid == (params.frame.x | 0x80000000u);
+    if ((!initialized && !traced)
+        || ((uint(entry.key.w) >> 12u) & 3u) != 0u) return;
+    int4 key = int4(entry.key.xyz, int(uint(entry.key.w) & PROBE_LOD));
+    uint slot = probeDirectoryBucket(key, params);
+    uint directoryCapacity = probeDirectoryCapacity(params);
+    [loop] for (uint attempt = 0u; attempt < directoryCapacity; ++attempt) {
+        uint head = probeDirectoryHead(0u, slot, params);
+        uint candidate = heads[head].compareExchange(EMPTY, index);
+        if (candidate == EMPTY) {
+            uint observed = heads[head].load();
+            if (observed == index) return;
+            if (observed == EMPTY) continue;
+            candidate = observed;
         }
-        if (!inserted) heads[2 * params.size.w + 2].add(1);
+        if (candidate != TOMBSTONE && candidate < currentCapacity()) {
+            Entry other = entries[candidate];
+            if (all(other.key.xyz == key.xyz)
+                && (uint(other.key.w) & PROBE_LOD) == uint(key.w)) return;
+        }
+        slot = (slot + 1u) & (directoryCapacity - 1u);
     }
+    heads[2u * params.size.w + 2u].add(1u);
 }
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
-void prefilter(uint3 thread : SV_DispatchThreadID) {
-    if (thread.x >= params.size.w) return;
-    uint index = heads[params.size.w + 1 + thread.x].load();
-    if (index == EMPTY) return;
+void packProbes(uint3 thread : SV_DispatchThreadID) {
+    uint slot = thread.x;
+    uint directoryCapacity = probeDirectoryCapacity(params);
+    if (slot >= directoryCapacity) return;
+    uint index = heads[probeDirectoryHead(0u, slot, params)].load();
+    if (index == EMPTY || index == TOMBSTONE) return;
+    heads[2u * params.size.w + 9u].add(1u);
     int4 key = entries[index].key;
-    uint mode = uint(key.w) & (SECONDARY | SURFACE | PROBE_LOD);
-    IrradianceProbe probe = (IrradianceProbe)0;
-    uint output = (params.frame.x & 1) * params.size.w + thread.x;
-    // ponytail: direct owned-probe writes avoid FXC local-array failures;
-    // use a workgroup tile if bandwidth becomes a measured bottleneck.
-    irradianceProbes[output] = probe;
-    float3 center = (float3(key.xyz) + 0.5) * spacing(params, 0, (mode & SECONDARY) != 0, (mode & PROBE_LOD) >> 18);
-    [loop] for (uint direction = 0; direction < 32; ++direction) {
-        float3 origin;
-        float4 radiance = findMerged(int4(key.xyz, int(direction | mode)), false, entries[index].identity, entries[index].padding.y, origin);
-        if (radiance.w == 0) continue;
-        float3 n = binDirection(direction, 0);
-        [loop] for (uint i = 0; i < IRRADIANCE_SIDE * IRRADIANCE_SIDE; ++i) {
-            float3 receiver = decodeNormal(irradianceOctUv(int2(i % IRRADIANCE_SIDE + 1, i / IRRADIANCE_SIDE + 1)));
-            irradianceProbes[output].coefficients[i] += radiance * max(0.0, dot(n, receiver));
-        }
-        uint source = findEntry(int4(key.xyz, int(direction | mode)), entries[index].identity, entries[index].padding.y);
-        if (source != EMPTY && (probe.origin.w == 0 || length(entries[source].origin.xyz - center) < length(probe.origin.xyz - center)))
-            probe.origin = entries[source].origin;
+    uint lodBits = uint(key.w) & PROBE_LOD;
+    uint output = (params.frame.x & 1u) * directoryCapacity + slot;
+    DependencyContext packedDependency = dependencyEmpty();
+    [loop] for (uint direction = 0u; direction < 32u; ++direction) {
+        int4 directionKey = int4(key.xyz, int(direction | lodBits));
+        uint source = findEntry(directionKey, false);
+        Entry current = source == EMPTY ? (Entry)0 : entries[source];
+        float4 radiance = source == EMPTY ? 0.0 : current.merged;
+        directionalProbes[output].radiance[direction] = radiance;
+        if (source != EMPTY && radiance.w > 0.0)
+            dependencyUnion(packedDependency, entryMergedDependency(current));
     }
-    [loop] for (uint i = 0; i < IRRADIANCE_SIDE * IRRADIANCE_SIDE; ++i) {
-        float4 coefficient = irradianceProbes[output].coefficients[i];
-        if (coefficient.w > 0) irradianceProbes[output].coefficients[i] = float4(coefficient.xyz / coefficient.w, 1);
-    }
-    irradianceProbes[output].origin = probe.origin;
+    storeProbeDependency(directionalProbes[output], packedDependency);
 }
-
-[shader("compute")]
-[numthreads(8, 8, 1)]
-void gather(uint3 thread : SV_DispatchThreadID) {
-    uint2 pixel = thread.xy;
-    if (any(pixel >= params.size.xy)) return;
-    uint2 full = fullPixel(pixel, params);
-    float depth = depthTexture.Load(int3(full, 0));
-    float3 normal = normalTexture.Load(int3(full, 0)).xyz * 2.0 - 1.0;
-    if (depth <= 0.0 || dot(normal, normal) < 0.01) {
-        irradiance.Store(int2(pixel), 0);
-        return;
-    }
-    normal = normalize(normal);
-    uint entry = (pixel.x + pixel.y * params.size.x) * CASCADES;
-    if (entries[entry].samples == 0) {
-        irradiance.Store(int2(pixel), 0);
-        return;
-    }
-    float3 position = entries[entry].origin.xyz;
-    float3 result = diffuseGather(position, normal, false, false, entries[entry].identity, entries[entry].padding.y)
-                   + emissiveIrradiance(worldPosition(float2(full) + 0.5, depth, params), normal, params.lightCounts.z);
-    irradiance.Store(int2(pixel), float4(result, depth));
-}
-
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void commitCache(uint3 thread : SV_DispatchThreadID) {
     uint bucket = thread.x;
     if (bucket >= params.size.w) return;
-    // Secondary transport needs its own retention capacity; otherwise primary
-    // and secondary angular histories evict one another in crowded buckets.
-    uint quota = params.history.y > 0 ? 4 : 2;
+    uint quota = min(cacheHistoryQuota(params), 4u);
+    if (quota == 0u) return;
     uint base = bucket * quota;
-    uint retained = 0;
-    uint output = EMPTY;
+    uint selected[4];
+    [unroll] for (uint slot = 0; slot < 4; ++slot) selected[slot] = EMPTY;
     uint source = heads[bucket].load();
     [loop] while (source != EMPTY) {
         Entry entry = entries[source];
         uint next = entry.next;
-        bool eligible = params.history.w > 0 && (entry.padding.y & 0x80000000u) == 0
+        bool eligible = params.history.w > 0.0
             && entry.valid == (params.frame.x | 0x80000000u)
-            && params.frame.x - entry.lastSample <= uint(params.history.w);
-        if (eligible && retained < quota) {
-            uint slot = base + retained++;
-            entry.next = output;
-            entry.padding.x = slot;
-            previousEntries[slot] = entry;
-            entries[source].padding.x = slot;
-            output = slot;
-        } else {
-            entries[source].padding.x = EMPTY;
-            if (eligible) heads[2 * params.size.w + 4].add(1);
+            && intervalHistoryAlive(entry.lastSample, params);
+        entries[source].padding.x = EMPTY;
+        if (eligible) {
+            // Reduction sorts by key, not age. Retaining its first keys can
+            // permanently starve newly discovered probes in a full bucket.
+            uint candidate = source;
+            [loop] for (uint slot = 0; slot < quota; ++slot) {
+                uint incumbent = selected[slot];
+                if (incumbent == EMPTY || params.frame.x - entries[candidate].lastSample
+                    < params.frame.x - entries[incumbent].lastSample) {
+                    selected[slot] = candidate;
+                    candidate = incumbent;
+                    if (candidate == EMPTY) break;
+                }
+            }
+            if (candidate != EMPTY) heads[2 * params.size.w + 4].add(1);
         }
         source = next;
     }
-    // After gather this head array becomes the next frame's history table.
+    uint output = EMPTY;
+    [loop] for (uint retained = 0; retained < quota; ++retained) {
+        source = selected[retained];
+        if (source == EMPTY) break;
+        uint slot = base + retained;
+        Entry entry = entries[source];
+        entry.next = output;
+        entry.padding.x = slot | (params.intervalHistory.y > 0.5 ? 0x80000000u : 0u);
+        previousEntries[slot] = entry;
+        entries[source].padding.x = entry.padding.x;
+        output = slot;
+    }
+    // After commit this head array addresses the retained history entries.
     heads[bucket].store(output);
 }
 
@@ -641,19 +1178,33 @@ void commitCache(uint3 thread : SV_DispatchThreadID) {
 [numthreads(64, 1, 1)]
 void remapProbeHeads(uint3 thread : SV_DispatchThreadID) {
     uint slot = thread.x;
-    if (slot >= params.size.w) return;
-    uint head = params.size.w + 1 + slot;
+    if (slot >= probeDirectoryCapacity(params)) return;
+    uint head = probeDirectoryHead(0u, slot, params);
     uint source = heads[head].load();
     if (source != EMPTY) {
-        uint mapped = entries[source].padding.x;
+        uint encoded = entries[source].padding.x;
+        uint mapped = encoded == EMPTY ? EMPTY : encoded & 0x7fffffffu;
+        if (mapped == EMPTY) {
+            // Commit can evict the directory representative while retaining
+            // sibling directions. Main heads now address previousEntries, not
+            // the working entries array; preserve the packed probe's slot.
+            Entry representative = entries[source];
+            uint mode = uint(representative.key.w) & PROBE_LOD;
+            uint quota = cacheHistoryQuota(params);
+            [loop] for (uint direction = 0u; direction < 32u && mapped == EMPTY; ++direction) {
+                int4 key = int4(representative.key.xyz, int(direction | mode));
+                uint bucket = transportCacheBucket(key, params.size.w);
+                uint committed = heads[bucket].load();
+                [loop] for (uint count = 0u; count < quota && committed != EMPTY; ++count) {
+                    Entry candidate = previousEntries[committed];
+                    if (all(candidate.key == key)) {
+                        mapped = committed;
+                        break;
+                    }
+                    committed = candidate.next;
+                }
+            }
+        }
         heads[head].store(mapped == EMPTY ? TOMBSTONE : mapped);
     }
 }
-
-[shader("compute")]
-[numthreads(1, 1, 1)]
-void checkProbeLookup(uint3 thread : SV_DispatchThreadID) {
-    if (thread.x == 0)
-        entries[0].padding.y = findIrradianceProbe(int4(10, 0, 0, 0), true, uint2(0), 0);
-}
-

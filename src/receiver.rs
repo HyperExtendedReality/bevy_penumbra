@@ -45,6 +45,7 @@ fn identity(
     geometry: bool,
     baked: bool,
     material: Option<&StandardMaterial>,
+    scene_instance: Option<u32>,
 ) -> ReceiverIdentity {
     let bits = entity.to_bits();
     ReceiverIdentity {
@@ -52,7 +53,7 @@ fn identity(
             bits as u32,
             (bits >> 32) as u32,
             u32::from(geometry && !baked && material.is_some_and(|m| !m.unlit)),
-            0,
+            scene_instance.unwrap_or(u32::MAX),
         ),
     }
 }
@@ -286,9 +287,12 @@ fn extract(
         // material implementations keep the cleared, excluded identity.
         let identity = identity(
             entity,
-            geometry && scene.data.instance_residency.contains_key(&entity),
+            geometry
+                && scene.data.instance_residency.contains_key(&entity)
+                && scene.data.instance_indices.contains_key(&entity),
             lightmap,
             material.and_then(|m| materials.get(&m.0)),
+            scene.data.instance_indices.get(&entity).copied(),
         );
         if !active || identity.value.z == 0 {
             commands.entity(render_entity).remove::<ReceiverIdentity>();
@@ -384,6 +388,13 @@ fn queue(
                 pipelines.cached.insert(*source, pipeline);
                 pipeline
             };
+            // A newly visible material may still be specializing. Keep the
+            // already compiled receivers active; this draw's pixels remain
+            // cleared/ineligible until its own identity pipeline is ready.
+            if cache.get_render_pipeline(pipeline).is_none() {
+                pipelines.incomplete_views.insert(view.retained_view_entity);
+                continue;
+            }
             let Some(mesh_id) = mesh_instances.mesh_asset_id(*main) else {
                 continue;
             };
@@ -402,6 +413,7 @@ fn queue(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare(
     mut commands: Commands,
     device: Res<RenderDevice>,
@@ -470,10 +482,9 @@ pub(crate) fn draw(
             "GI receiver raster phase"
         );
     }
-    let pipelines_ready = !receivers
-        .incomplete_views
-        .contains(&view.retained_view_entity)
-        && !phase.items.is_empty()
+    // Eligibility is per pixel. One pending specialization must not black out
+    // the complete view while its other receivers have valid identities.
+    let pipelines_ready = !phase.items.is_empty()
         && phase
             .items
             .values()
@@ -540,23 +551,35 @@ mod tests {
                 .contains::<bevy::render::sync_world::SyncToRenderWorld>()
         );
         let lit = StandardMaterial::default();
-        let first = identity(entity, true, false, Some(&lit)).value;
+        let first = identity(entity, true, false, Some(&lit), Some(17)).value;
         assert_eq!(
             u64::from(first.x) | (u64::from(first.y) << 32),
             entity.to_bits()
         );
         assert_eq!(first.z, 1);
-        assert_eq!(identity(entity, true, true, Some(&lit)).value.z, 0);
-        assert_eq!(identity(entity, false, false, Some(&lit)).value.z, 0);
-        assert_eq!(identity(entity, true, false, None).value.z, 0);
+        assert_eq!(first.w, 17);
+        assert_eq!(
+            identity(entity, true, true, Some(&lit), Some(17)).value.z,
+            0
+        );
+        assert_eq!(
+            identity(entity, false, false, Some(&lit), Some(17)).value.z,
+            0
+        );
+        assert_eq!(identity(entity, true, false, None, Some(17)).value.z, 0);
         let unlit = StandardMaterial {
             unlit: true,
             ..default()
         };
-        assert_eq!(identity(entity, true, false, Some(&unlit)).value.z, 0);
+        assert_eq!(
+            identity(entity, true, false, Some(&unlit), Some(17))
+                .value
+                .z,
+            0
+        );
         world.despawn(entity);
         let replacement = world.spawn_empty().id();
-        let replacement = identity(replacement, true, false, Some(&lit)).value;
+        let replacement = identity(replacement, true, false, Some(&lit), Some(23)).value;
         assert_ne!(first.xy(), replacement.xy());
     }
 

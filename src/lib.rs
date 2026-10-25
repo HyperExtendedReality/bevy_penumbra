@@ -1,4 +1,4 @@
-//! World-space global illumination using Split Radiance Cascades.
+//! Split radiance cascades global illumination.
 //!
 //! Add [`RadianceCascadesPlugin`] after Bevy's render plugins, attach
 //! [`RadianceCascades`] to a 3D camera, and tag opaque/alpha-masked `Mesh3d` /
@@ -7,6 +7,12 @@
 //! See the crate README for requirements, costs, and research deviations.
 
 #![recursion_limit = "256"]
+
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 mod deformation;
 mod environment;
@@ -17,6 +23,174 @@ pub use environment::RadianceCascadesEnvironment;
 mod receiver;
 mod render;
 mod scene;
+
+/// Shader/pipeline failures and scene revisions submitted by the GI renderer.
+#[derive(Resource, Clone, Default, bevy::render::extract_resource::ExtractResource)]
+#[extract_app(RenderApp)]
+pub struct RadianceCascadesStatus {
+    state: Arc<Mutex<RadianceCascadesStatusState>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Scene and lighting snapshots accepted by the renderer for an eligible view.
+pub struct RadianceCascadesRevisions {
+    /// Scene snapshot revision.
+    pub scene: u64,
+    /// Geometry snapshot revision.
+    pub geometry: u64,
+    /// Punctual and emissive-light revision.
+    pub lighting: u64,
+}
+
+/// Metadata for the latest GI frame encoded by the renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RadianceCascadesDispatch {
+    /// Monotonic within this renderer instance.
+    pub sequence: u64,
+    /// Scene and lighting revisions used by the encoded frame.
+    pub revisions: RadianceCascadesRevisions,
+}
+
+/// Metadata for one raw GI texture copy, captured when the renderer encoded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RadianceCascadesRawFrame {
+    /// Per-view frame counter for the copied GI result.
+    pub frame_id: u64,
+    /// Dispatch metadata for the copied GI result.
+    pub dispatch: RadianceCascadesDispatch,
+    /// Time the matching GI commands were encoded for submission.
+    pub submitted_at: Instant,
+}
+
+#[derive(Default)]
+struct RadianceCascadesStatusState {
+    failures: Vec<String>,
+    submitted: RadianceCascadesRevisions,
+    dispatch: Option<RadianceCascadesDispatch>,
+    raw_frames: VecDeque<Option<RadianceCascadesRawFrame>>,
+    next_dispatch_sequence: u64,
+    shader_compile_jobs: usize,
+    pipeline_compile_jobs: usize,
+    shader_backend: u8,
+}
+
+impl RadianceCascadesStatus {
+    /// Returns shader or pipeline errors from the renderer, if any.
+    pub fn failures(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .failures
+            .clone()
+    }
+
+    /// Revisions for the latest scene and lights uploaded for an eligible view.
+    pub fn submitted_revisions(&self) -> RadianceCascadesRevisions {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .submitted
+    }
+
+    /// Metadata for the most recent GI frame whose commands were encoded.
+    pub fn last_dispatch(&self) -> Option<RadianceCascadesDispatch> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .dispatch
+    }
+
+    /// Removes metadata for the oldest completed raw-output readback.
+    ///
+    /// Call once for every `ReadbackComplete` event from the matching raw
+    /// output texture. The outer `None` means no frame metadata is queued;
+    /// `Some(None)` means that frame had no committed dispatch.
+    pub fn take_raw_frame(&self) -> Option<Option<RadianceCascadesRawFrame>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .raw_frames
+            .pop_front()
+    }
+
+    pub(crate) fn record_raw_frame(&self, frame: Option<RadianceCascadesRawFrame>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .raw_frames
+            .push_back(frame);
+    }
+
+    /// Whether Slang or driver pipeline work is still running.
+    pub fn compilation_in_flight(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.shader_compile_jobs != 0 || state.pipeline_compile_jobs != 0
+    }
+
+    /// Shader format selected from the active device backend and features.
+    pub fn shader_backend(&self) -> Option<&'static str> {
+        match self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .shader_backend
+        {
+            1 => Some("slang_wgsl"),
+            2 => Some("slang_wgsl_naga_spirv"),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn record_failure(&self, failure: String) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.failures.contains(&failure) {
+            state.failures.push(failure);
+        }
+    }
+
+    pub(crate) fn record_submitted_revisions(&self, submitted: RadianceCascadesRevisions) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .submitted = submitted;
+    }
+
+    pub(crate) fn record_dispatch(
+        &self,
+        revisions: RadianceCascadesRevisions,
+    ) -> RadianceCascadesDispatch {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.next_dispatch_sequence = state.next_dispatch_sequence.wrapping_add(1).max(1);
+        state.submitted = revisions;
+        let dispatch = RadianceCascadesDispatch {
+            sequence: state.next_dispatch_sequence,
+            revisions,
+        };
+        state.dispatch = Some(dispatch);
+        dispatch
+    }
+
+    pub(crate) fn set_shader_compile_jobs(&self, count: usize) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .shader_compile_jobs = count;
+    }
+
+    pub(crate) fn set_pipeline_compile_jobs(&self, count: usize) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pipeline_compile_jobs = count;
+    }
+
+    pub(crate) fn set_shader_backend(&self, backend: u8) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .shader_backend = backend;
+    }
+}
 
 use bevy::{
     camera::{Hdr, visibility::VisibilitySystems},
@@ -32,34 +206,138 @@ use bevy::{
 };
 use bevy_slang::SlangCompiler;
 
-/// Supplies opaque or alpha-masked triangle geometry to Split Radiance Cascades.
+/// Supplies opaque or alpha-masked triangle geometry to radiance cascades GI.
 ///
 /// Offscreen meshes still occlude and emit. Base color, metallic, and emission
 /// come from `StandardMaterial`, vertex colors and CPU-retained material images.
 /// Indexed normals, tangents, and UV0/UV1 are retained for cascade shading.
 /// Alpha-masked surfaces preserve their material coverage.
 /// Morphing and skinning are supported.
-/// Split Radiance Cascades approximates GI with diffuse response and ignores
-/// clearcoat, anisotropy, and specular lobes and maps; Bevy keeps native specular shading.
+/// Split computes diffuse indirect illumination from transported radiance and
+/// applies receiver albedo from Bevy's deferred material data. Native Bevy
+/// lighting retains direct and specular illumination. The GI estimate does not
+/// model clearcoat, anisotropy, transmission, or specular tint maps.
 /// Requires render-world synchronization for the raster receiver identity pass.
 #[derive(Component, Clone, Copy, Debug, Default)]
 #[require(SyncToRenderWorld)]
 pub struct RadianceCascadesGeometry;
 
-/// Optional destination for the raw linear GI estimate, before reconstruction.
+/// Optional per-view cap for adaptive runtime transport scheduling.
 ///
-/// Supply an `Rgba32Float` image with `COPY_DST | COPY_SRC` usage and exactly the
-/// resolved GI dimensions (viewport divided by `resolution_divisor`, adjusted
-/// as needed for the cascade budget and device limits). RGB contains linear GI
-/// before receiver albedo, intensity, occlusion, and exposure; alpha is receiver
-/// depth. Read it asynchronously using Bevy's `Readback::texture`. No readback
-/// occurs unless the application requests one. Invalid destinations are diagnosed.
+/// This only limits work issued in a frame; it does not change cache capacity,
+/// allocation, or history. A zero value still permits one update.
+#[derive(Component, Clone, Copy, Debug, ExtractComponent)]
+#[extract_app(RenderApp)]
+pub struct RadianceCascadesRuntimeBudget {
+    /// Maximum selected receiver updates this view may issue in one frame.
+    pub max_updates_per_frame: u32,
+}
+
+/// Optional destination for the linear diffuse GI estimate before composition.
+/// Raw output excludes receiver albedo and artistic occlusion.
+///
+/// Supply an `Rgba32Float` image with `COPY_DST | COPY_SRC` usage and the active
+/// resolve dimensions: full viewport by default and half viewport (rounded up)
+/// with the low-end preset. RGB contains scene-linear diffuse transport divided
+/// by pi, before receiver albedo, intensity, occlusion, and camera exposure.
+/// No exposure conversion is required for scene-linear reference comparisons.
+/// Alpha is zero for background, negative for an
+/// eligible receiver without lighting support, and `1 + 0.25 * coverage` for
+/// supported diffuse GI (including observed black). Coverage is in `[0, 1]`.
+/// Read it asynchronously using Bevy's `Readback::texture`. No readback occurs
+/// unless the application requests one. Invalid destinations are diagnosed.
 #[derive(Component, Clone, Debug, ExtractComponent)]
 #[extract_app(RenderApp)]
 pub struct RadianceCascadesRawOutput(pub Handle<Image>);
 
-/// Per-camera Split Radiance Cascades quality and lighting controls. Distances
-/// are in world units.
+/// Shared receiver sampling, update, cache, traversal, and reconstruction budgets.
+///
+/// A default value keeps the historical `resolution_divisor`/`max_rays`
+/// behavior. Set any workload field to opt into the explicit grid and update
+/// budgets; in that mode the candidate grid is independent of `max_rays` and
+/// `max_rays` remains a compatibility ceiling on per-frame selected updates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamplingSettings {
+    /// Candidate-grid pixel divisor. Zero inherits `RadianceCascades::resolution_divisor`.
+    pub grid_divisor: u32,
+    /// Maximum visible screen-grid candidates. Zero uses the explicit mode's
+    /// hard safety cap of 131,072 candidates.
+    pub max_receiver_cells: u32,
+    /// Receiver updates selected per frame. Zero inherits `max_rays`.
+    pub max_updates_per_frame: u32,
+    /// Maximum retained world-cache entries, capped at 262,144. Zero derives
+    /// capacity from the candidate grid.
+    pub max_cache_entries: u32,
+    /// Hard traversal-query cap per frame across receiver seeding, transport,
+    /// and visibility queries. Zero disables the cap.
+    pub max_traversal_queries: u32,
+    /// Resolve scale: 1 is full resolution; values 2 through 8 divide the
+    /// viewport dimensions by that factor, rounding up.
+    pub resolve_scale: u32,
+}
+
+impl SamplingSettings {
+    /// No explicit workload limits; preserves the legacy sampling behavior.
+    pub const fn legacy() -> Self {
+        Self {
+            grid_divisor: 0,
+            max_receiver_cells: 0,
+            max_updates_per_frame: 0,
+            max_cache_entries: 0,
+            max_traversal_queries: 0,
+            resolve_scale: 1,
+        }
+    }
+
+    /// Defaults aimed at a 4 GB GTX 1650 / RX 5500 XT at 1280×720.
+    pub const fn low_end() -> Self {
+        Self {
+            grid_divisor: 8,
+            max_receiver_cells: 16_384,
+            max_updates_per_frame: 1_024,
+            max_cache_entries: 16_384,
+            max_traversal_queries: 16_384,
+            resolve_scale: 2,
+        }
+    }
+
+    pub(crate) const fn is_explicit(self) -> bool {
+        self.grid_divisor != 0
+            || self.max_receiver_cells != 0
+            || self.max_updates_per_frame != 0
+            || self.max_cache_entries != 0
+            || self.max_traversal_queries != 0
+    }
+
+    fn sanitized(mut self) -> Self {
+        if self.grid_divisor != 0 {
+            self.grid_divisor = self.grid_divisor.clamp(1, 256);
+        }
+        if self.max_receiver_cells != 0 {
+            self.max_receiver_cells = self.max_receiver_cells.clamp(1, 131_072);
+        }
+        if self.max_updates_per_frame != 0 {
+            self.max_updates_per_frame = self.max_updates_per_frame.clamp(1, 131_072);
+        }
+        if self.max_cache_entries != 0 {
+            self.max_cache_entries = self.max_cache_entries.clamp(1, 262_144);
+        }
+        if self.max_traversal_queries != 0 {
+            self.max_traversal_queries = self.max_traversal_queries.clamp(1, 131_072);
+        }
+        self.resolve_scale = self.resolve_scale.clamp(1, 8);
+        self
+    }
+}
+
+impl Default for SamplingSettings {
+    fn default() -> Self {
+        Self::legacy()
+    }
+}
+
+/// Per-camera radiance-cascades quality and lighting controls. Distances are
+/// in world units.
 ///
 /// Requires an HDR, single-sample deferred 3D camera. Required components are
 /// inserted automatically; do not override `Msaa::Off` on this camera.
@@ -75,12 +353,16 @@ pub struct RadianceCascadesRawOutput(pub Handle<Image>);
     Msaa::Off
 )]
 pub struct RadianceCascades {
+    /// Shared receiver-grid, update, traversal, cache, and reconstruction limits.
+    pub sampling: SamplingSettings,
     /// Per-view invalidation epoch. Call `reset_history()` after a game-driven
     /// origin rebase or camera teleport. The game retains ownership of its origin.
     pub history_epoch: u32,
     /// Spacing of cascade zero. Higher cascades double it (paper Eq. 4).
     pub probe_spacing: f32,
-    /// Cascade-zero cutoff. Higher cascades quadruple it; four cascades total.
+    /// Cascade-zero cutoff in world units. About 1.6× `probe_spacing` follows
+    /// the paper's recommended base interval. Higher cascades quadruple it;
+    /// four cascades are evaluated in total.
     pub interval_length: f32,
     /// One cascade sample per this many pixels along each image axis (minimum 1).
     pub resolution_divisor: u32,
@@ -94,23 +376,34 @@ pub struct RadianceCascades {
     /// Apply Bevy's material and screen-space occlusion to composed GI.
     /// Raw output bypasses these artistic factors.
     pub artistic_occlusion: bool,
-    /// Uniform environment radiance for cascade directions that exit the scene.
+    /// Constant source radiance for visibility-tested diffuse indirect estimates
+    /// at Split ray-hit surfaces. Bevy PBR shades visible surfaces with its own
+    /// ambient and environment-map lighting.
     pub environment: LinearRgba,
-    /// Per-frame blend with the previous cascade result, from 0 to 0.99.
+    /// Blend with validated previous irradiance.
+    /// Split also uses this as per-observation radiance interval retention;
+    /// zero disables screen history.
     pub temporal_blend: f32,
-    /// Number of frames to retain cascade history, clamped to 0..=64.
+    /// Split-only per-observation retention for cached interval transmittance. Higher
+    /// values preserve visibility while sparse probes refresh; dirty geometry
+    /// still invalidates affected records. Clamped to 0..=0.999.
+    pub split_transmittance_blend: f32,
+    /// Screen-history retention. Clamped to 0..=64.
+    /// Zero disables screen history and sparse-lattice jitter.
+    /// With history enabled, Split's world intervals persist until cache
+    /// eviction or invalidation, independently of this screen-history age.
     pub history_frames: u32,
-    /// Edge-aware spatial denoising steps, 0..4. Zero disables the filter.
+    /// Geometry-aware a-trous denoising steps. Clamped to
+    /// 0..=4. Zero disables the screen-space filter.
     pub spatial_filter_steps: u32,
-    /// Samples used to evaluate emissive surfaces per receiver, clamped to 1..=32.
+    /// Samples used for direct lighting at ray-hit surfaces, clamped to 1..=32.
     pub emissive_samples: u32,
-    /// Previous-frame diffuse feedback strength, clamped to 0..=0.95.
-    pub bounce_feedback: f32,
 }
 
 impl Default for RadianceCascades {
     fn default() -> Self {
         Self {
+            sampling: SamplingSettings::default(),
             history_epoch: 0,
             probe_spacing: 0.25,
             interval_length: 0.4,
@@ -120,17 +413,41 @@ impl Default for RadianceCascades {
             intensity: 1.0,
             artistic_occlusion: true,
             environment: LinearRgba::BLACK,
-            temporal_blend: 0.92,
-            history_frames: 32,
+            temporal_blend: 0.88,
+            split_transmittance_blend: 0.98,
+            history_frames: 24,
             spatial_filter_steps: 3,
             emissive_samples: 16,
-            bounce_feedback: 0.8,
         }
     }
 }
 
 impl RadianceCascades {
-    /// Invalidates this view's probe and screen history on the next rendered frame.
+    /// Conservative receiver-grid and reconstruction settings for 4 GB GPUs at
+    /// 1280×720. Use this when an explicit low-end workload cap is preferred.
+    pub fn low_end() -> Self {
+        Self {
+            sampling: SamplingSettings {
+                // Preserve useful Cornell-scale detail while retaining enough
+                // directional keys to avoid churn across the room's surfaces.
+                max_cache_entries: 65_536,
+                ..SamplingSettings::low_end()
+            },
+            probe_spacing: 1.0,
+            interval_length: 1.6,
+            resolution_divisor: 8,
+            max_rays: 1_024,
+            emissive_samples: 4,
+            history_frames: 24,
+            temporal_blend: 0.95,
+            spatial_filter_steps: 3,
+            ..Self::default()
+        }
+    }
+}
+
+impl RadianceCascades {
+    /// Invalidates this view's screen history and Split world cache on the next rendered frame.
     /// Scene transforms and asset residency continue to come from the game.
     pub fn reset_history(&mut self) {
         self.history_epoch = self.history_epoch.wrapping_add(1);
@@ -148,11 +465,12 @@ impl RadianceCascades {
         self.interval_length = finite(self.interval_length, 0.4, 0.001, 100_000.0);
         self.normal_bias = finite(self.normal_bias, 0.005, 0.00001, self.probe_spacing);
         self.intensity = finite(self.intensity, 1.0, 0.0, 100.0);
-        self.temporal_blend = finite(self.temporal_blend, 0.92, 0.0, 0.99);
+        self.temporal_blend = finite(self.temporal_blend, 0.88, 0.0, 0.99);
+        self.split_transmittance_blend = finite(self.split_transmittance_blend, 0.98, 0.0, 0.999);
         self.history_frames = self.history_frames.min(64);
         self.spatial_filter_steps = self.spatial_filter_steps.min(4);
         self.emissive_samples = self.emissive_samples.clamp(1, 32);
-        self.bounce_feedback = finite(self.bounce_feedback, 0.8, 0.0, 0.95);
+        self.sampling = self.sampling.sanitized();
         self.resolution_divisor = self.resolution_divisor.clamp(1, 64);
         self.max_rays = self.max_rays.clamp(1, 131_072);
         self.environment = LinearRgba::new(
@@ -205,6 +523,21 @@ impl Default for RadianceCascadesPlugin {
     }
 }
 
+impl RadianceCascadesPlugin {
+    /// Memory limits for a 4 GB GPU: 256 MiB scene, 256 MiB material atlas,
+    /// and 512 MiB aggregate camera allocations (including resize overlap,
+    /// receiver identity textures, and packed lights).
+    pub fn low_end() -> Self {
+        Self {
+            scene_gpu_budget_bytes: 256 * 1024 * 1024,
+            texture_atlas_budget_bytes: 256 * 1024 * 1024,
+            view_gpu_budget_bytes: 512 * 1024 * 1024,
+            max_concurrent_pipeline_compiles: 1,
+            ..Self::default()
+        }
+    }
+}
+
 impl Plugin for RadianceCascadesPlugin {
     fn build(&self, app: &mut App) {
         let sampler = app
@@ -217,7 +550,9 @@ impl Plugin for RadianceCascadesPlugin {
             sampler,
             budget: self.texture_atlas_budget_bytes,
         });
+        let status = RadianceCascadesStatus::default();
         app.init_resource::<scene::GiScene>()
+            .insert_resource(status.clone())
             .insert_resource(render::SceneBudget {
                 live_bytes: self.scene_gpu_budget_bytes,
                 view_bytes: self.view_gpu_budget_bytes,
@@ -226,11 +561,13 @@ impl Plugin for RadianceCascadesPlugin {
             .init_resource::<environment::EnvironmentTables>()
             .add_plugins((
                 ExtractComponentPlugin::<RadianceCascades>::default(),
+                ExtractComponentPlugin::<RadianceCascadesRuntimeBudget>::default(),
                 ExtractComponentPlugin::<RadianceCascadesRawOutput>::default(),
                 ExtractComponentPlugin::<RadianceCascadesEnvironment>::default(),
                 ExtractResourcePlugin::<scene::GiScene>::default(),
                 ExtractResourcePlugin::<render::SceneBudget>::default(),
                 ExtractResourcePlugin::<environment::EnvironmentTables>::default(),
+                ExtractResourcePlugin::<RadianceCascadesStatus>::default(),
             ))
             .add_systems(
                 PostUpdate,
@@ -247,6 +584,7 @@ impl Plugin for RadianceCascadesPlugin {
             app,
             self.compiler.clone(),
             self.max_concurrent_pipeline_compiles,
+            status,
         );
     }
 }
@@ -256,13 +594,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn renderer_status_clones_share_failures_and_submitted_revisions() {
+        let status = RadianceCascadesStatus::default();
+        let render_status = status.clone();
+        render_status.record_failure("shader failed".into());
+        let revisions = RadianceCascadesRevisions {
+            scene: 8,
+            geometry: 5,
+            lighting: 3,
+        };
+        render_status.record_submitted_revisions(revisions);
+        render_status.record_dispatch(revisions);
+        assert_eq!(status.failures(), ["shader failed"]);
+        assert_eq!(status.submitted_revisions(), revisions);
+        assert_eq!(
+            status.last_dispatch(),
+            Some(RadianceCascadesDispatch {
+                sequence: 1,
+                revisions,
+            })
+        );
+        let raw_frame = RadianceCascadesRawFrame {
+            frame_id: 7,
+            dispatch: status.last_dispatch().unwrap(),
+            submitted_at: Instant::now(),
+        };
+        render_status.record_raw_frame(Some(raw_frame));
+        render_status.record_raw_frame(None);
+        render_status.record_raw_frame(Some(raw_frame));
+        assert_eq!(status.take_raw_frame(), Some(Some(raw_frame)));
+        assert_eq!(status.take_raw_frame(), Some(None));
+        assert_eq!(status.take_raw_frame(), Some(Some(raw_frame)));
+        assert_eq!(status.take_raw_frame(), None);
+        assert!(!status.compilation_in_flight());
+        render_status.set_shader_compile_jobs(1);
+        assert!(status.compilation_in_flight());
+        render_status.set_shader_compile_jobs(0);
+        render_status.set_pipeline_compile_jobs(1);
+        assert!(status.compilation_in_flight());
+        render_status.set_pipeline_compile_jobs(0);
+        assert!(!status.compilation_in_flight());
+    }
+
+    #[test]
     fn invalid_settings_are_bounded() {
         let settings = RadianceCascades {
             probe_spacing: f32::NAN,
             resolution_divisor: 0,
             max_rays: u32::MAX,
             temporal_blend: f32::INFINITY,
-            bounce_feedback: 1.0,
             history_frames: u32::MAX,
             spatial_filter_steps: u32::MAX,
             emissive_samples: u32::MAX,
@@ -272,20 +652,80 @@ mod tests {
         assert_eq!(settings.probe_spacing, 0.25);
         assert_eq!(settings.resolution_divisor, 1);
         assert_eq!(settings.max_rays, 131_072);
-        assert_eq!(settings.temporal_blend, 0.92);
-        assert_eq!(settings.bounce_feedback, 0.95);
+        assert_eq!(settings.temporal_blend, 0.88);
         assert_eq!(settings.history_frames, 64);
         assert_eq!(settings.spatial_filter_steps, 4);
         assert_eq!(settings.emissive_samples, 32);
     }
 
     #[test]
-    fn split_radiance_cascades_defaults_are_active_and_preserved() {
+    fn shared_sampling_and_split_low_end_preset_are_bounded() {
+        let legacy = SamplingSettings::default();
+        assert_eq!(legacy, SamplingSettings::legacy());
+        assert_eq!(legacy.resolve_scale, 1);
+        assert!(!legacy.is_explicit());
+
+        let low_end = RadianceCascades::low_end();
+        assert!(low_end.sampling.is_explicit());
+        assert_eq!(low_end.sampling.grid_divisor, 8);
+        assert_eq!(low_end.sampling.max_receiver_cells, 16_384);
+        assert_eq!(low_end.sampling.max_updates_per_frame, 1_024);
+        assert_eq!(low_end.sampling.max_cache_entries, 65_536);
+        assert_eq!(low_end.sampling.max_traversal_queries, 16_384);
+        assert_eq!(low_end.sampling.resolve_scale, 2);
+        assert_eq!(low_end.max_rays, 1_024);
+        assert_eq!(low_end.emissive_samples, 4);
+        assert_eq!(low_end.probe_spacing, 1.0);
+        assert_eq!(low_end.interval_length, 1.6);
+        assert_eq!(low_end.history_frames, 24);
+        assert_eq!(low_end.temporal_blend, 0.95);
+        assert_eq!(low_end.spatial_filter_steps, 3);
+        let default_settings = RadianceCascades::default();
+        assert!(!default_settings.sampling.is_explicit());
+        assert_eq!(default_settings.resolution_divisor, 2);
+        assert_eq!(default_settings.max_rays, 131_072);
+        assert_eq!(default_settings.emissive_samples, 16);
+    }
+
+    #[test]
+    fn cache_entry_limit_accepts_262144_and_clamps_larger_values() {
+        let base = SamplingSettings::legacy();
+        let maximum = SamplingSettings {
+            max_cache_entries: 262_144,
+            ..base
+        }
+        .sanitized();
+        assert_eq!(maximum.max_cache_entries, 262_144);
+
+        let over_limit = SamplingSettings {
+            max_cache_entries: u32::MAX,
+            ..base
+        }
+        .sanitized();
+        assert_eq!(over_limit.max_cache_entries, 262_144);
+    }
+
+    #[test]
+    fn low_end_plugin_sets_separate_aggregate_resource_caps() {
+        let plugin = RadianceCascadesPlugin::low_end();
+        assert_eq!(plugin.scene_gpu_budget_bytes, 256 * 1024 * 1024);
+        assert_eq!(plugin.texture_atlas_budget_bytes, 256 * 1024 * 1024);
+        assert_eq!(plugin.view_gpu_budget_bytes, 512 * 1024 * 1024);
+        assert_eq!(plugin.max_concurrent_pipeline_compiles, 1);
+        assert_eq!(
+            plugin.scene_gpu_budget_bytes
+                + plugin.texture_atlas_budget_bytes as u64
+                + plugin.view_gpu_budget_bytes,
+            1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn split_controls_keep_their_defaults() {
         let settings = RadianceCascades { ..default() }.sanitized();
-        assert_eq!(settings.temporal_blend, 0.92);
-        assert_eq!(settings.history_frames, 32);
+        assert_eq!(settings.temporal_blend, 0.88);
+        assert_eq!(settings.history_frames, 24);
         assert_eq!(settings.spatial_filter_steps, 3);
-        assert_eq!(settings.bounce_feedback, 0.8);
         assert!(settings.artistic_occlusion);
     }
 
@@ -304,3 +744,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod transport_tests;

@@ -2,9 +2,6 @@ import bevy_pbr::prepass::io as prepass_io;
 import bevy_pbr::render::pbr_prepass_functions;
 import bevy_pbr::render::pbr_functions;
 
-@if(MOTION_VECTOR_PREPASS)
-import bevy_pbr::prepass::bindings::previous_view_uniforms;
-
 struct ReceiverIdentity { value: vec4<u32> }
 @group(1) @binding(0) var<uniform> receiver: ReceiverIdentity;
 
@@ -49,10 +46,5 @@ fn fragment(in: prepass_io::VertexOutput) -> ReceiverOutput {
     result.identity.z = packed_normal;
     @if(UNCLIPPED_DEPTH_ORTHO_EMULATION)
     result.depth = in.unclipped_depth;
-    @if(MOTION_VECTOR_PREPASS)
-    let previous_clip = previous_view_uniforms.clip_from_world * in.previous_world_position;
-    if previous_clip.w > 0.0 {
-        result.identity.w = bitcast<u32>(previous_clip.z / previous_clip.w);
-    }
     return result;
 }

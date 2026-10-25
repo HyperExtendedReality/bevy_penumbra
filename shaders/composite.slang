@@ -4,88 +4,108 @@
 [[vk::binding(0, 0)]] ConstantBuffer<Parameters> params;
 [[vk::binding(2, 0)]] Texture2D<float4> irradiance;
 [[vk::binding(3, 0)]] DepthTexture2D depthTexture;
-[[vk::binding(4, 0)]] Texture2D<float4> normalTexture;
 [[vk::binding(5, 0)]] Texture2D<uint4> gbuffer;
-[[vk::binding(7, 0)]] Texture2D<uint4> receiverIdentity;
+[[vk::binding(6, 0)]] Texture2D<float4> receiverHistory;
+[[vk::binding(7, 0)]] Texture2D<uint4> rasterReceiver;
 [[vk::binding(8, 0)]] Texture2D<float> screenSpaceOcclusion;
-[[vk::binding(9, 0)]] Texture2D<uint> surfaceGroups;
 
 struct VertexOutput { float4 position : SV_Position; };
 
 [shader("vertex")]
 VertexOutput vertex(uint index : SV_VertexID) {
     VertexOutput output;
-    output.position = float4(index == 1 ? 3.0 : -1.0, index == 2 ? 3.0 : -1.0, 0.0, 1.0);
+    output.position = float4(index == 1 ? 3.0 : -1.0,
+                             index == 2 ? 3.0 : -1.0, 0.0, 1.0);
     return output;
+}
+
+float3 reconstructCompositeGi(uint2 pixel) {
+    float depth = depthTexture.Load(int3(pixel, 0));
+    uint4 targetRaster = rasterReceiver.Load(int3(pixel, 0));
+    uint4 deferred = gbuffer.Load(int3(pixel, 0));
+    if (!(depth > 0.0) || !isfinite(depth)
+        || (targetRaster.z & 0x80000000u) == 0u
+        || (deferred.w & (1u << 24u)) != 0u) return 0.0;
+    float3 normal = receiverGeometricNormal(targetRaster.z, deferredShadingNormal(deferred));
+    float3 position = worldPosition(float2(pixel) + 0.5, depth, params);
+    if (!all(isfinite(position))) return 0.0;
+
+    uint scale = giResolveScale(params);
+    uint2 extent = giResolveExtent(params);
+    float2 local = float2(pixel - params.viewport.xy);
+    float2 grid = (local - float2(scale / 2u)) / float(scale);
+    int2 base = int2(floor(grid));
+    // Resolve samples use integer raster anchors, including a clamped final
+    // partial tile. Invert those actual anchors rather than a uniform grid.
+    float2 last = float2(params.viewport.zw - 1u);
+    float2 left = min(float2(base * int(scale) + int(scale / 2u)), last);
+    float2 right = min(float2((base + 1) * int(scale) + int(scale / 2u)), last);
+    float2 fraction = saturate((local - left) / max(right - left, 1.0));
+    float tolerance = surfaceTolerance(params);
+    float3 sum = 0.0;
+    float support = 0.0;
+    [unroll] for (uint tap = 0u; tap < 4u; ++tap) {
+        int2 bit = int2(tap & 1u, tap >> 1u);
+        int2 samplePixel = base + bit;
+        if (any(samplePixel < 0) || any(samplePixel >= int2(extent))) continue;
+        float2 axisWeight = lerp(1.0 - fraction, fraction, float2(bit));
+        float weight = axisWeight.x * axisWeight.y;
+        if (!(weight > 0.0)) continue;
+        float4 candidate = irradiance.Load(int3(samplePixel, 0));
+        // Alpha remains receiver depth, not a lighting-validity bit. Receiver
+        // metadata carries support after temporal resolve and any denoise pass.
+        if (!(candidate.w > 0.0) || !isfinite(candidate.w)
+            || !all(isfinite(candidate.xyz))) continue;
+        float4 receiver = receiverHistory.Load(int3(samplePixel, 0));
+        if (receiverHistoryLength(receiver) == 0u
+            || receiverScreenHistorySupportMask(receiver) == 0u
+            || any(asuint(receiver.xy) != targetRaster.xy)) continue;
+        uint2 sampleLocal = min(uint2(samplePixel) * scale + scale / 2u,
+                                params.viewport.zw - 1u);
+        uint2 full = params.viewport.xy + sampleLocal;
+        uint4 sampleRaster = rasterReceiver.Load(int3(full, 0));
+        if ((sampleRaster.z & 0x80000000u) == 0u
+            || any(sampleRaster.xy != targetRaster.xy)) continue;
+        uint4 sampleDeferred = gbuffer.Load(int3(full, 0));
+        if ((sampleDeferred.w & (1u << 24u)) != 0u) continue;
+        float3 sampleNormal = receiverNormal(receiver);
+        float3 rasterNormal = receiverGeometricNormal(sampleRaster.z, deferredShadingNormal(sampleDeferred));
+        if (dot(normal, sampleNormal) <= 0.97
+            || dot(normal, rasterNormal) <= 0.97
+            || dot(sampleNormal, rasterNormal) <= 0.97) continue;
+        float3 samplePosition = worldPosition(float2(full) + 0.5, candidate.w, params);
+        if (!all(isfinite(samplePosition))
+            || surfacePlaneDistance(samplePosition - position, normal, rasterNormal) > tolerance) continue;
+        sum += candidate.xyz * weight;
+        support += weight;
+    }
+    return support > 1e-6 ? sum / support : 0.0;
 }
 
 [shader("fragment")]
 float4 fragment(VertexOutput input) : SV_Target {
     uint2 pixel = uint2(input.position.xy);
-    float4 source = float4(0);
-    // Contribute zero outside this camera's viewport on shared render targets.
-    if (any(pixel < params.viewport.xy) || any(pixel >= params.viewport.xy + params.viewport.zw)) return source;
+    if (any(pixel < params.viewport.xy)
+        || any(pixel >= params.viewport.xy + params.viewport.zw)) return 0.0;
     float depth = depthTexture.Load(int3(pixel, 0));
     uint4 deferred = gbuffer.Load(int3(pixel, 0));
-    if (depth <= 0.0) return source;
-    if (((deferred.x & 0xffffffu) == 0 || ((deferred.z >> 8) & 255u) == 255u)) return source;
-    float3 normal = receiverGeometricNormal(receiverIdentity.Load(int3(pixel,0)).z,
-        normalize(normalTexture.Load(int3(pixel, 0)).xyz * 2.0 - 1.0));
-    float3 position = worldPosition(input.position.xy, depth, params);
-    float2 grid = irradianceGrid(input.position.xy, params);
-    int2 base = int2(floor(grid)); float2 fraction = frac(grid);
-    float3 sum = 0.0; float total = 0.0;
-    uint selectedSurfaceGroup = 0xffffffffu; float nearestSurface = 3.402823e38;
-    if (params.layers.w != 0) for (uint corner = 0; corner < 4; ++corner) {
-        uint2 bit = uint2(corner & 1, corner >> 1);
-        int2 low = clamp(base + int2(bit), int2(0), int2(params.size.xy) - 1);
-        float4 value = irradiance.Load(int3(low, 0));
-        if (value.w <= 0.0) continue;
-        uint2 full = fullPixel(uint2(low), params);
-        float3 other = worldPosition(float2(full) + 0.5, value.w, params);
-        float3 otherNormal = receiverGeometricNormal(receiverIdentity.Load(int3(full,0)).z,
-            normalize(normalTexture.Load(int3(full, 0)).xyz * 2.0 - 1.0));
-        if (dot(normal, otherNormal) < 0.95 || abs(dot(position - other, normal)) > surfaceTolerance(params)) continue;
-        float distance = dot(position - other, position - other);
-        if (distance < nearestSurface) {
-            nearestSurface = distance;
-            selectedSurfaceGroup = surfaceGroups.Load(int3(low,0));
-        }
-    }
-    for (uint corner = 0; corner < 4; ++corner) {
-        uint2 bit = uint2(corner & 1, corner >> 1);
-        int2 low = clamp(base + int2(bit), int2(0), int2(params.size.xy) - 1);
-        float4 value = irradiance.Load(int3(low, 0));
-        if (value.w <= 0.0) continue;
-        uint2 full = fullPixel(uint2(low), params);
-        if (params.layers.w != 0 && surfaceGroups.Load(int3(low,0)) != selectedSurfaceGroup) continue;
-        float3 other = worldPosition(float2(full) + 0.5, value.w, params);
-        float3 otherNormal = receiverGeometricNormal(receiverIdentity.Load(int3(full,0)).z,
-            normalize(normalTexture.Load(int3(full, 0)).xyz * 2.0 - 1.0));
-        if (dot(normal, otherNormal) < 0.95 || abs(dot(position - other, normal)) > surfaceTolerance(params)) continue;
-        float2 weights = lerp(1.0 - fraction, fraction, float2(bit));
-        float weight = weights.x * weights.y * pow(max(0.0, dot(normal, otherNormal)), 16.0)
-                       * exp(-length(position - other) / max(params.tuning.x, 0.001));
-        sum += value.xyz * weight;
-        total += weight;
-    }
-    // Bevy 0.19's deferred base color uses gamma 2.2 (pbr_deferred_functions).
-    float3 baseColor = deferredBaseColor(deferred);
+    if (!(depth > 0.0) || (deferred.w & (1u << 24u)) != 0u) return 0.0;
+
+    float3 diffuseGi = reconstructCompositeGi(pixel);
     float3 diffuseOcclusion = 1.0;
-    if ((params.layers.z & 1u) != 0) {
-        diffuseOcclusion = float((deferred.z >> 16) & 255u) / 255.0;
-        if ((params.layers.z & 2u) != 0) {
-            float ssao = saturate(screenSpaceOcclusion.Load(int3(pixel,0)));
-            // Bevy 0.19.1 ssao_multibounce and deferred_lighting conventions.
+    if ((params.layers.z & 1u) != 0u) {
+        diffuseOcclusion = float((deferred.z >> 16u) & 255u) / 255.0;
+        if ((params.layers.z & 2u) != 0u) {
+            float ssao = saturate(screenSpaceOcclusion.Load(int3(pixel, 0)));
+            float3 baseColor = deferredBaseColor(deferred);
             float3 a = 2.0404 * baseColor - 0.3324;
             float3 b = -4.7951 * baseColor + 0.6417;
             float3 c = 2.7552 * baseColor + 0.6903;
-            diffuseOcclusion = min(diffuseOcclusion, max(float3(ssao), ((ssao*a+b)*ssao+c)*ssao));
+            diffuseOcclusion = min(diffuseOcclusion,
+                max(float3(ssao), ((ssao * a + b) * ssao + c) * ssao));
         }
     }
     float3 albedo = deferredDiffuseAlbedo(deferred);
-    float3 gi = total > 0.00001 ? sum / total : float3(0.0);
-    gi *= albedo;
-    gi *= diffuseOcclusion;
-    return float4(gi * params.tuning.w * params.environment.w, 0);
+    return float4(diffuseGi * albedo * diffuseOcclusion
+        * params.tuning.w * params.environment.w, 0.0);
 }

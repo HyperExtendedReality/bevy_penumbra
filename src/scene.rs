@@ -141,6 +141,9 @@ pub(crate) struct SceneData {
     pub acceleration_prefix: Arc<Vec<UVec4>>,
     pub blas_words: Arc<Vec<UVec4>>,
     pub instance_words: Arc<Vec<UVec4>>,
+    /// Entity-to-index mapping for the packed GPU instance table. The index is
+    /// used by raster receivers to enter the owning BLAS without a TLAS walk.
+    pub instance_indices: Arc<HashMap<Entity, u32>>,
     // ponytail: 64-bit signatures keep residency metadata small; retain full
     // geometry/material keys only if hash collisions become a practical risk.
     pub instance_residency: Arc<HashMap<Entity, u64>>,
@@ -155,6 +158,7 @@ pub(crate) struct GiScene {
     pub data: Arc<SceneData>,
     pub pending_entities: Arc<HashSet<Entity>>,
     pub revision: u64,
+    pub light_revision: u64,
     pub geometry_revision: u64,
     pub mesh_revision: u64,
     pub topology_revision: u64,
@@ -165,6 +169,8 @@ pub(crate) struct GiScene {
 }
 
 const INSTANCE_WORDS: usize = 9;
+const INSTANCE_FLAG_UNLIT: u32 = 1 << 4;
+const INSTANCE_FLAG_BAKED_RECEIVER: u32 = 1 << 5;
 
 #[derive(Clone)]
 pub(crate) struct SceneInstance {
@@ -179,7 +185,7 @@ pub(crate) struct SceneInstance {
     pub albedo: Vec3,
     emission: Vec3,
     // Bits 0..1: cull mode; bit 2: mirrored; bit 3: double-sided; bit 4: unlit;
-    // bit 5: baked-lightmap receiver (occlusion and scattering remain enabled).
+    // bit 5: baked-lightmap receiver; bit 6: active deformation.
     flags: u32,
     material: u32,
     layers: RenderLayers,
@@ -227,6 +233,30 @@ pub(crate) fn view_lights(data: &SceneData, layers: &RenderLayers) -> (Vec<GiLig
 }
 
 impl SceneInstance {
+    pub(crate) fn world_bounds(&self) -> Option<(Vec3, Vec3)> {
+        (self.min.is_finite() && self.max.is_finite() && self.min.cmple(self.max).all())
+            .then_some((self.min, self.max))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_world_bounds(min: Vec3, max: Vec3) -> Self {
+        Self {
+            entity: Entity::PLACEHOLDER,
+            world_from_local: bevy::math::Affine3A::IDENTITY,
+            local_from_world: bevy::math::Affine3A::IDENTITY,
+            min,
+            max,
+            root: 0,
+            first: 0,
+            count: 0,
+            albedo: Vec3::ZERO,
+            emission: Vec3::ZERO,
+            flags: 0,
+            material: 0,
+            layers: RenderLayers::default(),
+        }
+    }
+
     fn triangle(&self, local: Triangle) -> Triangle {
         Triangle {
             a: self
@@ -505,7 +535,7 @@ fn save_blas_cache(
     let directory = cache_dir;
     let path = directory.join(format!("{geometry_signature:016x}.bvh"));
     let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(&directory)?;
+        std::fs::create_dir_all(directory)?;
         let mut file = tempfile::NamedTempFile::new_in(directory)?;
         file.write_all(BLAS_CACHE_MAGIC)?;
         file.write_all(&geometry_signature.to_le_bytes())?;
@@ -768,86 +798,7 @@ fn has_usable_triangle(mesh: &Mesh, positions: &[[f32; 3]]) -> bool {
     })
 }
 
-fn triangle_surface_groups(triangles: &[Triangle], vertex_count: usize) -> Vec<u32> {
-    fn root(parents: &mut [u32], mut index: u32) -> u32 {
-        while parents[index as usize] != index {
-            let parent = parents[index as usize];
-            parents[index as usize] = parents[parent as usize];
-            index = parent;
-        }
-        index
-    }
-
-    fn join(parents: &mut [u32], a: u32, b: u32) {
-        let (a, b) = (root(parents, a), root(parents, b));
-        if a != b {
-            parents[a.max(b) as usize] = a.min(b);
-        }
-    }
-
-    let mut parents: Vec<_> = (0..triangles.len()).map(|index| index as u32).collect();
-    let mut vertex_owner = vec![u32::MAX; vertex_count];
-    for (index, triangle) in triangles.iter().enumerate() {
-        for vertex in triangle.indices.to_array() {
-            if let Some(owner) = vertex_owner.get_mut(vertex as usize) {
-                if *owner == u32::MAX {
-                    *owner = index as u32;
-                } else {
-                    join(&mut parents, index as u32, *owner);
-                }
-            }
-        }
-    }
-    let mut group_ids = vec![u32::MAX; parents.len()];
-    for (index, triangle) in triangles.iter().enumerate() {
-        let component = root(&mut parents, index as u32) as usize;
-        group_ids[component] = group_ids[component].min(
-            triangle
-                .indices
-                .x
-                .min(triangle.indices.y)
-                .min(triangle.indices.z),
-        );
-    }
-    for index in 0..parents.len() {
-        let component = root(&mut parents, index as u32) as usize;
-        group_ids[index] = group_ids[component];
-    }
-    group_ids
-}
-
-#[cfg(test)]
-mod surface_group_tests {
-    use super::*;
-
-    #[test]
-    fn surface_groups_follow_mesh_local_connectivity() {
-        let triangle = |a, b, c| Triangle {
-            indices: UVec3::new(a, b, c),
-            ..Triangle::default()
-        };
-        let triangles = vec![triangle(0, 1, 2), triangle(2, 3, 4), triangle(10, 11, 12)];
-        let groups = triangle_surface_groups(&triangles, 13);
-        assert_eq!(groups, vec![0, 0, 10]);
-
-        let reordered = vec![triangles[2], triangles[0], triangles[1]];
-        assert_eq!(triangle_surface_groups(&reordered, 13), vec![10, 0, 0]);
-        assert_eq!(
-            geometry_words(&triangles, &groups, &[])
-                .iter()
-                .skip(1)
-                .map(|word| word.w)
-                .collect::<Vec<_>>(),
-            groups
-        );
-    }
-}
-
-fn geometry_words(
-    triangles: &[Triangle],
-    surface_groups: &[u32],
-    vertices: &[MeshVertex],
-) -> Vec<UVec4> {
+fn geometry_words(triangles: &[Triangle], vertices: &[MeshVertex]) -> Vec<UVec4> {
     let mut words = Vec::with_capacity(1 + triangles.len() + vertices.len() * 5);
     words.push(UVec4::new(
         1,
@@ -855,53 +806,63 @@ fn geometry_words(
         5,
         vertices.len() as u32,
     ));
-    words.extend(
-        triangles
-            .iter()
-            .zip(surface_groups)
-            .map(|(triangle, &group)| triangle.indices.extend(group)),
-    );
+    words.extend(triangles.iter().map(|triangle| triangle.indices.extend(0)));
     words.extend(vertices.iter().flat_map(|vertex| vertex.words()));
     words
 }
 
-fn local_triangles(mesh: &Mesh, positions: &[[f32; 3]]) -> Vec<Triangle> {
-    let indices: Vec<usize> = match mesh.indices() {
-        Some(Indices::U16(values)) => values.iter().map(|&i| i as usize).collect(),
-        Some(Indices::U32(values)) => values.iter().map(|&i| i as usize).collect(),
-        None => (0..positions.len()).collect(),
+fn local_triangles(
+    vertices: &[MeshVertex],
+    indices: Option<&Indices>,
+    preserve_degenerate: bool,
+) -> Vec<Triangle> {
+    let index_count = match indices {
+        Some(Indices::U16(values)) => values.len(),
+        Some(Indices::U32(values)) => values.len(),
+        None => vertices.len(),
     };
-    indices
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .filter_map(|indices| {
-            let [Some(a), Some(b), Some(c)] =
-                [indices[0], indices[1], indices[2]].map(|i| positions.get(i))
-            else {
-                return None;
-            };
-            let [a, b, c] = [a, b, c].map(|p| Vec3::from_array(*p));
-            let cross = (b - a).cross(c - a);
-            if !a.is_finite()
-                || !b.is_finite()
-                || !c.is_finite()
-                || !cross.is_finite()
-                || (cross == Vec3::ZERO
-                    && mesh.get_morph_targets().is_none()
-                    && mesh.attribute(Mesh::ATTRIBUTE_JOINT_INDEX).is_none())
-            {
-                return None;
+    let mut triangles = Vec::with_capacity(index_count / 3);
+    let mut append = |indices: [usize; 3]| {
+        let [Some(a), Some(b), Some(c)] = indices.map(|index| vertices.get(index)) else {
+            return;
+        };
+        let [a, b, c] = [a.position, b.position, c.position];
+        let cross = (b - a).cross(c - a);
+        if !a.is_finite()
+            || !b.is_finite()
+            || !c.is_finite()
+            || !cross.is_finite()
+            || (cross == Vec3::ZERO && !preserve_degenerate)
+        {
+            return;
+        }
+        triangles.push(Triangle {
+            a: a.extend(0.0),
+            b: b.extend(0.0),
+            c: c.extend(0.0),
+            indices: UVec3::new(indices[0] as u32, indices[1] as u32, indices[2] as u32),
+            ..default()
+        });
+    };
+    match indices {
+        Some(Indices::U16(indices)) => {
+            for chunk in indices.as_chunks::<3>().0 {
+                append([chunk[0] as usize, chunk[1] as usize, chunk[2] as usize]);
             }
-            Some(Triangle {
-                a: a.extend(0.0),
-                b: b.extend(0.0),
-                c: c.extend(0.0),
-                indices: UVec3::new(indices[0] as u32, indices[1] as u32, indices[2] as u32),
-                ..default()
-            })
-        })
-        .collect()
+        }
+        Some(Indices::U32(indices)) => {
+            for chunk in indices.as_chunks::<3>().0 {
+                append([chunk[0] as usize, chunk[1] as usize, chunk[2] as usize]);
+            }
+        }
+        None => {
+            for triangle in 0..vertices.len() / 3 {
+                let first = triangle * 3;
+                append([first, first + 1, first + 2]);
+            }
+        }
+    }
+    triangles
 }
 
 impl MeshCache {
@@ -940,7 +901,6 @@ impl MeshCache {
                     .map(|(_, id)| self.meshes[id].vertices.len())
                     .sum::<usize>(),
         );
-        let mut surface_groups = Vec::with_capacity(triangles.capacity());
         let mut nodes = Vec::with_capacity(
             keys.iter()
                 .map(|(id, _)| self.meshes[id].nodes.len())
@@ -958,7 +918,6 @@ impl MeshCache {
         self.animated_spans.clear();
         for &(id, _) in &keys {
             let mesh = &self.meshes[&id];
-            let groups = triangle_surface_groups(&mesh.triangles, mesh.vertices.len());
             let span = MeshSpan {
                 vertex: vertices.len() as u32,
                 root: nodes.len() as u32,
@@ -971,7 +930,6 @@ impl MeshCache {
                 indices: triangle.indices + vertex_offset,
                 ..*triangle
             }));
-            surface_groups.extend(groups);
             vertices.extend_from_slice(&mesh.vertices);
             nodes.extend(mesh.nodes.iter().map(|node| BvhNode {
                 first: node.first
@@ -985,7 +943,6 @@ impl MeshCache {
         }
         for &(entity, id) in &animated {
             let mesh = &self.meshes[&id];
-            let groups = triangle_surface_groups(&mesh.triangles, mesh.vertices.len());
             let span = MeshSpan {
                 vertex: vertices.len() as u32,
                 root: nodes.len() as u32,
@@ -997,7 +954,6 @@ impl MeshCache {
                 indices: triangle.indices + UVec3::splat(span.vertex),
                 ..*triangle
             }));
-            surface_groups.extend(groups);
             vertices.extend_from_slice(&mesh.vertices);
             nodes.extend(mesh.nodes.iter().map(|node| BvhNode {
                 first: node.first
@@ -1009,7 +965,7 @@ impl MeshCache {
                 ..*node
             }));
         }
-        self.geometry_words = Arc::new(geometry_words(&triangles, &surface_groups, &vertices));
+        self.geometry_words = Arc::new(geometry_words(&triangles, &vertices));
         self.vertices = Arc::new(vertices);
         if geometry_keys != self.packed_geometry_keys || animated_keys != self.animated_keys {
             self.triangles = Arc::new(triangles);
@@ -1069,19 +1025,11 @@ fn pack_instances(
     instances: &[SceneInstance],
     tlas_count: usize,
     base: usize,
-    probabilities: &HashMap<Entity, Vec<f32>>,
     materials: &[UVec4],
     textures: &[UVec4],
 ) -> Vec<UVec4> {
     let mut words = Vec::with_capacity(instances.len() * INSTANCE_WORDS);
-    let mut masses = Vec::new();
-    let material_base = base
-        + instances.len() * INSTANCE_WORDS
-        + instances
-            .iter()
-            .filter_map(|instance| probabilities.get(&instance.entity))
-            .map(|values| values.len().div_ceil(4))
-            .sum::<usize>();
+    let material_base = base + instances.len() * INSTANCE_WORDS;
     let layer_base = material_base + materials.len() + textures.len();
     let mut layer_masks = Vec::new();
     for instance in instances {
@@ -1112,31 +1060,32 @@ fn pack_instances(
             0,
             (material_base + instance.material as usize * MATERIAL_WORDS) as u32,
         ));
-        let probability_offset = if let Some(values) = probabilities.get(&instance.entity) {
-            let offset = base + instances.len() * INSTANCE_WORDS + masses.len();
-            for group in values.chunks(4) {
-                let mut word = [0; 4];
-                for (i, value) in group.iter().enumerate() {
-                    word[i] = value.to_bits();
-                }
-                masses.push(UVec4::from_array(word));
-            }
-            offset as u32
-        } else {
-            0
-        };
         words.push(UVec4::new(
             tlas_count as u32 + instance.root,
             instance.first,
             instance.count,
-            probability_offset,
+            0,
         ));
     }
-    words.extend(masses);
     words.extend_from_slice(materials);
     words.extend_from_slice(textures);
     words.extend(layer_masks);
     words
+}
+
+fn changed_instance_transform(
+    scene: &GiScene,
+    entity: Entity,
+    transform: &GlobalTransform,
+) -> bool {
+    scene
+        .data
+        .instance_indices
+        .get(&entity)
+        .and_then(|index| scene.data.instances.get(*index as usize))
+        .is_none_or(|instance| {
+            instance.entity != entity || instance.world_from_local != transform.affine()
+        })
 }
 
 // Bevy system parameters and query tuples describe the scene inputs.
@@ -1184,10 +1133,16 @@ pub(crate) fn update_scene(
     mut mesh_cache: Local<MeshCache>,
     mut texture_cache: Local<TextureCache>,
     (
+        mut light_scratch,
+        mut light_layers_scratch,
         (deformation_inputs, mut previous_poses),
         (unsupported_materials, mut warned_unsupported_materials, mut pending_entities),
         (mesh_events, mut mesh_event_cursor),
+        (image_events, mut image_event_cursor),
+        (material_events, mut material_event_cursor),
     ): (
+        Local<Vec<GiLight>>,
+        Local<Vec<RenderLayers>>,
         (
             crate::deformation::DeformationInputs,
             Local<HashMap<Entity, Result<crate::deformation::DeformationPose, &'static str>>>,
@@ -1207,6 +1162,14 @@ pub(crate) fn update_scene(
         (
             Option<Res<Messages<AssetEvent<Mesh>>>>,
             Local<MessageCursor<AssetEvent<Mesh>>>,
+        ),
+        (
+            Option<Res<Messages<AssetEvent<Image>>>>,
+            Local<MessageCursor<AssetEvent<Image>>>,
+        ),
+        (
+            Option<Res<Messages<AssetEvent<StandardMaterial>>>>,
+            Local<MessageCursor<AssetEvent<StandardMaterial>>>,
         ),
     ),
 ) {
@@ -1281,10 +1244,65 @@ pub(crate) fn update_scene(
     let lightmaps_removed = removed_lightmaps
         .read()
         .any(|entity| previous_geometry.contains(&entity));
-    let images_changed = images.as_ref().is_some_and(|images| images.is_changed());
+    let images_resource_changed = images.as_ref().is_some_and(|images| images.is_changed());
+    let changed_images: Option<HashSet<_>> = image_events.as_ref().map(|events| {
+        image_event_cursor
+            .read(events)
+            .filter_map(|event| match event {
+                AssetEvent::Added { id }
+                | AssetEvent::Modified { id }
+                | AssetEvent::Removed { id }
+                | AssetEvent::LoadedWithDependencies { id } => Some(*id),
+                AssetEvent::Unused { .. } => None,
+            })
+            .collect()
+    });
+    let images_changed = changed_images.as_ref().map_or_else(
+        || images_resource_changed,
+        |changed| {
+            !changed.is_empty()
+                && geometry.iter().any(|(_, _, material, _, visible, ..)| {
+                    if visible.as_ref().is_some_and(|visible| !visible.get()) {
+                        return false;
+                    }
+                    materials
+                        .get(&material.0)
+                        .filter(|material| material_support(material).is_ok())
+                        .is_some_and(|material| {
+                            texture_handles(material)
+                                .into_iter()
+                                .flatten()
+                                .any(|handle| changed.contains(&handle.id()))
+                        })
+                })
+        },
+    );
     let texture_options_changed = texture_options
         .as_ref()
         .is_some_and(|options| options.is_changed());
+    let materials_resource_changed = materials.is_changed();
+    let changed_materials: Option<HashSet<_>> = material_events.as_ref().map(|events| {
+        material_event_cursor
+            .read(events)
+            .filter_map(|event| match event {
+                AssetEvent::Added { id }
+                | AssetEvent::Modified { id }
+                | AssetEvent::Removed { id }
+                | AssetEvent::LoadedWithDependencies { id } => Some(*id),
+                AssetEvent::Unused { .. } => None,
+            })
+            .collect()
+    });
+    let materials_changed = changed_materials.as_ref().map_or_else(
+        || materials_resource_changed,
+        |changed| {
+            !changed.is_empty()
+                && geometry.iter().any(|(_, _, material, _, visible, ..)| {
+                    !visible.as_ref().is_some_and(|visible| !visible.get())
+                        && changed.contains(&material.0.id())
+                })
+        },
+    );
     let changed_meshes: Option<HashSet<_>> = mesh_events.as_ref().map(|events| {
         mesh_event_cursor
             .read(events)
@@ -1313,69 +1331,123 @@ pub(crate) fn update_scene(
         mesh_cache.support.clear();
     }
     pending_entities.clear();
-    for (entity, mesh_handle, material, _, visible, ..) in &geometry {
-        if visible.as_ref().is_some_and(|visible| !visible.get()) {
-            continue;
-        }
-        let Some(material_asset) = materials.get(&material.0) else {
-            continue;
-        };
-        let Some(mesh) = meshes.get(&mesh_handle.0) else {
-            continue;
-        };
-        if mesh_cache
-            .support
-            .entry(mesh_handle.0.id())
-            .or_insert_with(|| mesh_support(mesh))
-            .is_ok()
-            && crate::material::material_mesh_layout_support(material_asset, mesh).is_ok()
-        {
-            pending_entities.insert(entity);
-        }
-    }
-    if texture_cache.permanent_failure {
-        pending_entities.clear();
-    }
-    if scene.pending_entities.as_ref() != &*pending_entities {
-        scene.pending_entities = Arc::new(pending_entities.clone());
-    }
     let mut dirty = !scene.ready
         || poses_changed
         || images_changed
         || texture_options_changed
         || mesh_assets_changed
-        || materials.is_changed()
+        || materials_changed
         || visibility_removed
         || layers_removed
         || lightmaps_removed
         || rebuilt.is_some()
         || !rebuilt_blas.is_empty();
     let mut geometry_count = 0;
+    let mut changed_geometry = Vec::new();
     for (entity, mesh, material, transform, visible, layers, lightmap) in &geometry {
         geometry_count += 1;
-        dirty |= !previous_geometry.contains(&entity)
-            || changed_meshes
-                .as_ref()
-                .is_some_and(|changed| changed.contains(&mesh.0.id()))
-            || mesh.is_changed()
-            || material.is_changed()
-            || transform.is_changed()
-            || visible.as_ref().is_some_and(|v| v.is_changed())
-            || layers.as_ref().is_some_and(|layers| layers.is_changed())
-            || lightmap
-                .as_ref()
-                .is_some_and(|lightmap| lightmap.is_changed());
+        if !texture_cache.permanent_failure
+            && !visible.as_ref().is_some_and(|visible| !visible.get())
+            && let Some(material_asset) = materials.get(&material.0)
+            && let Some(mesh_asset) = meshes.get(&mesh.0)
+            && mesh_cache
+                .support
+                .entry(mesh.0.id())
+                .or_insert_with(|| mesh_support(mesh_asset))
+                .is_ok()
+            && crate::material::material_mesh_layout_support(material_asset, mesh_asset).is_ok()
+        {
+            pending_entities.insert(entity);
+        }
+        let is_new = !previous_geometry.contains(&entity);
+        let mesh_asset_changed = changed_meshes
+            .as_ref()
+            .is_some_and(|changed| changed.contains(&mesh.0.id()));
+        let mesh_changed = mesh.is_changed();
+        let material_changed = material.is_changed();
+        let transform_tick_changed = transform.is_changed();
+        let transform_value_changed =
+            transform_tick_changed && changed_instance_transform(&scene, entity, &transform);
+        let visibility_changed = visible.as_ref().is_some_and(|visible| visible.is_changed());
+        let layers_changed = layers.as_ref().is_some_and(|layers| layers.is_changed());
+        let lightmap_changed = lightmap
+            .as_ref()
+            .is_some_and(|lightmap| lightmap.is_changed());
+        let entity_dirty = is_new
+            || mesh_asset_changed
+            || mesh_changed
+            || material_changed
+            || transform_value_changed
+            || visibility_changed
+            || layers_changed
+            || lightmap_changed;
+        if entity_dirty {
+            dirty = true;
+            let mut changed = Vec::new();
+            if is_new {
+                changed.push("new");
+            }
+            if mesh_asset_changed {
+                changed.push("mesh_asset_event");
+            }
+            if mesh_changed {
+                changed.push("mesh_handle");
+            }
+            if material_changed {
+                changed.push("material_handle");
+            }
+            if transform_tick_changed {
+                changed.push("transform_tick");
+            }
+            if transform_value_changed {
+                changed.push("transform_value");
+            }
+            if visibility_changed {
+                changed.push("visibility");
+            }
+            if layers_changed {
+                changed.push("layers");
+            }
+            if lightmap_changed {
+                changed.push("lightmap");
+            }
+            changed_geometry.push((entity, changed));
+        }
+    }
+    if scene.pending_entities.as_ref() != &*pending_entities {
+        scene.pending_entities = Arc::new(pending_entities.clone());
     }
     // Removing a required input drops the entity from the query. Membership
     // catches every such removal without rebuilding for unrelated despawns.
     dirty |= geometry_count != previous_geometry.len();
     if dirty {
+        debug!(
+            images_changed,
+            images_resource_changed,
+            materials_changed,
+            materials_resource_changed,
+            mesh_assets_changed,
+            poses_changed,
+            texture_options_changed,
+            visibility_removed,
+            layers_removed,
+            lightmaps_removed,
+            tlas_rebuilt = rebuilt.is_some(),
+            rebuilt_blas = ?rebuilt_blas,
+            pose_dirty_entities = ?pose_dirty_entities,
+            changed_geometry = ?changed_geometry,
+            geometry_count,
+            previous_geometry_count = previous_geometry.len(),
+            "GI scene rebuild requested"
+        );
         previous_geometry.clear();
         previous_geometry.extend(geometry.iter().map(|(entity, ..)| entity));
     }
 
-    let mut lights = Vec::new();
-    let mut light_layers = Vec::new();
+    let mut lights = std::mem::take(&mut *light_scratch);
+    lights.clear();
+    let mut light_layers = std::mem::take(&mut *light_layers_scratch);
+    light_layers.clear();
     for (light, transform, visible, layers) in &directional {
         if visible.is_some_and(|v| !v.get())
             || !light.illuminance.is_finite()
@@ -1436,6 +1508,8 @@ pub(crate) fn update_scene(
         }
     }
     if !dirty && scene.data.lights == lights && scene.data.light_layers == light_layers {
+        *light_scratch = lights;
+        *light_layers_scratch = light_layers;
         return;
     }
     if !dirty {
@@ -1445,6 +1519,7 @@ pub(crate) fn update_scene(
             ..scene.data.as_ref().clone()
         });
         scene.revision = scene.revision.wrapping_add(1);
+        scene.light_revision = scene.light_revision.wrapping_add(1);
         return;
     }
 
@@ -1475,6 +1550,8 @@ pub(crate) fn update_scene(
         }
         scene.ready = false;
         warn_once!("GI scene pending texture residency: {reason}");
+        *light_scratch = lights;
+        *light_layers_scratch = light_layers;
         return;
     }
     let mut material_indices = HashMap::new();
@@ -1569,8 +1646,16 @@ pub(crate) fn update_scene(
                     });
                     if !pending_matches {
                         mesh_cache.pending_blas.remove(&id);
-                        let mut triangles = local_triangles(mesh, positions);
+                        // Keep triangle expansion off the main scene-update path.
+                        // Copy only the compact source index array; the validated
+                        // vertex data is moved into the worker and returned with
+                        // its BLAS output.
+                        let indices = mesh.indices().cloned();
+                        let preserve_degenerate = mesh.get_morph_targets().is_some()
+                            || mesh.attribute(Mesh::ATTRIBUTE_JOINT_INDEX).is_some();
                         let task = AsyncComputeTaskPool::get().spawn(async move {
+                            let mut triangles =
+                                local_triangles(&vertices, indices.as_ref(), preserve_degenerate);
                             #[cfg(not(target_arch = "wasm32"))]
                             let (nodes, triangles) = {
                                 let cache_dir = blas_cache_dir();
@@ -1680,8 +1765,8 @@ pub(crate) fn update_scene(
         } else {
             0
         } | (u32::from(material.double_sided) << 3)
-            | (u32::from(material.unlit) << 4)
-            | (u32::from(lightmap.is_some()) << 5);
+            | (u32::from(material.unlit) * INSTANCE_FLAG_UNLIT)
+            | (u32::from(lightmap.is_some()) * INSTANCE_FLAG_BAKED_RECEIVER);
         let flags = flags | (u32::from(poses.contains_key(&entity)) << 6);
         let mut residency = std::collections::hash_map::DefaultHasher::new();
         mesh_cache.meshes[&id].signature.hash(&mut residency);
@@ -1780,21 +1865,14 @@ pub(crate) fn update_scene(
         });
         instance_residency.insert(entity, residency);
     }
-    let instance_residency = if scene.data.instance_residency.as_ref() == &instance_residency {
-        scene.data.instance_residency.clone()
-    } else {
-        Arc::new(instance_residency)
-    };
     // Emitter ordering follows stable entity/mesh order, independently of TLAS
     // partition/refit. Only emitting triangles require world-space expansion.
     let mut emitters = Vec::new();
     let mut emitter_keys = Vec::new();
-    let mut probabilities = HashMap::new();
     for instance in &instances {
         if instance.emission.max_element() <= 0.0 {
             continue;
         }
-        probabilities.insert(instance.entity, vec![0.0; instance.count as usize]);
         for i in 0..instance.count {
             let mut local = mesh_cache.triangles[(instance.first + i) as usize];
             if let Some(Ok(pose)) = poses.get(&instance.entity) {
@@ -1811,7 +1889,7 @@ pub(crate) fn update_scene(
                 [local.a, local.b, local.c] = points.map(|point| point.extend(0.0));
             }
             let mut triangle = instance.triangle(local);
-            if instance.flags & 16 != 0 {
+            if instance.flags & INSTANCE_FLAG_UNLIT != 0 {
                 // A power estimate may be approximate, but all potentially
                 // emitting vertex-colored regions retain positive probability.
                 let color = local
@@ -1847,10 +1925,6 @@ pub(crate) fn update_scene(
             return;
         }
     };
-    for (triangle, &(entity, index, _)) in emitters.iter().zip(&emitter_keys) {
-        probabilities.get_mut(&entity).expect("emitter instance")[index as usize] =
-            triangle.emission.w;
-    }
     let mut by_entity: HashMap<_, _> = instances
         .iter()
         .map(|instance| (instance.entity, instance.clone()))
@@ -1899,14 +1973,30 @@ pub(crate) fn update_scene(
         scene.topology_revision = scene.topology_revision.wrapping_add(1);
         nodes
     };
-    let instance_indices: HashMap<_, _> = instances
+    let instance_index_map: HashMap<_, _> = instances
         .iter()
         .enumerate()
         .map(|(i, instance)| (instance.entity, i as u32))
         .collect();
+    let instance_indices = if scene.data.instance_indices.as_ref() == &instance_index_map {
+        scene.data.instance_indices.clone()
+    } else {
+        Arc::new(instance_index_map.clone())
+    };
+    for (entity, residency) in &mut instance_residency {
+        let mut indexed_residency = std::collections::hash_map::DefaultHasher::new();
+        residency.hash(&mut indexed_residency);
+        instance_index_map[entity].hash(&mut indexed_residency);
+        *residency = indexed_residency.finish();
+    }
+    let instance_residency = if scene.data.instance_residency.as_ref() == &instance_residency {
+        scene.data.instance_residency.clone()
+    } else {
+        Arc::new(instance_residency)
+    };
     for light in &mut emissive_lights {
         let (entity, _, triangle) = emitter_keys[light.source.y as usize];
-        light.source = UVec4::new(instance_indices[&entity], triangle, 0, 0);
+        light.source = UVec4::new(instance_index_map[&entity], triangle, 0, 0);
     }
     let emissive_lights = Arc::new(emissive_lights);
     let cost = tree_cost(&nodes);
@@ -1930,13 +2020,7 @@ pub(crate) fn update_scene(
     };
     let base = 1 + nodes.len() * 2 + blas_words.len();
     let mut prefix = vec![UVec4::new(
-        (base
-            + instances.len() * INSTANCE_WORDS
-            + probabilities
-                .values()
-                .map(|values| values.len().div_ceil(4))
-                .sum::<usize>()
-            + packed_materials.len()) as u32,
+        (base + instances.len() * INSTANCE_WORDS + packed_materials.len()) as u32,
         base as u32,
         instances.len() as u32,
         INSTANCE_WORDS as u32,
@@ -1946,7 +2030,6 @@ pub(crate) fn update_scene(
         &instances,
         nodes.len(),
         base,
-        &probabilities,
         &packed_materials,
         &texture_cache.atlas.words,
     ));
@@ -2032,6 +2115,9 @@ pub(crate) fn update_scene(
     {
         scene.mesh_revision = scene.mesh_revision.wrapping_add(1);
     }
+    let lighting_changed = scene.data.lights != lights
+        || scene.data.light_layers != light_layers
+        || scene.data.emissive_lights.as_ref() != emissive_lights.as_ref();
     scene.data = Arc::new(SceneData {
         deformation: Arc::new(deformation),
         triangles: mesh_cache.triangles.clone(),
@@ -2046,12 +2132,16 @@ pub(crate) fn update_scene(
         acceleration_prefix: Arc::new(prefix),
         blas_words,
         instance_words,
+        instance_indices,
         instance_residency,
         lights,
         light_layers,
         emissive_lights,
     });
     scene.revision = scene.revision.wrapping_add(1);
+    if lighting_changed {
+        scene.light_revision = scene.light_revision.wrapping_add(1);
+    }
     scene.geometry_revision = scene.geometry_revision.wrapping_add(1);
     scene.ready = true;
     debug!(
@@ -2152,7 +2242,7 @@ fn build_emissive_lights(triangles: &mut [Triangle]) -> Result<Vec<GiLight>, &'s
         if !power.is_finite() || power <= 0.0 {
             continue;
         }
-        let cull = triangle.albedo.w as u32;
+        let cull = triangle.albedo.w as u32 & 3;
         lights.push(GiLight {
             position: triangle.a.with_w(if cull == 0 { -2.0 } else { -1.0 }),
             color: emission.extend(area),
@@ -2161,19 +2251,19 @@ fn build_emissive_lights(triangles: &mut [Triangle]) -> Result<Vec<GiLight>, &'s
             edge2: edge2.extend(0.0),
             source: UVec4::new(0, index as u32, 0, 0),
         });
-        weights.push((index, power));
+        weights.push(power);
     }
     if lights.len() > CDF_STEPS as usize {
         return Err("emissive triangle count exceeds the 24-bit sampling grid");
     }
-    let total: f64 = weights.iter().map(|(_, power)| power).sum();
+    let total: f64 = weights.iter().sum();
     if !lights.is_empty() && (!total.is_finite() || total <= 0.0) {
         return Err("emissive triangle power total is not finite and positive");
     }
     let mut cumulative_power = 0.0;
     let mut previous_boundary = 0;
     let light_count = lights.len();
-    for (offset, (light, (index, weight))) in lights.iter_mut().zip(weights).enumerate() {
+    for (offset, (light, weight)) in lights.iter_mut().zip(weights).enumerate() {
         cumulative_power += weight;
         let boundary = if offset + 1 == light_count {
             CDF_STEPS
@@ -2186,8 +2276,7 @@ fn build_emissive_lights(triangles: &mut [Triangle]) -> Result<Vec<GiLight>, &'s
         debug_assert!(boundary > previous_boundary);
         light.direction.w = boundary as f32 / CDF_STEPS as f32;
         light.edge1.w = probability;
-        // The hit-side MIS PDF must match the emitter CDF after BVH sorting.
-        triangles[index].emission.w = probability;
+        // The secondary NEE sampler uses this CDF boundary and discrete PDF.
         previous_boundary = boundary;
     }
     debug_assert!(lights.is_empty() || previous_boundary == CDF_STEPS);
@@ -2379,7 +2468,23 @@ fn build_tree<T>(elements: &mut [T], bounds: impl Fn(&T) -> (Vec3, Vec3)) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::asset::RenderAssetUsages;
     use bevy::mesh::morph::MeshMorphWeights;
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+
+    fn rgba8_image(color: [u8; 4]) -> Image {
+        Image::new(
+            Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            color.to_vec(),
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        )
+    }
 
     fn wait_for_blas_builds(app: &mut App, expected: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2392,6 +2497,136 @@ mod tests {
         assert!(app.world().resource::<GiScene>().blas_builds >= expected);
     }
 
+    #[derive(Resource, Default)]
+    struct GlobalTransformChangeCount(usize);
+
+    fn count_changed_global_transforms(
+        changed: Query<Entity, Changed<GlobalTransform>>,
+        mut count: ResMut<GlobalTransformChangeCount>,
+    ) {
+        count.0 = changed.iter().count();
+    }
+
+    #[test]
+    fn equal_transform_rewrites_do_not_rebuild_scene_but_motion_updates_emitters() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(bevy::transform::TransformPlugin)
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<GiScene>()
+            .init_resource::<GlobalTransformChangeCount>()
+            .add_message::<AssetEvent<Mesh>>()
+            .add_message::<AssetEvent<Image>>()
+            .add_message::<AssetEvent<StandardMaterial>>()
+            .add_systems(
+                PostUpdate,
+                (count_changed_global_transforms, update_scene)
+                    .chain()
+                    .after(bevy::transform::TransformSystems::Propagate),
+            );
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::default());
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                base_color: Color::BLACK,
+                emissive: LinearRgba::WHITE,
+                ..default()
+            });
+        let entity = app
+            .world_mut()
+            .spawn((
+                Mesh3d(mesh),
+                MeshMaterial3d(material),
+                RadianceCascadesGeometry,
+                Transform::IDENTITY,
+                GlobalTransform::IDENTITY,
+            ))
+            .id();
+        wait_for_blas_builds(&mut app, 1);
+        app.update();
+        let (revision, geometry_revision, emitter_positions) = {
+            let scene = app.world().resource::<GiScene>();
+            (
+                scene.revision,
+                scene.geometry_revision,
+                scene
+                    .data
+                    .emissive_lights
+                    .iter()
+                    .map(|light| light.position.truncate())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(!emitter_positions.is_empty());
+
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(Transform::IDENTITY);
+        app.update();
+        assert!(
+            app.world().resource::<GlobalTransformChangeCount>().0 > 0,
+            "equal Transform rewrite should propagate a Changed GlobalTransform"
+        );
+        let scene = app.world().resource::<GiScene>();
+        assert_eq!(scene.revision, revision);
+        assert_eq!(scene.geometry_revision, geometry_revision);
+
+        let translation = Vec3::new(3.0, 2.0, -1.0);
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(Transform::from_translation(translation));
+        app.update();
+        assert!(app.world().resource::<GlobalTransformChangeCount>().0 > 0);
+        let scene = app.world().resource::<GiScene>();
+        assert!(scene.revision > revision);
+        assert!(scene.geometry_revision > geometry_revision);
+        let instance = scene
+            .data
+            .instances
+            .iter()
+            .find(|instance| instance.entity == entity)
+            .unwrap();
+        assert_eq!(
+            instance.world_from_local.translation.to_array(),
+            translation.to_array()
+        );
+        assert_eq!(scene.data.emissive_lights.len(), emitter_positions.len());
+        for (before, after) in emitter_positions
+            .iter()
+            .zip(scene.data.emissive_lights.iter())
+        {
+            assert_eq!(after.position.truncate() - *before, translation);
+        }
+    }
+
+    #[test]
+    fn next_event_cdf_includes_all_supported_emissive_triangles() {
+        let triangle = |x: f32, flags: u32| Triangle {
+            a: Vec3::new(x, 0.0, 0.0).extend(0.0),
+            b: Vec3::new(x + 1.0, 0.0, 0.0).extend(0.0),
+            c: Vec3::new(x, 1.0, 0.0).extend(0.0),
+            albedo: Vec3::ONE.extend(flags as f32),
+            emission: Vec3::ONE.extend(1.0),
+            ..default()
+        };
+        let mut triangles = [triangle(0.0, 0), triangle(2.0, 1 << 4)];
+
+        let lights = build_emissive_lights(&mut triangles).unwrap();
+
+        assert_eq!(lights.len(), 2);
+        assert_eq!(lights[0].source.y, 0);
+        assert_eq!(lights[1].source.y, 1);
+        assert!(triangles.iter().all(|triangle| triangle.emission.w == 0.0));
+        assert!((lights.iter().map(|light| light.edge1.w).sum::<f32>() - 1.0).abs() < 1e-6);
+        assert_eq!(lights[0].direction.w, 0.5);
+        assert_eq!(lights[1].direction.w, 1.0);
+    }
+
     #[test]
     fn mesh_support_rejects_non_finite_positions() {
         let mut mesh = Mesh::from(Cuboid::default());
@@ -2400,6 +2635,244 @@ mod tests {
             mesh_support(&mesh),
             Err("mesh vertex attributes must be finite")
         );
+    }
+
+    #[test]
+    fn local_triangles_preserve_indexed_and_nonindexed_geometry() {
+        let positions = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(1.0, 0.0, 1.0),
+            Vec3::new(0.0, 1.0, 1.0),
+        ];
+        let vertices: Vec<_> = positions
+            .iter()
+            .map(|&position| MeshVertex {
+                position,
+                normal: Vec3::ZERO,
+                tangent: Vec4::ZERO,
+                uv: Vec4::ZERO,
+                color: Vec4::ONE,
+                flags: 0,
+            })
+            .collect();
+        let indexed_u16 = Indices::U16(vec![2, 0, 1, 5, 3, 4, 1]);
+        let indexed_u32 = Indices::U32(vec![2, 0, 1, 5, 3, 4, 1]);
+        let indexed = local_triangles(&vertices, Some(&indexed_u16), false);
+        let indexed_32 = local_triangles(&vertices, Some(&indexed_u32), false);
+        let nonindexed = local_triangles(&vertices, None, false);
+
+        assert_eq!(
+            indexed
+                .iter()
+                .map(|triangle| triangle.indices.to_array())
+                .collect::<Vec<_>>(),
+            vec![[2, 0, 1], [5, 3, 4]]
+        );
+        assert_eq!(
+            indexed_32
+                .iter()
+                .map(|triangle| triangle.indices.to_array())
+                .collect::<Vec<_>>(),
+            vec![[2, 0, 1], [5, 3, 4]]
+        );
+        assert_eq!(
+            nonindexed
+                .iter()
+                .map(|triangle| triangle.indices.to_array())
+                .collect::<Vec<_>>(),
+            vec![[0, 1, 2], [3, 4, 5]]
+        );
+        for (triangle, expected) in indexed.iter().zip([[2, 0, 1], [5, 3, 4]]) {
+            assert_eq!(triangle.a.truncate(), positions[expected[0]]);
+            assert_eq!(triangle.b.truncate(), positions[expected[1]]);
+            assert_eq!(triangle.c.truncate(), positions[expected[2]]);
+        }
+        for (triangle, expected) in nonindexed.iter().zip([[0, 1, 2], [3, 4, 5]]) {
+            assert_eq!(triangle.a.truncate(), positions[expected[0]]);
+            assert_eq!(triangle.b.truncate(), positions[expected[1]]);
+            assert_eq!(triangle.c.truncate(), positions[expected[2]]);
+        }
+        assert_eq!(
+            indexed_32
+                .iter()
+                .map(|triangle| (triangle.indices, triangle.a, triangle.b, triangle.c))
+                .collect::<Vec<_>>(),
+            indexed
+                .iter()
+                .map(|triangle| (triangle.indices, triangle.a, triangle.b, triangle.c))
+                .collect::<Vec<_>>()
+        );
+        let degenerate = vec![vertices[0]; 3];
+        assert!(local_triangles(&degenerate, None, false).is_empty());
+        assert_eq!(local_triangles(&degenerate, None, true).len(), 1);
+    }
+
+    #[test]
+    fn unrelated_image_edits_do_not_rebuild_untextured_scene() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<GiScene>()
+            .add_message::<AssetEvent<Image>>()
+            .add_message::<AssetEvent<StandardMaterial>>()
+            .add_systems(Update, update_scene);
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::default());
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let unrelated_image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(rgba8_image([255, 0, 0, 255]));
+        let _entity = app
+            .world_mut()
+            .spawn((
+                Mesh3d(mesh),
+                MeshMaterial3d(material.clone()),
+                RadianceCascadesGeometry,
+                GlobalTransform::IDENTITY,
+            ))
+            .id();
+        wait_for_blas_builds(&mut app, 1);
+        app.update();
+        let (revision, geometry_revision) = {
+            let scene = app.world().resource::<GiScene>();
+            (scene.revision, scene.geometry_revision)
+        };
+
+        // Text layout can mutably borrow Assets<Image> without changing any
+        // image asset or emitting an AssetEvent. This must not invalidate GI.
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .set_changed();
+        app.update();
+        let scene = app.world().resource::<GiScene>();
+        assert_eq!(scene.revision, revision);
+        assert_eq!(scene.geometry_revision, geometry_revision);
+
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .get_mut(&unrelated_image)
+            .unwrap()
+            .data
+            .as_mut()
+            .unwrap()[0] = 17;
+        app.world_mut()
+            .resource_mut::<Messages<AssetEvent<Image>>>()
+            .write(AssetEvent::Modified {
+                id: unrelated_image.id(),
+            });
+        app.update();
+
+        let scene = app.world().resource::<GiScene>();
+        assert_eq!(scene.revision, revision);
+        assert_eq!(scene.geometry_revision, geometry_revision);
+    }
+
+    #[test]
+    fn referenced_image_edits_rebuild_scene_textures() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<GiScene>()
+            .add_message::<AssetEvent<Image>>()
+            .add_message::<AssetEvent<StandardMaterial>>()
+            .add_systems(Update, update_scene);
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::default());
+        let image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(rgba8_image([255, 0, 0, 255]));
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                base_color_texture: Some(image.clone()),
+                ..default()
+            });
+        let entity = app
+            .world_mut()
+            .spawn((
+                Mesh3d(mesh),
+                MeshMaterial3d(material.clone()),
+                RadianceCascadesGeometry,
+                GlobalTransform::IDENTITY,
+            ))
+            .id();
+        wait_for_blas_builds(&mut app, 1);
+        app.update();
+        let (revision, geometry_revision, textures) = {
+            let scene = app.world().resource::<GiScene>();
+            (
+                scene.revision,
+                scene.geometry_revision,
+                scene.data.textures.clone(),
+            )
+        };
+
+        // A global resource borrow with no per-asset event should be ignored
+        // even when the scene does reference a GI texture.
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .set_changed();
+        app.update();
+        let scene = app.world().resource::<GiScene>();
+        assert_eq!(scene.revision, revision);
+        assert_eq!(scene.geometry_revision, geometry_revision);
+        assert!(Arc::ptr_eq(&scene.data.textures, &textures));
+
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .get_mut_untracked(image.id())
+            .unwrap()
+            .data
+            .as_mut()
+            .unwrap()[0] = 0;
+        app.world_mut()
+            .resource_mut::<Messages<AssetEvent<Image>>>()
+            .write(AssetEvent::Modified { id: image.id() });
+        app.update();
+
+        let scene = app.world().resource::<GiScene>();
+        assert!(scene.revision > revision);
+        assert!(scene.geometry_revision > geometry_revision);
+        assert!(!Arc::ptr_eq(&scene.data.textures, &textures));
+
+        let revision = scene.revision;
+        let geometry_revision = scene.geometry_revision;
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut_untracked(material.id())
+            .unwrap()
+            .base_color = Color::BLACK;
+        app.world_mut()
+            .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+            .write(AssetEvent::Modified { id: material.id() });
+        app.update();
+        let scene = app.world().resource::<GiScene>();
+        assert!(scene.revision > revision);
+        assert!(scene.geometry_revision > geometry_revision);
+        let instance = scene
+            .data
+            .instances
+            .iter()
+            .find(|instance| instance.entity == entity)
+            .expect("edited material's instance stays in the scene");
+        assert_eq!(instance.albedo, Vec3::ZERO);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2892,6 +3365,12 @@ mod tests {
         assert_eq!(scene.blas_builds, 1);
         assert_eq!(scene.data.triangles.len(), 12);
         assert_eq!(scene.data.instances.len(), 20);
+        for (index, instance) in scene.data.instances.iter().enumerate() {
+            assert_eq!(
+                scene.data.instance_indices.get(&instance.entity),
+                Some(&(index as u32))
+            );
+        }
         let triangles = scene.data.triangles.clone();
         let blas = scene.data.blas_nodes.clone();
         let mesh_revision = scene.mesh_revision;
@@ -3076,10 +3555,7 @@ mod tests {
         assert_eq!(lights[0].direction.w, lights[0].edge1.w);
         assert_eq!(lights[1].direction.w, 1.0);
         assert!(lights.iter().all(|light| light.position.w == -1.0));
-        for (triangle, light) in triangles.iter().zip(&lights) {
-            assert_eq!(triangle.emission.w, light.edge1.w);
-        }
-        assert_eq!(triangles[2].emission.w, 0.0);
+        assert!(triangles.iter().all(|triangle| triangle.emission.w == 0.0));
     }
 
     #[test]
@@ -3136,28 +3612,48 @@ mod tests {
         ));
 
         wait_for_blas_builds(&mut app, 1);
+        let emissive_lights_for = |scene: &GiScene, entity: Entity| {
+            let instance = scene.data.instance_indices[&entity];
+            let mut lights: Vec<_> = scene
+                .data
+                .emissive_lights
+                .iter()
+                .filter(|light| light.source.x == instance)
+                .map(|light| {
+                    (
+                        light.source.y,
+                        light.color.w,
+                        light.edge1.w,
+                        light.direction.w,
+                    )
+                })
+                .collect();
+            lights.sort_by_key(|light| light.0);
+            lights
+        };
+        let assert_emissive_cdf = |lights: &[GiLight]| {
+            let mut previous = 0.0;
+            for light in lights {
+                assert!(light.direction.w > previous);
+                assert!((light.direction.w - previous - light.edge1.w).abs() < 1e-6);
+                previous = light.direction.w;
+            }
+            assert!((previous - 1.0).abs() < 1e-6);
+        };
         let scene = app.world().resource::<GiScene>();
         let revision = scene.revision;
-        let packed_probabilities = |scene: &GiScene, entity: Entity| {
-            let instance = scene
-                .data
-                .instances
-                .iter()
-                .position(|instance| instance.entity == entity)
-                .unwrap();
-            let base = 1 + scene.data.nodes.len() * 2 + scene.data.blas_words.len();
-            let probability_word =
-                scene.data.instance_words[instance * INSTANCE_WORDS + INSTANCE_WORDS - 1];
-            let offset = probability_word.w as usize - base;
-            scene.data.instance_words[offset]
-        };
         assert_eq!(scene.data.emissive_lights.len(), 4);
+        assert_emissive_cdf(&scene.data.emissive_lights);
         assert!(scene.data.emissive_lights.iter().all(|light| {
             (light.color.w - 0.5).abs() < 1e-6 && (light.edge1.w - 0.25).abs() < 1e-6
         }));
-        let initial_hit_pdf = packed_probabilities(scene, animated);
-        assert_eq!(f32::from_bits(initial_hit_pdf.x), 0.25);
-        assert_eq!(f32::from_bits(initial_hit_pdf.y), 0.25);
+        let initial_animated_lights = emissive_lights_for(scene, animated);
+        assert_eq!(initial_animated_lights.len(), 2);
+        assert!(
+            initial_animated_lights
+                .iter()
+                .all(|light| { (light.1 - 0.5).abs() < 1e-6 && (light.2 - 0.25).abs() < 1e-6 })
+        );
 
         let mut weights = app
             .world_mut()
@@ -3170,6 +3666,7 @@ mod tests {
         let lights = &scene.data.emissive_lights;
         assert!(scene.revision > revision);
         assert_eq!(lights.len(), 4);
+        assert_emissive_cdf(lights);
         let large = lights
             .iter()
             .find(|light| (light.color.w - 1.5).abs() < 1e-6)
@@ -3181,9 +3678,18 @@ mod tests {
                 .filter(|light| (light.color.w - 0.5).abs() < 1e-6)
                 .all(|light| (light.edge1.w - 1.0 / 6.0).abs() < 1e-6)
         );
-        let packed_hit_pdf = packed_probabilities(scene, animated);
-        assert_eq!(f32::from_bits(packed_hit_pdf.x), 0.5);
-        assert!((f32::from_bits(packed_hit_pdf.y) - 1.0 / 6.0).abs() < 1e-6);
+        let animated_lights = emissive_lights_for(scene, animated);
+        assert_eq!(animated_lights.len(), 2);
+        let large_animated = animated_lights
+            .iter()
+            .find(|light| (light.1 - 1.5).abs() < 1e-6)
+            .expect("morphed emitter belongs to animated instance");
+        assert!((large_animated.2 - 0.5).abs() < 1e-6);
+        let small_animated = animated_lights
+            .iter()
+            .find(|light| (light.1 - 0.5).abs() < 1e-6)
+            .expect("unchanged emitter belongs to animated instance");
+        assert!((small_animated.2 - 1.0 / 6.0).abs() < 1e-6);
         let pdf_sum = lights.iter().map(|light| light.edge1.w).sum::<f32>();
         assert!((pdf_sum - 1.0).abs() < 1e-6);
     }
@@ -3216,6 +3722,12 @@ mod tests {
         wait_for_blas_builds(&mut app, 1);
         let revision = app.world().resource::<GiScene>().revision;
         assert_eq!(app.world().resource::<GiScene>().data.triangles.len(), 12);
+        assert!(
+            app.world()
+                .resource::<GiScene>()
+                .pending_entities
+                .contains(&entity)
+        );
         app.update();
         assert_eq!(app.world().resource::<GiScene>().revision, revision);
         let triangles = app.world().resource::<GiScene>().data.triangles.clone();
@@ -3280,6 +3792,28 @@ mod tests {
         };
         let colors = emitter_colors(&app);
         assert_eq!(colors.len(), 24);
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&material)
+            .unwrap()
+            .emissive = LinearRgba::BLACK;
+        app.update();
+        assert_eq!(
+            app.world().resource::<GiScene>().data.emissive_lights.len(),
+            12,
+            "only positive emissive power participates in hit-surface NEE"
+        );
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&material)
+            .unwrap()
+            .emissive = LinearRgba::RED;
+        app.update();
+        assert_eq!(
+            app.world().resource::<GiScene>().data.emissive_lights.len(),
+            24,
+            "all emitting meshes participate without a sampling classification"
+        );
         // Crossing another emitter changes BVH partitions, but must not shuffle
         // the sampling CDF and turn previously stable samples into new lights.
         app.world_mut()
@@ -3294,11 +3828,23 @@ mod tests {
             .remove::<RadianceCascadesGeometry>();
         app.update();
         assert!(app.world().resource::<GiScene>().data.triangles.is_empty());
+        assert!(
+            app.world()
+                .resource::<GiScene>()
+                .pending_entities
+                .is_empty()
+        );
         app.world_mut()
             .entity_mut(entity)
             .insert(RadianceCascadesGeometry);
         wait_for_blas_builds(&mut app, 2);
         assert_eq!(app.world().resource::<GiScene>().data.triangles.len(), 12);
+        assert!(
+            app.world()
+                .resource::<GiScene>()
+                .pending_entities
+                .contains(&entity)
+        );
         app.world_mut().entity_mut(entity).remove::<Mesh3d>();
         app.update();
         assert!(app.world().resource::<GiScene>().data.triangles.is_empty());
@@ -3330,14 +3876,32 @@ mod tests {
             .insert(InheritedVisibility::HIDDEN);
         app.update();
         assert!(app.world().resource::<GiScene>().data.triangles.is_empty());
+        assert!(
+            app.world()
+                .resource::<GiScene>()
+                .pending_entities
+                .is_empty()
+        );
         app.world_mut()
             .entity_mut(entity)
             .remove::<InheritedVisibility>();
         wait_for_blas_builds(&mut app, 6);
         assert_eq!(app.world().resource::<GiScene>().data.triangles.len(), 12);
+        assert!(
+            app.world()
+                .resource::<GiScene>()
+                .pending_entities
+                .contains(&entity)
+        );
         app.world_mut().entity_mut(entity).despawn();
         app.update();
         assert!(app.world().resource::<GiScene>().data.triangles.is_empty());
+        assert!(
+            app.world()
+                .resource::<GiScene>()
+                .pending_entities
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3383,6 +3947,7 @@ mod tests {
         app.update();
         let scene = app.world().resource::<GiScene>();
         let revision = scene.revision;
+        let light_revision = scene.light_revision;
         let geometry_revision = scene.geometry_revision;
         let nodes = scene.data.nodes.clone();
         assert_eq!(scene.data.lights.len(), 3);
@@ -3402,8 +3967,13 @@ mod tests {
         assert_eq!(cone(-1.0), 0.0);
         app.update();
         assert_eq!(app.world().resource::<GiScene>().revision, revision);
+        assert_eq!(
+            app.world().resource::<GiScene>().light_revision,
+            light_revision
+        );
         for entity in [point, spot, directional] {
             let before = app.world().resource::<GiScene>().revision;
+            let before_lights = app.world().resource::<GiScene>().light_revision;
             app.world_mut()
                 .entity_mut(entity)
                 .insert(GlobalTransform::from(
@@ -3411,6 +3981,7 @@ mod tests {
                 ));
             app.update();
             assert!(app.world().resource::<GiScene>().revision > before);
+            assert!(app.world().resource::<GiScene>().light_revision > before_lights);
             assert_eq!(
                 app.world().resource::<GiScene>().geometry_revision,
                 geometry_revision
@@ -3422,14 +3993,47 @@ mod tests {
             app.world_mut()
                 .entity_mut(entity)
                 .insert(InheritedVisibility::HIDDEN);
+            let before_hidden = app.world().resource::<GiScene>().light_revision;
             app.update();
             assert_eq!(app.world().resource::<GiScene>().data.lights.len(), 2);
+            assert!(app.world().resource::<GiScene>().light_revision > before_hidden);
+            let before_visible = app.world().resource::<GiScene>().light_revision;
             app.world_mut()
                 .entity_mut(entity)
                 .insert(InheritedVisibility::VISIBLE);
             app.update();
             assert_eq!(app.world().resource::<GiScene>().data.lights.len(), 3);
+            assert!(app.world().resource::<GiScene>().light_revision > before_visible);
         }
+        let before_point_edit = app.world().resource::<GiScene>().light_revision;
+        {
+            let mut light = app.world_mut().get_mut::<PointLight>(point).unwrap();
+            light.intensity *= 2.0;
+            light.color = Color::linear_rgb(0.2, 0.5, 1.0);
+            light.range *= 0.5;
+        }
+        app.update();
+        assert!(app.world().resource::<GiScene>().light_revision > before_point_edit);
+        let before_spot_edit = app.world().resource::<GiScene>().light_revision;
+        {
+            let mut light = app.world_mut().get_mut::<SpotLight>(spot).unwrap();
+            light.intensity *= 2.0;
+            light.inner_angle = 0.15;
+            light.outer_angle = 0.4;
+        }
+        app.update();
+        assert!(app.world().resource::<GiScene>().light_revision > before_spot_edit);
+        let before_sun_edit = app.world().resource::<GiScene>().light_revision;
+        {
+            let mut light = app
+                .world_mut()
+                .get_mut::<DirectionalLight>(directional)
+                .unwrap();
+            light.illuminance *= 2.0;
+            light.color = Color::linear_rgb(1.0, 0.85, 0.65);
+        }
+        app.update();
+        assert!(app.world().resource::<GiScene>().light_revision > before_sun_edit);
         app.world_mut()
             .get_mut::<SpotLight>(spot)
             .unwrap()

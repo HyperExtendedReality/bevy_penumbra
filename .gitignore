@@ -2,3 +2,15 @@
 /tmp/
 /screenshots/
 /assets
+/.build/
+/.out/
+/captures
+/scripts/__pycache__
+/ref
+/scripts
+/docs
+/bevy_penumbra
+37904
+39148
+49408
+8044

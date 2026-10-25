@@ -62,13 +62,54 @@ void checkTraversal(uint3 id : SV_DispatchThreadID) {
         uint base = instanceBase(instance);
         float3 localOrigin = transformPoint(base, origin.xyz);
         float3 localDirection = transformPoint(base, direction.xyz, true);
-        uint4 geometry = sceneWord(base + 8);
+        uint4 instanceGeometry = sceneWord(base + 8);
+        uint4 geometryHeader = geometryWord(0);
         uint flags = sceneWord(base + 6).w;
-        for (uint triangle = geometry.y; triangle < geometry.y + geometry.z; ++triangle) {
+        for (uint triangle = instanceGeometry.y;
+             triangle < instanceGeometry.y + instanceGeometry.z; ++triangle) {
             brute = traceTriangle(localOrigin, localDirection, direction.xyz, 0.0, 0.0,
-                                  triangle, instance, flags, brute);
+                                  triangle, instance, base, flags, geometryHeader, brute);
         }
     }
     results[output + 1] = uint4(asuint(brute.distance), brute.triangle, brute.instance,
         uint(occluded != (hit.triangle != EMPTY)));
+}
+
+// Focused fixture for geometry-dependency bounds. Keep this on the production
+// tracked traversal entry points so a miss, closest hit, and NEE visibility
+// query all exercise their real dependency propagation.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void checkTrackedTraversal(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= params.size.x) return;
+    float4 origin = rays[id.x * 2], direction = rays[id.x * 2 + 1];
+    DependencyContext rayDependency;
+    float dependencyStart, dependencyDistance, dependencyPadding;
+    Hit hit = traceRayTracked(origin.xyz, direction.xyz, origin.w,
+                              rayDependency, dependencyStart, dependencyDistance,
+                              dependencyPadding, false, 0.0, 0.0, 0u);
+    bool querySupported;
+    DependencyContext shadowDependency;
+    bool blocked = traceOccludedTracked(origin.xyz, direction.xyz, origin.w,
+                                        querySupported, shadowDependency, 0u);
+    uint output = id.x * 11u;
+    results[output] = uint4(asuint(hit.distance), hit.triangle, hit.instance, hit.errors);
+    uint rayFlags = (rayDependency.known ? 1u : 0u)
+        | (rayDependency.hasBounds ? 2u : 0u);
+    uint shadowFlags = (shadowDependency.known ? 1u : 0u)
+        | (shadowDependency.hasBounds ? 2u : 0u);
+    results[output + 1u] = uint4(asuint(rayDependency.minimum), rayFlags);
+    results[output + 2u] = uint4(asuint(rayDependency.maximum), rayFlags);
+    results[output + 3u] = uint4(uint(blocked), uint(querySupported), shadowFlags, 0u);
+    results[output + 4u] = uint4(asuint(shadowDependency.minimum), shadowFlags);
+    results[output + 5u] = uint4(asuint(shadowDependency.maximum), shadowFlags);
+    Entry stored = (Entry)0;
+    storeEntryDependency(stored, rayDependency);
+    results[output + 6u] = asuint(stored.dependencyMin);
+    results[output + 7u] = asuint(stored.dependencyMax);
+    DependencyContext unknownUnion = rayDependency;
+    dependencyUnion(unknownUnion, dependencyUnknown());
+    storeEntryDependency(stored, unknownUnion);
+    results[output + 8u] = asuint(stored.dependencyMin);
+    results[output + 9u] = asuint(stored.dependencyMax);
 }

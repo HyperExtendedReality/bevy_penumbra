@@ -2,15 +2,16 @@
 static const float PI = 3.141592653589793;
 static const uint CASCADES = 4;
 static const uint BASE_THETA = 4;
-static const uint IRRADIANCE_SIDE = 6;
 static const uint EMPTY = 0xffffffff;
 static const uint TOMBSTONE = 0xfffffffe;
-static const uint SECONDARY = 1u << 14;
-static const uint SURFACE = 7u << 15;
-static const uint PROBE_LOD = 3u << 18;
+// Distance LODs are independent of the four angular/distance cascades.
+// Cap scaling at 2^24 (largest interval exponent 30), with five key bits.
+static const uint MAX_PROBE_LOD = 24u;
+static const uint PROBE_LOD = 31u << 18;
 
 struct Parameters {
     float4x4 worldFromClip;
+    float4x4 clipFromWorld;
     float4x4 previousClipFromWorld;
     float4x4 previousWorldFromClip;
     float4 cameraPosition;
@@ -18,22 +19,68 @@ struct Parameters {
     uint4 size;           // GI width, height, pixel count, hash bucket count
     float4 tuning;        // probe spacing, interval cutoff, normal bias, intensity
     float4 environment;  // RGB radiance, exposure
-    float4 history;      // temporal blend, bounce feedback, valid, retention frames
+    float4 history;      // temporal blend, reserved, valid, retention frames
+    float4 intervalHistory; // transmittance decay, Split flag, diffuse debug .25, early query cap
     uint4 frame;         // frame index, merge cascade, instance count, light count
-    uint4 lightCounts;   // conventional count, emissive count, receiver sample budget, reserved
-    float4 stability;    // screen history valid, scene changed, reserved.xy
-    uint4 layers;        // light-buffer mask tail, 32-bit word count, reserved.xy
+    uint4 lightCounts;   // conventional count, emissive count, hit-lighting sample budget, reserved
+    float4 stability;    // screen history valid, scene changed, motion vectors, exact Disney diffuse
+    uint4 layers;        // light-buffer mask tail, word count, occlusion flags, reserved
     uint4 environmentInfo; // alias-record offset, width, height, enabled
     float4 environmentRotation; // world-to-environment quaternion
-    float4 environmentScale; // HDR intensity, reserved.xyz
+    float4 environmentScale; // HDR intensity, reserved, reserved, reserved
     uint4 geometryPages; // geometry mode (0 buffer, 1 pages, 2 pages + deformed overlay), side
     uint4 scenePages; // paged scene texture enable, layer width, prefix words, animated ranges
     uint4 sceneOverlay; // instance base/words, immutable BLAS words, mutable BLAS words
+    float4 dirtyMin; // changed scene union bounds.xyz; w > 0 means bounds are valid
+    float4 dirtyMax; // w > 0 means the host proved bounded geometry-history reuse safe
+    float4 transport; // reserved transport values, lighting-only invalidation
+    uint4 sampling; // selected updates, traversal-query budget, retained cache cap, resolve scale
+    uint4 ownerSequence; // LOD target pixels, clear-pass flag, fair ray quota, cursor/disabled flag
+    uint4 cacheTime; // elapsed milliseconds; wraps after 49.7 days
+    uint4 worldReceivers; // reserved
+    uint4 worldReceiverState; // reserved
+    float4 lightDirtyMin; // finite punctual-light influence union; w > 0 marks local change
+    float4 lightDirtyMax;
 };
+
+[ForceInline]
+uint cacheHistoryQuota(Parameters p) {
+    uint quota = 4u;
+    if (p.sampling.z > 0u)
+        quota = min(quota, max(1u, p.sampling.z / max(p.size.w, 1u)));
+    return quota;
+}
+bool persistentWorldIntervals(Parameters p) {
+    return p.intervalHistory.y > 0.5;
+}
+bool worldGeometryHistoryUnchanged(Parameters p) {
+    bool acceptedBoundedGeometry = persistentWorldIntervals(p)
+        && p.dirtyMax.w > 0.5;
+    return p.stability.y <= 0.5 || acceptedBoundedGeometry;
+}
+bool worldRadianceUnchanged(Parameters p) {
+    return p.transport.w <= 0.5 && worldGeometryHistoryUnchanged(p);
+}
+bool intervalHistoryAlive(uint lastSample, Parameters p) {
+    // Camera discovery must not expire unchanged world lighting with screen history.
+    return (p.history.w > 0.0 && persistentWorldIntervals(p))
+        || p.frame.x - lastSample <= uint(max(p.history.w, 0.0));
+}
+[ForceInline]
+uint stochasticSampleFrame(Parameters p) {
+    return p.frame.x;
+}
+[ForceInline]
+uint giResolveScale(Parameters p) { return max(p.sampling.w, 1u); }
+[ForceInline]
+uint2 giResolveExtent(Parameters p) {
+    uint scale = giResolveScale(p);
+    return (p.viewport.zw + scale - 1u) / scale;
+}
 
 struct Triangle {
     float4 a, b, c;
-    float4 albedo, emission; // emission.w: discrete light probability for MIS
+    float4 albedo, emission; // emission.w: reserved
 };
 struct BvhNode {
     float3 minimum; uint first;
@@ -47,34 +94,210 @@ struct Entry {
     int4 key;
     float4 interval; // J.rgb, beta (paper Eq. 6)
     float4 merged;   // I.rgb, valid
-    float4 origin;   // actual ray origin.xyz, decayed interval sample count.w
+    float4 origin;   // canonical world-grid center.xyz, retained transmittance sample count.w
     uint next, valid, lastSample, samples;
-    uint2 identity; // stable entity bits, including its generation
-    uint2 padding; // x: retained-cache remap; y: finest-level mesh component
+    uint2 identity; // reserved; probe identity is the world-grid key
+    uint2 padding; // x: selected-descriptor / retained-cache remap; y: visible-init marker
+    // Primary interval segment sphere (center.xyz, radius.w); zero/malformed is unknown.
+    float4 normal;
+    // Local-light dependency spheres: center.xyz, radius.w > 0; w == -1 is
+    // proven lighting-independent zero; zero/malformed values are unknown.
+    float4 boundaryInterval; // Union of receiver hits contributing to retained raw J.
+    float4 boundaryMerged; // Union of supported I hits, including cascade children.
+    float4 dependencyMin; // RAW J/beta dependencies; w: 1 when measured (0 = unknown)
+    float4 dependencyMax; // xyz: union maximum, w: 1 when the measured union is nonempty
+    float4 mergedDependencyMin; // Full I includes child/visibility dependencies.
+    float4 mergedDependencyMax;
 };
 
-// 6x6 octahedral irradiance, as in Chandra; virtual border taps fold onto
-// this core grid without allocating duplicate texels. Each texel
-// stores independently normalized E/pi and validity.
-struct IrradianceProbe { float4 coefficients[36]; float4 origin; };
-int2 irradianceOctTexel(int2 pixel) {
-    int2 p = pixel - 1;
-    int last = int(IRRADIANCE_SIDE) - 1;
-    if (p.x < 0) { p.x = 0; p.y = last - p.y; }
-    else if (p.x > last) { p.x = last; p.y = last - p.y; }
-    if (p.y < 0) { p.y = 0; p.x = last - p.x; }
-    else if (p.y > last) { p.y = last; p.x = last - p.x; }
-    return p;
+// A dependency is the union of world-space segments that established a value.
+// Keep "measured empty" distinct from unknown: empty bounds are valid only
+// while the host's scene-root revision remains unchanged.
+struct DependencyContext {
+    float3 minimum;
+    float3 maximum;
+    bool known;
+    bool hasBounds;
+};
+
+[ForceInline]
+DependencyContext dependencyEmpty() {
+    DependencyContext context;
+    context.minimum = 0.0;
+    context.maximum = 0.0;
+    context.known = true;
+    context.hasBounds = false;
+    return context;
 }
+
 [ForceInline]
-float2 irradianceOctUv(int2 pixel) { return (float2(irradianceOctTexel(pixel)) + 0.5) / float(IRRADIANCE_SIDE); }
+DependencyContext dependencyUnknown() {
+    DependencyContext context = dependencyEmpty();
+    context.known = false;
+    return context;
+}
+
 [ForceInline]
-uint irradianceOctIndex(int2 pixel) {
-    int2 texel = irradianceOctTexel(pixel);
-    return uint(texel.x + texel.y * int(IRRADIANCE_SIDE));
+void dependencyIncludeBounds(inout DependencyContext context, float3 minimum, float3 maximum) {
+    if (!context.known) return;
+    if (!all(isfinite(minimum)) || !all(isfinite(maximum)) || any(minimum > maximum)) {
+        context = dependencyUnknown();
+        return;
+    }
+    if (!context.hasBounds) {
+        context.minimum = minimum;
+        context.maximum = maximum;
+        context.hasBounds = true;
+    } else {
+        context.minimum = min(context.minimum, minimum);
+        context.maximum = max(context.maximum, maximum);
+    }
+}
+
+[ForceInline]
+void dependencyIncludeSegment(inout DependencyContext context, float3 start, float3 end,
+                              float padding) {
+    if (!all(isfinite(start)) || !all(isfinite(end)) || !isfinite(padding)) {
+        context = dependencyUnknown();
+        return;
+    }
+    float coordinateScale = max(1.0, max(max(abs(start.x), abs(start.y)), abs(start.z)));
+    coordinateScale = max(coordinateScale,
+        max(max(abs(end.x), abs(end.y)), abs(end.z)));
+    // Keep endpoint arithmetic conservative at large world coordinates; this
+    // is float-roundoff slack, not a shading or geometric acceptance tolerance.
+    float3 radius = max(padding, 0.0) + max(coordinateScale * 1e-6, 1.1920929e-7);
+    dependencyIncludeBounds(context, min(start, end) - radius, max(start, end) + radius);
+}
+
+[ForceInline]
+void dependencyUnion(inout DependencyContext context, DependencyContext other) {
+    if (!context.known || !other.known) {
+        context = dependencyUnknown();
+        return;
+    }
+    if (other.hasBounds)
+        dependencyIncludeBounds(context, other.minimum, other.maximum);
+}
+
+[ForceInline]
+DependencyContext storedDependency(float4 minimum, float4 maximum) {
+    DependencyContext context;
+    context.minimum = minimum.xyz;
+    context.maximum = maximum.xyz;
+    context.known = minimum.w > 0.5;
+    context.hasBounds = maximum.w > 0.5;
+    if (context.known && context.hasBounds
+        && (!all(isfinite(context.minimum)) || !all(isfinite(context.maximum))
+            || any(context.minimum > context.maximum)))
+        context.known = false;
+    return context;
+}
+
+[ForceInline]
+DependencyContext entryDependency(Entry entry) {
+    return storedDependency(entry.dependencyMin, entry.dependencyMax);
+}
+
+[ForceInline]
+DependencyContext entryMergedDependency(Entry entry) {
+    return storedDependency(entry.mergedDependencyMin, entry.mergedDependencyMax);
+}
+
+[ForceInline]
+void storeEntryDependency(inout Entry entry, DependencyContext context) {
+    entry.dependencyMin = float4(context.minimum, context.known ? 1.0 : 0.0);
+    entry.dependencyMax = float4(context.maximum, context.hasBounds ? 1.0 : 0.0);
+}
+
+[ForceInline]
+void storeEntryMergedDependency(inout Entry entry, DependencyContext context) {
+    entry.mergedDependencyMin = float4(context.minimum, context.known ? 1.0 : 0.0);
+    entry.mergedDependencyMax = float4(context.maximum, context.hasBounds ? 1.0 : 0.0);
+}
+
+// Probe-major Split radiance stores the 32 directional bins plus the aggregate
+// dependency used to invalidate packed history conservatively.
+struct DirectionalProbe {
+    float4 radiance[32];
+    float4 dependencyMin; // aggregate dependency for all packed directional records
+    float4 dependencyMax;
+};
+
+[ForceInline]
+DependencyContext probeDependency(float4 minimumRecord, float4 maximumRecord) {
+    DependencyContext context;
+    context.minimum = minimumRecord.xyz;
+    context.maximum = maximumRecord.xyz;
+    context.known = minimumRecord.w > 0.5;
+    context.hasBounds = maximumRecord.w > 0.5;
+    if (context.known && context.hasBounds
+        && (!all(isfinite(context.minimum)) || !all(isfinite(context.maximum))
+            || any(context.minimum > context.maximum)))
+        context.known = false;
+    return context;
+}
+
+[ForceInline]
+void storeProbeDependency(inout DirectionalProbe probe, DependencyContext context) {
+    probe.dependencyMin = float4(context.minimum, context.known ? 1.0 : 0.0);
+    probe.dependencyMax = float4(context.maximum, context.hasBounds ? 1.0 : 0.0);
 }
 [ForceInline]
 float luminance(float3 color) { return dot(color, float3(0.2126, 0.7152, 0.0722)); }
+// Independent scalar streams for estimators that need four decorrelated
+// uniforms. Offsetting a 2D low-discrepancy pair only translates the same
+// dimensions and is not independent for alias selection plus texel UVs.
+[ForceInline]
+uint transportHash(uint value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+[ForceInline]
+float transportRandom(uint seed, uint lane) {
+    uint bits = transportHash(seed + 0x9e3779b9u * (lane + 1u));
+    return (float(bits >> 8) + 0.5) * (1.0 / 16777216.0);
+}
+// Disney/Burley scattering factor; the diffuse BSDF is albedo * factor / PI.
+// NdotL, NdotV, and LdotH are evaluated for each sampled incident direction.
+[ForceInline]
+float disneyDiffuseMultiplier(float3 normal, float3 light, float3 view, float perceptualRoughness) {
+    float nDotL = saturate(dot(normal, light));
+    float nDotV = saturate(dot(normal, view));
+    float3 halfSum = light + view;
+    float halfLengthSquared = dot(halfSum, halfSum);
+    if (nDotL <= 0 || nDotV <= 0 || halfLengthSquared <= 1e-20) return 0;
+    float3 halfVector = halfSum * rsqrt(halfLengthSquared);
+    // Bevy PBR passes perceptual roughness through perceptualRoughnessToRoughness.
+    float roughness = max(saturate(perceptualRoughness), 0.089);
+    roughness *= roughness;
+    float lDotH = saturate(dot(light, halfVector));
+    float f90 = 0.5 + 2.0 * roughness * lDotH * lDotH;
+    float lightScatter = 1.0 + (f90 - 1.0) * pow(1.0 - nDotL, 5.0);
+    float viewScatter = 1.0 + (f90 - 1.0) * pow(1.0 - nDotV, 5.0);
+    return lightScatter * viewScatter;
+}
+
+float3 clampOutgoingRadiance(float3 value, Parameters p) {
+    if (!all(isfinite(value))) return 0;
+    // Transport caches store scene-linear energy. Firefly handling belongs in
+    // reconstruction, where raw transport remains available for validation.
+    return max(value, 0.0);
+}
+
+[ForceInline]
+float rawGiSupportAlpha(bool eligible, bool supported, float confidence) {
+    return !eligible ? 0.0 : (supported ? 1.0 + 0.25 * confidence : -1.0);
+}
+
+bool dirtyContains(float3 position, Parameters p) {
+    return p.dirtyMin.w > 0.0 && all(position >= p.dirtyMin.xyz) && all(position <= p.dirtyMax.xyz);
+}
 float3 deferredBaseColor(uint4 packed) {
     float3 encoded = float3(packed.x & 255u, (packed.x >> 8) & 255u, (packed.x >> 16) & 255u) / 255.0;
     return pow(encoded, float3(2.2));
@@ -87,7 +310,6 @@ float3 deferredDiffuseAlbedo(uint4 packed) {
 float3 deferredShadingNormal(uint4 packed) {
     return decodeNormal(float2(packed.w & 4095u,(packed.w >> 12) & 4095u)/4095.0);
 }
-float deferredPerceptualRoughness(uint4 packed) { return float(packed.x >> 24)/255.0; }
 // Move along the oriented geometric normal by both the application's world
 // bias and a coordinate-relative representable offset (Ray Tracing Gems Ch. 6).
 float3 rayOffset(float3 position, float3 normal, float bias) {
@@ -159,21 +381,14 @@ float3 cosineDirection(float3 normal, float2 uv) {
            + normal * sqrt(1 - uv.x);
 }
 [ForceInline]
-float spacing(Parameters p, uint level, bool secondary = false, uint lod = 0) {
-    return p.tuning.x * float(1u << (level + lod)) * (secondary ? 4.0 : 1.0);
-}
-// Opposing faces in a thin wall must not share hemisphere samples or feedback.
-// Six normal sectors split opposing faces; component IDs separately split disconnected islands.
-[ForceInline]
-uint surfaceKey(float3 normal) {
-    float3 n = abs(normal);
-    uint axis = n.x >= n.y && n.x >= n.z ? 0 : (n.y >= n.z ? 1 : 2);
-    return (axis * 2 + (normal[axis] < 0 ? 1u : 0u)) << 15;
+float spacing(Parameters p, uint level, uint lod = 0) {
+    return p.tuning.x * exp2(float(min(level, CASCADES - 1u) + min(lod, MAX_PROBE_LOD)));
 }
 [ForceInline]
-int4 cacheKey(float3 position, uint direction, uint level, Parameters p, bool secondary = false, uint surface = 0, uint lod = 0) {
-    return int4(int3(floor(position / spacing(p, level, secondary, lod))),
-                int(direction | (level << 12) | (secondary ? SECONDARY : 0) | surface | (lod << 18)));
+int4 cacheKey(float3 position, uint direction, uint level, Parameters p, uint lod = 0) {
+    lod = min(lod, MAX_PROBE_LOD);
+    return int4(int3(floor(position / spacing(p, level, lod))),
+                int(direction | (level << 12) | (lod << 18)));
 }
 [ForceInline]
 uint hashKey(int4 key, uint bucketCount) {
@@ -204,20 +419,37 @@ float3 previousWorldPosition(float2 pixel, float depth, Parameters p) {
     float4 h = mul(p.previousWorldFromClip, float4(uv.x * 2 - 1, 1 - uv.y * 2, depth, 1));
     return h.xyz / h.w;
 }
-// Invert the actual integer prepass sample centers, including noninteger
-// resolution ratios. Nominal low-res centers shift history by half a full pixel.
+// Invert the integer prepass sample centers, including noninteger resolution ratios.
+float2 sparseGridJitter(Parameters p) {
+    // Keep partial schedules anchored so a revisit addresses the same raster sample.
+    bool partialReceiverBudget = (p.ownerSequence.w & 0x40000000u) != 0u
+        || (p.sampling.x > 0u && p.sampling.x < p.size.z);
+    if (partialReceiverBudget || p.history.x <= 0.0 || p.history.w <= 0.0) return 0.0;
+    float2 scale = float2(p.viewport.zw) / float2(p.size.xy);
+    return (r2(p.frame.x * 977u + 487u) - 0.5) * scale;
+}
 float2 irradianceGrid(float2 pixel, Parameters p) {
     float2 scale = float2(p.viewport.zw) / float2(p.size.xy);
     float2 local = pixel - float2(p.viewport.xy);
-    int2 base = int2(floor(local / scale - 0.5));
-    float2 center = floor((float2(base) + 0.5) * scale) + 0.5;
+    float2 jitter = sparseGridJitter(p);
+    int2 base = int2(floor((local - jitter) / scale - 0.5));
+    float2 center = floor((float2(base) + 0.5) * scale + jitter) + 0.5;
     base -= int2(local.x < center.x ? 1 : 0, local.y < center.y ? 1 : 0);
-    float2 left = floor((float2(base) + 0.5) * scale) + 0.5;
-    float2 right = floor((float2(base) + 1.5) * scale) + 0.5;
+    float2 left = floor((float2(base) + 0.5) * scale + jitter) + 0.5;
+    float2 right = floor((float2(base) + 1.5) * scale + jitter) + 0.5;
     return float2(base) + saturate((local - left) / (right - left));
 }
 float surfaceTolerance(Parameters p) { return max(p.tuning.z * 2, p.tuning.x * 0.02); }
+// A chord on a smooth surface lies near the average tangent plane of its endpoints.
+float surfacePlaneDistance(float3 delta, float3 targetNormal, float3 sampleNormal) {
+    float3 averageNormal = targetNormal + sampleNormal;
+    float normalLengthSquared = dot(averageNormal, averageNormal);
+    if (!(normalLengthSquared > 1e-20) || !isfinite(normalLengthSquared))
+        return abs(dot(delta, targetNormal));
+    return abs(dot(delta, averageNormal * rsqrt(normalLengthSquared)));
+}
 uint2 fullPixel(uint2 pixel, Parameters p) {
-    return p.viewport.xy + min(uint2((float2(pixel) + 0.5) * float2(p.viewport.zw) / float2(p.size.xy)),
+    float2 jitter = sparseGridJitter(p);
+    return p.viewport.xy + min(uint2((float2(pixel) + 0.5) * float2(p.viewport.zw) / float2(p.size.xy) + jitter),
                                p.viewport.zw - 1);
 }

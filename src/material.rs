@@ -579,9 +579,11 @@ mod tests {
 
     #[test]
     fn diffuse_material_support_accepts_approximated_lobes() {
-        let mut material = StandardMaterial::default();
-        material.clearcoat = 0.5;
-        material.anisotropy_strength = 0.5;
+        let mut material = StandardMaterial {
+            clearcoat: 0.5,
+            anisotropy_strength: 0.5,
+            ..default()
+        };
         assert!(material_support(&material).is_ok());
         material.specular_tint = Color::linear_rgb(0.2, 0.6, 0.9);
         assert!(material_support(&material).is_ok());
