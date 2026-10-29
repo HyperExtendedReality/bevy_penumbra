@@ -462,7 +462,7 @@ fn wanted_pipelines(settings: RadianceCascades) -> u64 {
 
 const MODULES: [(&str, &[&str]); 4] = [
     ("cascades.slang", &COMPUTE_ENTRIES),
-    ("composite.slang", &["vertex", "fragment"]),
+    ("composite.slang", &["vertex", "fragment", "compositeAnchors"]),
     ("acceleration.slang", &["refitTlas"]),
     ("deformation.slang", &["deformVertices", "refitBlas"]),
 ];
@@ -812,6 +812,7 @@ struct Pipelines {
     driver_cache_save: Option<std::thread::JoinHandle<Result<(), String>>>,
     driver_cache_dirty: bool,
     composite: CachedRenderPipelineId,
+    composite_anchors: CachedComputePipelineId,
     refit: CachedComputePipelineId,
     deform: [CachedComputePipelineId; 2],
 }
@@ -1354,6 +1355,7 @@ fn finalize_view_lighting(
     if (0..COMPUTE_ENTRIES.len())
         .any(|i| required & (1 << i) != 0 && pipelines.pipeline(i).is_none())
         || cache.get_render_pipeline(pipelines.composite).is_none()
+        || cache.get_compute_pipeline(pipelines.composite_anchors).is_none()
     {
         report("waiting for composite pipeline");
         return;
@@ -1625,6 +1627,8 @@ fn init_pipelines(
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
             ),
         ),
     );
@@ -1662,6 +1666,13 @@ fn init_pipelines(
         }),
         ..default()
     });
+    let composite_anchors = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("split_rc_composite_anchors".into()),
+        layout: vec![composite_anchor_layout()],
+        shader: handles[COMPUTE_ENTRIES.len()].clone(),
+        entry_point: Some("compositeAnchors".into()),
+        ..default()
+    });
     let refit = cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("rc_tlas_refit".into()),
         layout: vec![refit_layout()],
@@ -1686,6 +1697,7 @@ fn init_pipelines(
         driver_cache_save: None,
         driver_cache_dirty: false,
         composite,
+        composite_anchors,
         refit,
         deform: ["deformVertices", "refitBlas"].map(|entry| {
             cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -3405,6 +3417,32 @@ pub(crate) fn upload_material_atlas(
     (texture, view)
 }
 
+/// Display irradiance, G-buffer, display receiver metadata and raster identity
+/// in; anchor position and geometric normal out. Bindings match composite.slang.
+fn composite_anchor_layout() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
+        "split_rc_composite_anchors",
+        &BindGroupLayoutEntries::with_indices(
+            ShaderStages::COMPUTE,
+            (
+                (0, uniform_buffer::<Parameters>(false)),
+                (2, texture_2d(TextureSampleType::Float { filterable: false })),
+                (5, texture_2d(TextureSampleType::Uint)),
+                (6, texture_2d(TextureSampleType::Float { filterable: false })),
+                (7, texture_2d(TextureSampleType::Uint)),
+                (
+                    14,
+                    texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
+                ),
+                (
+                    15,
+                    texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
+                ),
+            ),
+        ),
+    )
+}
+
 pub(crate) fn refit_layout() -> BindGroupLayoutDescriptor {
     BindGroupLayoutDescriptor::new(
         "rc_tlas_refit",
@@ -4730,6 +4768,9 @@ struct ViewBuffers {
     metadata_views: [TextureView; 5],
     _denoise_receiver_history_output: Texture,
     denoise_receiver_history_output_view: TextureView,
+    /// Composite anchor position/compatibility and geometric normal.
+    _composite_anchor_textures: [Texture; 2],
+    composite_anchor_views: [TextureView; 2],
     uniforms: [UniformBuffer<Parameters>; LEVELS],
     clear_uniforms: [UniformBuffer<Parameters>; 2],
     /// Reuse bind groups while their exact resources/layout slices remain stable.
@@ -4833,6 +4874,7 @@ struct ViewBindings {
     denoise: [BindGroup; LEVELS],
     temporal: BindGroup,
     world_resolve: BindGroup,
+    composite_anchors: BindGroup,
     composite: BindGroup,
     frame: RenderedFrame,
     scene_history: SceneHistorySnapshot,
@@ -4940,6 +4982,9 @@ fn view_binding_key(
         hash_view(view, &mut hasher);
     }
     hash_view(&buffers.denoise_receiver_history_output_view, &mut hasher);
+    for view in &buffers.composite_anchor_views {
+        hash_view(view, &mut hasher);
+    }
     hasher.finish()
 }
 
@@ -5037,9 +5082,9 @@ fn view_bytes(size: UVec2, shading_size: UVec2, settings: RadianceCascades) -> u
     let pixels = u64::from(size.x) * u64::from(size.y);
     let shading_pixels = u64::from(shading_size.x) * u64::from(shading_size.y);
     let buckets = cache_bucket_count(pixels, settings);
-    // Four diffuse, five temporal metadata, one post-denoise receiver, and
-    // three independent background current/history images.
-    let image_bytes = shading_pixels * 13 * 16;
+    // Four diffuse, five temporal metadata, one post-denoise receiver, three
+    // independent background current/history images and two composite anchors.
+    let image_bytes = shading_pixels * 15 * 16;
     image_bytes
         + 12
         + (LEVELS as u64 + 2) * std::mem::size_of::<Parameters>() as u64
@@ -5455,6 +5500,11 @@ impl ViewBuffers {
         });
         let denoise_receiver_history_output_view =
             denoise_receiver_history_output.create_view(&TextureViewDescriptor::default());
+        let composite_anchor_textures: [Texture; 2] =
+            std::array::from_fn(|_| make_texture(shading_size));
+        let composite_anchor_views = std::array::from_fn(|i| {
+            composite_anchor_textures[i].create_view(&TextureViewDescriptor::default())
+        });
         Self {
             size,
             shading_size,
@@ -5480,6 +5530,8 @@ impl ViewBuffers {
             metadata_views,
             _denoise_receiver_history_output: denoise_receiver_history_output,
             denoise_receiver_history_output_view,
+            _composite_anchor_textures: composite_anchor_textures,
+            composite_anchor_views,
             uniforms: std::array::from_fn(|_| UniformBuffer::default()),
             clear_uniforms: std::array::from_fn(|_| UniformBuffer::default()),
             binding_cache: std::array::from_fn(|_| None),
@@ -5857,6 +5909,10 @@ fn prepare(
             (
                 "composite",
                 cache.get_render_pipeline_state(pipelines.composite),
+            ),
+            (
+                "compositeAnchors",
+                cache.get_compute_pipeline_state(pipelines.composite_anchors),
             ),
             (
                 "refitTlas",
@@ -7990,7 +8046,8 @@ fn prepare(
             let required = required_pipelines(settings);
             let pipelines_ready = (0..COMPUTE_ENTRIES.len())
                 .all(|i| required & (1 << i) == 0 || pipelines.pipeline(i).is_some())
-                && cache.get_render_pipeline(pipelines.composite).is_some();
+                && cache.get_render_pipeline(pipelines.composite).is_some()
+                && cache.get_compute_pipeline(pipelines.composite_anchors).is_some();
             let (target_size, viewport) = camera_descriptor(Some(camera));
             commands.entity(entity).insert(GiPreparedView {
                 settings: requested_settings,
@@ -8240,6 +8297,19 @@ fn prepare(
             current_receiver_history,
             &buffers.denoise_receiver_history_output_view,
         );
+        let composite_anchors = device.create_bind_group(
+            "split_rc_composite_anchors",
+            &cache.get_bind_group_layout(&composite_anchor_layout()),
+            &BindGroupEntries::with_indices((
+                (0, &uniforms[0]),
+                (2, display),
+                (5, gbuffer),
+                (6, display_receiver_history),
+                (7, &receiver.view),
+                (14, &buffers.composite_anchor_views[0]),
+                (15, &buffers.composite_anchor_views[1]),
+            )),
+        );
         let composite_entries = BindGroupEntries::sequential((
             &uniforms[0],
             display,
@@ -8253,6 +8323,8 @@ fn prepare(
             current.heads.as_entire_binding(),
             buffers.entries.as_entire_binding(),
             buffers.irradiance_probes.as_entire_binding(),
+            &buffers.composite_anchor_views[0],
+            &buffers.composite_anchor_views[1],
         ))
         .iter()
         .filter(|entry| !matches!(entry.binding, 1 | 4))
@@ -8266,7 +8338,8 @@ fn prepare(
         let required = required_pipelines(settings);
         let pipelines_ready = (0..COMPUTE_ENTRIES.len())
             .all(|i| required & (1 << i) == 0 || pipelines.pipeline(i).is_some())
-            && cache.get_render_pipeline(pipelines.composite).is_some();
+            && cache.get_render_pipeline(pipelines.composite).is_some()
+            && cache.get_compute_pipeline(pipelines.composite_anchors).is_some();
         let (target_size, viewport) = camera_descriptor(Some(camera));
         commands.entity(entity).insert(GiPreparedView {
             settings: requested_settings,
@@ -8289,6 +8362,7 @@ fn prepare(
             denoise,
             temporal,
             world_resolve,
+            composite_anchors,
             composite,
             frame: RenderedFrame {
                 clip_from_world,
@@ -8458,7 +8532,10 @@ fn render(
         return;
     }
     *pending_pipelines = 0;
-    let Some(composite) = cache.get_render_pipeline(pipelines.composite) else {
+    let (Some(composite), Some(composite_anchors)) = (
+        cache.get_render_pipeline(pipelines.composite),
+        cache.get_compute_pipeline(pipelines.composite_anchors),
+    ) else {
         buffers.screen_history_valid.store(false, Ordering::Relaxed);
         if raw_output.is_some() {
             shaders.status.record_raw_frame(None);
@@ -9022,6 +9099,19 @@ fn render(
     }
 
     // Add diffuse light to the current HDR attachment without swapping the view target.
+    let span = diagnostics.time_span(context.command_encoder(), "compositeAnchors");
+    let mut pass = context
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("split_rc_composite_anchors"),
+            ..default()
+        });
+    pass.set_pipeline(composite_anchors);
+    pass.set_bind_group(0, &bindings.composite_anchors, &[]);
+    pass.dispatch_workgroups(shading_x, shading_y, 1);
+    drop(pass);
+    span.end(context.command_encoder());
+
     let composition_span = diagnostics.time_span(context.command_encoder(), "composition");
     let mut pass = context
         .command_encoder()
@@ -12583,6 +12673,7 @@ mod tests {
             .chain(&view._metadata)
             .chain(&view._background_textures)
             .chain(std::iter::once(&view._denoise_receiver_history_output))
+            .chain(&view._composite_anchor_textures)
             .map(|texture| u64::from(texture.width()) * u64::from(texture.height()) * 16)
             .sum();
         let buffer_bytes: u64 = view

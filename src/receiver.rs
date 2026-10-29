@@ -602,7 +602,8 @@ mod tests {
 
     #[test]
     fn packed_geometric_normal_shader_is_valid_wgsl() {
-        let source = include_str!("../shaders/receiver.wesl");
+        // A Windows checkout may convert the shader to CRLF.
+        let source = include_str!("../shaders/receiver.wesl").replace("\r\n", "\n");
         let start = source
             .find("fn pack_geometric_normal(")
             .expect("normal packer");

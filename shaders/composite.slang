@@ -11,6 +11,10 @@
 [[vk::binding(9, 0)]] StructuredBuffer<uint> probeHeads;
 [[vk::binding(10, 0)]] StructuredBuffer<Entry> probeEntries;
 [[vk::binding(11, 0)]] StructuredBuffer<DirectionalProbe> directionalProbes;
+[[vk::binding(12, 0)]] Texture2D<float4> anchorPosition;
+[[vk::binding(13, 0)]] Texture2D<float4> anchorNormal;
+[[vk::binding(14, 0)]] [format("rgba32f")] WTexture2D<float4> anchorPositionOutput;
+[[vk::binding(15, 0)]] [format("rgba32f")] WTexture2D<float4> anchorNormalOutput;
 
 void splitLodBlend(float3 position, out uint lowLod, out uint highLod, out float blend) {
     splitLodBlendForParameters(position, params, lowLod, highLod, blend);
@@ -51,40 +55,64 @@ VertexOutput vertex(uint index : SV_VertexID) {
     return output;
 }
 
+// The anchor-side half of compositeCompatibleCandidate. About scale² full-
+// resolution pixels test each display anchor, so its own checks, world
+// position and geometric normal are resolved once here. Position w is one
+// for a compatible anchor.
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void compositeAnchors(uint3 thread : SV_DispatchThreadID) {
+    if (any(thread.xy >= giResolveExtent(params))) return;
+    int2 samplePixel = int2(thread.xy);
+    float4 anchor = 0.0;
+    float3 rasterNormal = 0.0;
+    float4 candidate = irradiance.Load(int3(samplePixel, 0));
+    float4 receiver = receiverHistory.Load(int3(samplePixel, 0));
+    // Alpha remains receiver depth, not a lighting-validity bit. Receiver
+    // metadata carries support after temporal resolve and any denoise pass.
+    if (candidate.w > 0.0 && isfinite(candidate.w) && all(isfinite(candidate.xyz))
+        && receiverHistoryLength(receiver) != 0u
+        && receiverScreenHistorySupportMask(receiver) != 0u) {
+        uint scale = giResolveScale(params);
+        uint2 sampleLocal = min(uint2(samplePixel) * scale + scale / 2u,
+                                params.viewport.zw - 1u);
+        uint2 full = params.viewport.xy + sampleLocal;
+        uint4 sampleRaster = rasterReceiver.Load(int3(full, 0));
+        uint4 sampleDeferred = gbuffer.Load(int3(full, 0));
+        // A target that matches the metadata identity then matches the raster.
+        if ((sampleRaster.z & 0x80000000u) != 0u
+            && all(sampleRaster.xy == asuint(receiver.xy))
+            && (sampleDeferred.w & (1u << 24u)) == 0u) {
+            float3 sampleNormal = receiverNormal(receiver);
+            rasterNormal = receiverGeometricNormal(sampleRaster.z,
+                deferredShadingNormal(sampleDeferred));
+            float3 samplePosition = worldPosition(float2(full) + 0.5, candidate.w, params);
+            if (dot(sampleNormal, rasterNormal) > 0.97 && all(isfinite(samplePosition)))
+                anchor = float4(samplePosition, 1.0);
+        }
+    }
+    anchorPositionOutput.Store(samplePixel, anchor);
+    anchorNormalOutput.Store(samplePixel, float4(rasterNormal, 0.0));
+}
+
 bool compositeCompatibleCandidate(int2 samplePixel, uint2 targetIdentity,
                                   float3 targetPosition, float3 targetNormal,
                                   float tolerance, out float3 value) {
     value = 0.0;
     uint2 extent = giResolveExtent(params);
     if (any(samplePixel < 0) || any(samplePixel >= int2(extent))) return false;
-    uint scale = giResolveScale(params);
-    float4 candidate = irradiance.Load(int3(samplePixel, 0));
-    // Alpha remains receiver depth, not a lighting-validity bit. Receiver
-    // metadata carries support after temporal resolve and any denoise pass.
-    if (!(candidate.w > 0.0) || !isfinite(candidate.w)
-        || !all(isfinite(candidate.xyz))) return false;
+    // compositeAnchors resolved the anchor-side checks, position and normal.
+    float4 anchor = anchorPosition.Load(int3(samplePixel, 0));
+    if (anchor.w == 0.0) return false;
     float4 receiver = receiverHistory.Load(int3(samplePixel, 0));
-    if (receiverHistoryLength(receiver) == 0u
-        || receiverScreenHistorySupportMask(receiver) == 0u
-        || any(asuint(receiver.xy) != targetIdentity)) return false;
-    uint2 sampleLocal = min(uint2(samplePixel) * scale + scale / 2u,
-                            params.viewport.zw - 1u);
-    uint2 full = params.viewport.xy + sampleLocal;
-    uint4 sampleRaster = rasterReceiver.Load(int3(full, 0));
-    if ((sampleRaster.z & 0x80000000u) == 0u
-        || any(sampleRaster.xy != targetIdentity)) return false;
-    uint4 sampleDeferred = gbuffer.Load(int3(full, 0));
-    if ((sampleDeferred.w & (1u << 24u)) != 0u) return false;
+    if (any(asuint(receiver.xy) != targetIdentity)) return false;
     float3 sampleNormal = receiverNormal(receiver);
-    float3 rasterNormal = receiverGeometricNormal(sampleRaster.z, deferredShadingNormal(sampleDeferred));
+    float3 rasterNormal = anchorNormal.Load(int3(samplePixel, 0)).xyz;
     if (dot(targetNormal, sampleNormal) <= 0.97
         || dot(targetNormal, rasterNormal) <= 0.97
-        || dot(sampleNormal, rasterNormal) <= 0.97) return false;
-    float3 samplePosition = worldPosition(float2(full) + 0.5, candidate.w, params);
-    if (!all(isfinite(samplePosition))
-        || surfacePlaneDistance(samplePosition - targetPosition, targetNormal, rasterNormal) > tolerance)
+        || surfacePlaneDistance(anchor.xyz - targetPosition, targetNormal, rasterNormal) > tolerance)
         return false;
-    value = candidate.xyz;
+    value = irradiance.Load(int3(samplePixel, 0)).xyz;
     return true;
 }
 

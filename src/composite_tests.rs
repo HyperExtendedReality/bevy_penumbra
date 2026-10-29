@@ -4,7 +4,7 @@ use bevy::render::render_resource::binding_types::{texture_2d, uniform_buffer};
 
 const CHECK_COMPOSITE: &str = r#"
 #include "composite.slang"
-[[vk::binding(12, 0)]] RWStructuredBuffer<float4> results;
+[[vk::binding(16, 0)]] RWStructuredBuffer<float4> results;
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void checkComposite(uint3 thread : SV_DispatchThreadID) {
@@ -70,6 +70,7 @@ impl CompositeFixture {
         &self,
         device: &bevy::render::renderer::RenderDevice,
         queue: &bevy::render::renderer::RenderQueue,
+        anchor_pipeline: &ComputePipeline,
         pipeline: &ComputePipeline,
         depth_pipeline: &RenderPipeline,
     ) -> Vec<[f32; 4]> {
@@ -155,6 +156,16 @@ impl CompositeFixture {
         let raster_view = view(&raster);
         let gbuffer_view = view(&gbuffer);
         let depth_view = view(&depth);
+        let anchors = [0, 1].map(|_| {
+            temporal_test_texture_sized(
+                device,
+                "composite_test_anchor",
+                TextureFormat::Rgba32Float,
+                TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING,
+                self.resolve_size,
+            )
+        });
+        let anchor_views = anchors.each_ref().map(view);
         let depth_group = device.create_bind_group(
             "composite_test_depth",
             &depth_pipeline.get_bind_group_layout(0).into(),
@@ -219,6 +230,26 @@ impl CompositeFixture {
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        let texture_entry = |binding, view| BindGroupEntry {
+            binding,
+            resource: BindingResource::TextureView(view),
+        };
+        let anchor_group = device.create_bind_group(
+            "composite_test_anchors",
+            &anchor_pipeline.get_bind_group_layout(0).into(),
+            &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: parameters.binding().unwrap(),
+                },
+                texture_entry(2, &irradiance_view),
+                texture_entry(5, &gbuffer_view),
+                texture_entry(6, &receiver_view),
+                texture_entry(7, &raster_view),
+                texture_entry(14, &anchor_views[0]),
+                texture_entry(15, &anchor_views[1]),
+            ],
+        );
         let group = device.create_bind_group(
             "composite_test",
             &pipeline.get_bind_group_layout(0).into(),
@@ -259,8 +290,10 @@ impl CompositeFixture {
                     binding: 11,
                     resource: directional.as_entire_binding(),
                 },
+                texture_entry(12, &anchor_views[0]),
+                texture_entry(13, &anchor_views[1]),
                 BindGroupEntry {
-                    binding: 12,
+                    binding: 16,
                     resource: output.as_entire_binding(),
                 },
             ],
@@ -291,6 +324,14 @@ impl CompositeFixture {
                 label: Some("composite_test"),
                 timestamp_writes: None,
             });
+            // Production order: anchors are resolved before reconstruction.
+            pass.set_pipeline(anchor_pipeline);
+            pass.set_bind_group(0, &anchor_group, &[]);
+            pass.dispatch_workgroups(
+                self.resolve_size.x.div_ceil(8),
+                self.resolve_size.y.div_ceil(8),
+                1,
+            );
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(
@@ -355,7 +396,7 @@ fn gpu_composite_upsample_respects_receiver_geometry_and_support() {
             ],
             &SlangSettings {
                 target: SlangTarget::Wgsl,
-                entry_points: vec!["checkComposite".into()],
+                entry_points: vec!["compositeAnchors".into(), "checkComposite".into()],
                 optimization: Some(2),
                 ..default()
             },
@@ -407,6 +448,14 @@ fn gpu_composite_upsample_respects_receiver_geometry_and_support() {
                 ),
                 (
                     12,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ),
+                (
+                    13,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ),
+                (
+                    16,
                     bevy::render::render_resource::binding_types::storage_buffer::<Vec<Vec4>>(
                         false,
                     ),
@@ -424,6 +473,52 @@ fn gpu_composite_upsample_respects_receiver_geometry_and_support() {
         layout: Some(&pipeline_layout),
         module: &module,
         entry_point: Some("checkComposite"),
+        compilation_options: default(),
+        cache: None,
+    });
+    let anchor_layout = device.create_bind_group_layout(
+        Some("composite_test_anchors"),
+        &BindGroupLayoutEntries::with_indices(
+            ShaderStages::COMPUTE,
+            (
+                (0, uniform_buffer::<TransportParameters>(false)),
+                (
+                    2,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ),
+                (5, texture_2d(TextureSampleType::Uint)),
+                (
+                    6,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ),
+                (7, texture_2d(TextureSampleType::Uint)),
+                (
+                    14,
+                    bevy::render::render_resource::binding_types::texture_storage_2d(
+                        TextureFormat::Rgba32Float,
+                        StorageTextureAccess::WriteOnly,
+                    ),
+                ),
+                (
+                    15,
+                    bevy::render::render_resource::binding_types::texture_storage_2d(
+                        TextureFormat::Rgba32Float,
+                        StorageTextureAccess::WriteOnly,
+                    ),
+                ),
+            ),
+        ),
+    );
+    let anchor_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("composite_test_anchors"),
+        bind_group_layouts: &[Some(&anchor_layout)],
+        immediate_size: 0,
+    });
+    let anchor_pipeline = device.create_compute_pipeline(&RawComputePipelineDescriptor {
+        label: Some("composite_test_anchors"),
+        layout: Some(&anchor_pipeline_layout),
+        module: &module,
+        entry_point: Some("compositeAnchors"),
         compilation_options: default(),
         cache: None,
     });
@@ -458,7 +553,9 @@ fn gpu_composite_upsample_respects_receiver_geometry_and_support() {
         multiview_mask: None,
         cache: None,
     });
-    let check = |fixture: &CompositeFixture| fixture.run(device, queue, &pipeline, &depth_pipeline);
+    let check = |fixture: &CompositeFixture| {
+        fixture.run(device, queue, &anchor_pipeline, &pipeline, &depth_pipeline)
+    };
     let assert_rgb = |actual: [f32; 4], expected: [f32; 3], label: &str| {
         for component in 0..3 {
             assert!(
