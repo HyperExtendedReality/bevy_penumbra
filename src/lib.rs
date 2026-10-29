@@ -295,16 +295,16 @@ pub struct RadianceCascadesRawOutput(pub Handle<Image>);
 
 /// Shared receiver sampling, update, cache, traversal, and reconstruction budgets.
 ///
-/// A default value keeps the historical `resolution_divisor`/`max_rays`
-/// behavior. Set any workload field to opt into the explicit grid and update
-/// budgets; in that mode the candidate grid is independent of `max_rays` and
-/// `max_rays` remains a compatibility ceiling on per-frame selected updates.
+/// Every view uses one amortized scheme: a sparse candidate grid, a bounded
+/// number of receiver updates per frame rotated fairly across the grid, and
+/// a persistent world cache. Zero fields inherit `resolution_divisor` and
+/// `max_rays`; `max_rays` also caps the per-frame selected updates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SamplingSettings {
     /// Candidate-grid pixel divisor. Zero inherits `RadianceCascades::resolution_divisor`.
     pub grid_divisor: u32,
-    /// Maximum visible screen-grid candidates. Zero uses the explicit mode's
-    /// hard safety cap of 131,072 candidates.
+    /// Maximum visible screen-grid candidates. Zero uses the hard safety cap
+    /// of 131,072 candidates.
     pub max_receiver_cells: u32,
     /// Receiver updates selected per frame. Zero inherits `max_rays`.
     pub max_updates_per_frame: u32,
@@ -320,8 +320,8 @@ pub struct SamplingSettings {
 }
 
 impl SamplingSettings {
-    /// No explicit workload limits; preserves the legacy sampling behavior.
-    pub const fn legacy() -> Self {
+    /// No workload limits beyond `resolution_divisor` and `max_rays`.
+    pub const fn unlimited() -> Self {
         Self {
             grid_divisor: 0,
             max_receiver_cells: 0,
@@ -342,14 +342,6 @@ impl SamplingSettings {
             max_traversal_queries: 16_384,
             resolve_scale: 2,
         }
-    }
-
-    pub(crate) const fn is_explicit(self) -> bool {
-        self.grid_divisor != 0
-            || self.max_receiver_cells != 0
-            || self.max_updates_per_frame != 0
-            || self.max_cache_entries != 0
-            || self.max_traversal_queries != 0
     }
 
     fn sanitized(mut self) -> Self {
@@ -375,7 +367,7 @@ impl SamplingSettings {
 
 impl Default for SamplingSettings {
     fn default() -> Self {
-        Self::legacy()
+        Self::unlimited()
     }
 }
 
@@ -723,13 +715,11 @@ mod tests {
 
     #[test]
     fn shared_sampling_and_split_low_end_preset_are_bounded() {
-        let legacy = SamplingSettings::default();
-        assert_eq!(legacy, SamplingSettings::legacy());
-        assert_eq!(legacy.resolve_scale, 1);
-        assert!(!legacy.is_explicit());
+        let unlimited = SamplingSettings::default();
+        assert_eq!(unlimited, SamplingSettings::unlimited());
+        assert_eq!(unlimited.resolve_scale, 1);
 
         let low_end = RadianceCascades::low_end();
-        assert!(low_end.sampling.is_explicit());
         assert_eq!(low_end.sampling.grid_divisor, 8);
         assert_eq!(low_end.sampling.max_receiver_cells, 16_384);
         assert_eq!(low_end.sampling.max_updates_per_frame, 1_024);
@@ -744,7 +734,6 @@ mod tests {
         assert_eq!(low_end.temporal_blend, 0.95);
         assert_eq!(low_end.spatial_filter_steps, 3);
         let default_settings = RadianceCascades::default();
-        assert!(!default_settings.sampling.is_explicit());
         assert_eq!(default_settings.resolution_divisor, 2);
         assert_eq!(default_settings.max_rays, 131_072);
         assert_eq!(default_settings.emissive_samples, 16);
@@ -752,7 +741,7 @@ mod tests {
 
     #[test]
     fn cache_entry_limit_accepts_262144_and_clamps_larger_values() {
-        let base = SamplingSettings::legacy();
+        let base = SamplingSettings::unlimited();
         let maximum = SamplingSettings {
             max_cache_entries: 262_144,
             ..base

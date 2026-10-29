@@ -513,8 +513,21 @@ void clear(uint3 thread : SV_DispatchThreadID) {
                 heads[2 * params.size.w + 10u + word].store(0u);
         }
     }
-    if (thread.x == 0u && params.ownerSequence.z != 0u)
+    if (thread.x == 0u && params.ownerSequence.z != 0u) {
         heads[rootRayOffsetHead(params)].store(0u);
+        heads[traceCountHead(params)].store(0u);
+        heads[traceArgsHead(params)].store(0u);
+        heads[traceArgsHead(params) + 1u].store(1u);
+        heads[traceArgsHead(params) + 2u].store(1u);
+        uint headWords, headStride;
+        heads.GetDimensions(headWords, headStride);
+        if (params.environmentScale.z <= 0.5 && headWords >= deferredTraceEnd(params)) {
+            heads[deferredQueryCountHead(params)].store(0u);
+            heads[deferredQueryArgsHead(params)].store(0u);
+            heads[deferredQueryArgsHead(params) + 1u].store(1u);
+            heads[deferredQueryArgsHead(params) + 2u].store(1u);
+        }
+    }
     // Both head clears run before transport. The second one preserves shared
     // query/owner counters; only the first needs to clear sparse output images,
     // which otherwise incurs a redundant full-image write on every frame.
@@ -704,14 +717,16 @@ bool splitSampleSurface(uint2 pixel, out float3 position, out float3 normal) {
 void seed(uint3 thread : SV_DispatchThreadID) {
     if (any(thread.xy >= params.size.xy)) return;
     uint sample = thread.x + thread.y * params.size.x;
-    [unroll] for (uint variant = 0u; variant < 2u; ++variant)
-        [unroll] for (uint level = 0u; level < CASCADES; ++level) {
-            uint descriptor = probeDescriptorIndex(sample, variant, level);
-            entries[descriptor] = (Entry)0;
-        }
-
+    // Every descriptor is written exactly once, either with its seeded entry
+    // or zero. Entries are 272 bytes, so clearing and then overwriting them
+    // doubled this bandwidth-bound pass.
     float3 surfacePosition, geometricNormal;
-    if (!splitSampleSurface(thread.xy, surfacePosition, geometricNormal)) return;
+    if (!splitSampleSurface(thread.xy, surfacePosition, geometricNormal)) {
+        [unroll] for (uint variant = 0u; variant < 2u; ++variant)
+            [unroll] for (uint level = 0u; level < CASCADES; ++level)
+                entries[probeDescriptorIndex(sample, variant, level)] = (Entry)0;
+        return;
+    }
 
     uint lowLod, highLod;
     float lodBlend;
@@ -731,7 +746,11 @@ void seed(uint3 thread : SV_DispatchThreadID) {
         : transportCandidateSelected(sample);
     bool eligibleRay = selectedRay || coldPriority;
     [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
-        if (variant == 1u && highLod == lowLod) continue;
+        if (variant == 1u && highLod == lowLod) {
+            [unroll] for (uint level = 0u; level < CASCADES; ++level)
+                entries[probeDescriptorIndex(sample, variant, level)] = (Entry)0;
+            continue;
+        }
         uint lod = variant == 0u ? lowLod : highLod;
         [unroll] for (uint level = 0u; level < CASCADES; ++level) {
             uint index = probeDescriptorIndex(sample, variant, level);
@@ -927,11 +946,20 @@ void prefix(uint3 thread : SV_DispatchThreadID) {
 void generateDirections(uint3 thread : SV_DispatchThreadID) {
     if (any(thread.xy >= params.size.xy)) return;
     uint sample = thread.x + thread.y * params.size.x;
+    if (params.environmentScale.y > 0.5 && params.environmentScale.z <= 0.5)
+        irradiance.Store(int2(thread.xy), 0.0);
+    bool selected = false;
     [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
         uint index = probeDescriptorIndex(sample, variant, 0u);
         if (entries[index].padding.x == 0u || entries[index].next == EMPTY) continue;
         uint canonical = entries[index].next;
         entries[index].lastSample += entries[canonical].valid;
+        selected = true;
+    }
+    if (selected) {
+        uint ticket = heads[traceCountHead(params)].add(1u);
+        heads[traceSamplesHead(params) + ticket].store(sample);
+        heads[traceArgsHead(params)].max(ticket * traceLaneStride(params) / 64u + 1u);
     }
 }
 
@@ -1069,12 +1097,14 @@ void deposit(uint first, float3 samplePosition, float3 rayOrigin,
     }
 }
 
-void traceTransport(uint3 thread) {
+// Immediate traces shade and deposit here. Deferred traces only store the
+// closest hit; `deferred` is a literal at each call so the closest-hit kernel
+// carries no hit-shading code.
+[ForceInline]
+void traceTransport(uint3 thread, bool deferred, uint ticket) {
     uint2 pixel = thread.xy;
     if (any(pixel >= params.size.xy)) return;
     uint sample = pixel.x + pixel.y * params.size.x;
-    if (params.environmentScale.y > 0.5 && params.environmentScale.z <= 0.5)
-        irradiance.Store(int2(pixel), 0.0);
     uint firstLow = probeDescriptorIndex(sample, 0u, 0u);
     uint firstHigh = probeDescriptorIndex(sample, 1u, 0u);
     bool lowSelected = entries[firstLow].padding.x != 0u && entries[firstLow].next != EMPTY;
@@ -1094,44 +1124,127 @@ void traceTransport(uint3 thread) {
         if (dot(direction, geometricNormal) < 0.0) direction = -direction;
         float3 rayOrigin = rayOffset(surfacePosition, geometricNormal, params.tuning.z);
         DependencyContext rayDependency = dependencyUnknown();
-        DependencyContext outgoingDependency = dependencyEmpty();
         float dependencyStart = 0.0, dependencyDistance = 0.0;
         float dependencyPadding = 0.0;
         float coneWidth = params.tuning.x * 0.5;
         Hit hit = traceRayTracked(rayOrigin, direction, 1e20, rayDependency,
             dependencyStart, dependencyDistance, dependencyPadding,
             false, coneWidth, 0.5);
-        bool radianceSupported;
-        TransportRadiance radiance = outgoingTransportRadianceTracked(rayOrigin,
-            direction, hit, radianceSupported, outgoingDependency,
-            mergeVisibilityAdmissionLimit());
-        if (!radianceSupported) continue;
-        if (params.environmentScale.y > 0.5 && params.environmentScale.z <= 0.5
-            && hit.triangle != EMPTY && (hit.errors & HIT_QUERY_UNSUPPORTED) == 0u) {
-            HitAttributes attributes = hitAttributes(hit);
-            float3 hitNormal = attributes.geometricNormal;
-            if (dot(hitNormal, direction) > 0.0) hitNormal = -hitNormal;
-            float3 hitPosition = rayOrigin + direction * hit.distance;
-            float3 hitShading = hitShadingNormal(hit, attributes, direction);
-            bool unlit = (sceneWord(instanceBase(hit.instance) + 6u).w & 16u) != 0u;
-            if (!unlit && all(isfinite(hitPosition)) && all(isfinite(hitNormal))
-                && all(isfinite(hitShading)) && dot(hitNormal, hitNormal) > 0.01
-                && dot(hitShading, -direction) > 0.0 && dot(hitShading, hitNormal) > 0.0)
-                irradiance.Store(int2(pixel), float4(hitPosition,
-                    receiverPackedNormal(normalize(hitNormal)) + 1.0));
+        if (!deferred) {
+            finishTransportVariant(pixel, first, lod, surfacePosition, rayOrigin,
+                direction, hit, rayDependency, dependencyStart, dependencyDistance,
+                dependencyPadding);
+            continue;
         }
-        deposit(first, surfacePosition, rayOrigin, direction, hit, radiance, lod,
-            rayDependency, dependencyStart, dependencyDistance, dependencyPadding,
-            outgoingDependency);
+        storeDeferredSlot(ticket * 2u + variant, surfacePosition, rayOrigin, direction,
+            hit, rayDependency, dependencyStart, dependencyDistance, dependencyPadding, 0u);
     }
 }
 
+bool loadDeferredSlot(uint slot, out float3 surfacePosition, out float3 rayOrigin,
+                      out float3 direction, out Hit hit, out DependencyContext rayDependency) {
+    uint word = deferredSlotHead(slot, params);
+    [unroll] for (uint i = 0u; i < 3u; ++i) {
+        surfacePosition[i] = asfloat(heads[word + i].load());
+        rayOrigin[i] = asfloat(heads[word + 3u + i].load());
+        direction[i] = asfloat(heads[word + 6u + i].load());
+        hit.barycentric[i] = asfloat(heads[word + 13u + i].load());
+        rayDependency.minimum[i] = asfloat(heads[word + 17u + i].load());
+        rayDependency.maximum[i] = asfloat(heads[word + 20u + i].load());
+    }
+    hit.distance = asfloat(heads[word + 9u].load());
+    hit.triangle = heads[word + 10u].load();
+    hit.instance = heads[word + 11u].load();
+    hit.errors = heads[word + 12u].load();
+    hit.footprint = asfloat(heads[word + 16u].load());
+    uint dependencyFlags = heads[word + 23u].load();
+    rayDependency.known = (dependencyFlags & 1u) != 0u;
+    rayDependency.hasBounds = (dependencyFlags & 2u) != 0u;
+    return heads[word + 31u].load() == deferredSlotTag();
+}
+
+// Hit shading, optional secondary seeding, and interval deposition for one
+// traced receiver variant. Shared by the immediate and deferred traces.
+void finishTransportVariant(uint2 pixel, uint first, uint lod, float3 surfacePosition,
+                            float3 rayOrigin, float3 direction, Hit hit,
+                            DependencyContext rayDependency, float dependencyStart,
+                            float dependencyDistance, float dependencyPadding) {
+    DependencyContext outgoingDependency = dependencyEmpty();
+    bool radianceSupported;
+    TransportRadiance radiance = outgoingTransportRadianceTracked(rayOrigin,
+        direction, hit, radianceSupported, outgoingDependency,
+        mergeVisibilityAdmissionLimit());
+    if (!radianceSupported) return;
+    if (params.environmentScale.y > 0.5 && params.environmentScale.z <= 0.5
+        && hit.triangle != EMPTY && (hit.errors & HIT_QUERY_UNSUPPORTED) == 0u) {
+        HitAttributes attributes = hitAttributes(hit);
+        float3 hitNormal = attributes.geometricNormal;
+        if (dot(hitNormal, direction) > 0.0) hitNormal = -hitNormal;
+        float3 hitPosition = rayOrigin + direction * hit.distance;
+        float3 hitShading = hitShadingNormal(hit, attributes, direction);
+        bool unlit = (sceneWord(instanceBase(hit.instance) + 6u).w & 16u) != 0u;
+        if (!unlit && all(isfinite(hitPosition)) && all(isfinite(hitNormal))
+            && all(isfinite(hitShading)) && dot(hitNormal, hitNormal) > 0.01
+            && dot(hitShading, -direction) > 0.0 && dot(hitShading, hitNormal) > 0.0)
+            irradiance.Store(int2(pixel), float4(hitPosition,
+                receiverPackedNormal(normalize(hitNormal)) + 1.0));
+    }
+    deposit(first, surfacePosition, rayOrigin, direction, hit, radiance, lod,
+        rayDependency, dependencyStart, dependencyDistance, dependencyPadding,
+        outgoingDependency);
+}
+
+// The deferred scratch exists only in primary cache heads sized for it.
+bool deferredTraceAvailable() {
+    if (params.environmentScale.z > 0.5) return false;
+    uint words, stride;
+    heads.GetDimensions(words, stride);
+    return words >= deferredTraceEnd(params);
+}
+
+uint deferredSlotTag() { return params.frame.x | 0x80000000u; }
+
+void storeDeferredSlot(uint slot, float3 surfacePosition, float3 rayOrigin, float3 direction,
+                       Hit hit, DependencyContext rayDependency, float dependencyStart,
+                       float dependencyDistance, float dependencyPadding, uint queries) {
+    uint word = deferredSlotHead(slot, params);
+    [unroll] for (uint i = 0u; i < 3u; ++i) {
+        heads[word + i].store(asuint(surfacePosition[i]));
+        heads[word + 3u + i].store(asuint(rayOrigin[i]));
+        heads[word + 6u + i].store(asuint(direction[i]));
+        heads[word + 13u + i].store(asuint(hit.barycentric[i]));
+        heads[word + 17u + i].store(asuint(rayDependency.minimum[i]));
+        heads[word + 20u + i].store(asuint(rayDependency.maximum[i]));
+    }
+    heads[word + 9u].store(asuint(hit.distance));
+    heads[word + 10u].store(hit.triangle);
+    heads[word + 11u].store(hit.instance);
+    heads[word + 12u].store(hit.errors);
+    heads[word + 16u].store(asuint(hit.footprint));
+    heads[word + 23u].store((rayDependency.known ? 1u : 0u)
+        | (rayDependency.hasBounds ? 2u : 0u));
+    heads[word + 24u].store(asuint(dependencyStart));
+    heads[word + 25u].store(asuint(dependencyDistance));
+    heads[word + 26u].store(asuint(dependencyPadding));
+    heads[word + 30u].store(queries);
+    heads[word + 31u].store(deferredSlotTag());
+}
+
+uint traceTicket(uint lane) {
+    uint stride = traceLaneStride(params);
+    if (lane % stride != 0u) return EMPTY;
+    uint ticket = lane / stride;
+    return ticket < heads[traceCountHead(params)].load() ? ticket : EMPTY;
+}
+
+uint2 ticketPixel(uint ticket) {
+    uint sample = heads[traceSamplesHead(params) + ticket].load();
+    return uint2(sample % params.size.x, sample / params.size.x);
+}
+
 [shader("compute")]
-[numthreads(8, 8, 1)]
+[numthreads(64, 1, 1)]
 void trace(uint3 thread : SV_DispatchThreadID) {
-<<<<<<< Updated upstream
-    traceTransport(thread);
-=======
     uint ticket = traceTicket(thread.x);
     if (ticket == EMPTY) return;
     // With deferred scratch, this kernel only takes tickets beyond its capacity.
@@ -1247,7 +1360,6 @@ void traceResolve(uint3 thread : SV_DispatchThreadID) {
             asfloat(heads[word + 25u].load()), asfloat(heads[word + 26u].load()));
         visibilityMode = VISIBILITY_TRACE;
     }
->>>>>>> Stashed changes
 }
 
 [shader("compute")]
@@ -1270,8 +1382,7 @@ void reduce(uint3 thread : SV_DispatchThreadID) {
         DependencyContext freshDependency = dependencyEmpty();
         float4 freshLightHitBounds = emptyLightHitBounds();
         float4 freshBetaSegmentSphere = emptyLightHitBounds();
-        Entry retained = (Entry)0;
-        bool hasRetained = false;
+        uint retainedIndex = EMPTY;
         [loop] while (cursor != EMPTY && all(entries[cursor].key == key)) {
             Entry sample = entries[cursor];
             uint next = sample.next;
@@ -1293,9 +1404,9 @@ void reduce(uint3 thread : SV_DispatchThreadID) {
                     freshLightHitBounds, sample.boundaryInterval);
                 freshBetaSegmentSphere = unionConservativeSpheres(
                     freshBetaSegmentSphere, sample.normal);
-            } else if (!hasRetained && sample.valid == (params.frame.x | 0x80000000u)) {
-                retained = sample;
-                hasRetained = true;
+            } else if (retainedIndex == EMPTY
+                       && sample.valid == (params.frame.x | 0x80000000u)) {
+                retainedIndex = cursor;
             }
             if (cursor != source) entries[cursor].valid = 0u;
             cursor = next;
@@ -1327,7 +1438,9 @@ void reduce(uint3 thread : SV_DispatchThreadID) {
             aggregate.normal = freshBetaSegmentSphere;
             entries[source] = aggregate;
             unique = source;
-        } else if (hasRetained) {
+        } else if (retainedIndex != EMPTY) {
+            // The walk only cleared this slot's valid word, which is rewritten below.
+            Entry retained = entries[retainedIndex];
             retained.next = unique;
             retained.valid = params.frame.x | 0x80000000u;
             retained.samples = 0u;
@@ -1593,6 +1706,8 @@ void mergeEntry(uint index) {
 [numthreads(64, 1, 1)]
 void merge(uint3 thread : SV_DispatchThreadID) {
     uint index = thread.x * CASCADES + thread.y;
+    // Seed, deposit and reduce store level-L keys only at current descriptors with index % CASCADES == L.
+    if (index < currentCapacity() && thread.y != params.frame.y) return;
     if (index >= currentCapacity() + cacheHistoryQuota(params) * params.size.w) return;
     if (entries[index].valid != (params.frame.x | 0x80000000u)
         || !intervalHistoryAlive(entries[index].lastSample, params)
@@ -1605,8 +1720,9 @@ void merge(uint3 thread : SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void seedProbes(uint3 thread : SV_DispatchThreadID) {
-    if (thread.y >= CASCADES) return;
-    uint index = thread.x * CASCADES + thread.y;
+    // Only level-0 keys seed probes, and descriptors keep level L at index % CASCADES == L.
+    if (thread.y != 0u) return;
+    uint index = thread.x * CASCADES;
     if (index >= currentCapacity()) return;
     // Include every initialized visible descriptor, including candidates with
     // zero prefix offsets; retained cache entries are read while packing radiance.

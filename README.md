@@ -60,12 +60,14 @@ It targets GTX 1650 / RX 5500 XT class hardware; that performance target has not
 been certified on those GPUs. See [quality and performance validation](docs/quality-and-performance.md)
 for the measurement protocol and current evidence.
 
-`sampling` separates candidate-grid density from selected receiver updates,
-cache capacity, traversal work, and resolve scale. In explicit sampling mode,
-lowering `max_rays` reduces selected updates while retaining the candidate grid.
-An all-zero workload configuration retains the legacy grid/budget relationship.
+Every view uses one amortized sampling scheme. `sampling` separates
+candidate-grid density from selected receiver updates, cache capacity,
+traversal work, and resolve scale; zero fields inherit `resolution_divisor`
+and `max_rays`, and `max_rays` caps the receiver updates selected per frame
+while the candidate grid stays fixed. Selected receivers are traced with one
+compact dispatch whose lanes are spaced out for small budgets.
 Use `..Default::default()` or `..RadianceCascades::low_end()` in struct literals
-to account for the new `sampling` field.
+to account for the `sampling` field.
 
 Use `..Default::default()` in struct literals to inherit shared settings.
 
@@ -136,14 +138,6 @@ traversal runs. `RadianceCascadesStatus::hardware_ray_queries` reports which
 traversal the latest dispatch used.
 
 The Sponza demo and library use Split Radiance Cascades. In the interactive
-<<<<<<< Updated upstream
-Sponza demo, `F12` toggles cursor grab.
-Sponza defaults to 8,192 receiver updates and 131,072 traversal queries per
-frame, resolve scale 4, and two direct-light samples. The library's low-end
-preset remains at 1,024 updates and 16,384 queries. The demo keeps its requested
-profile fixed while running; `--max-rays`, `--max-traversal-queries`, and
-`--resolution-divisor` adjust it; `--multi-bounce` enables the secondary cache.
-=======
 Sponza demo, `F12` toggles cursor grab and `H` toggles hardware ray queries,
 which Sponza requests by default; the window title shows the traversal in use.
 `--software-traversal` starts with the software traversal.
@@ -155,7 +149,6 @@ profile fixed while running; `--max-rays`, `--max-traversal-queries`, and
 and `--cached-hit-sky` adds cached hit sky lighting.
 Interactive mode requests VSync by default; `--no-vsync` requests AutoNoVsync
 instead and may produce tearing. The platform can choose a fallback present mode.
->>>>>>> Stashed changes
 Split's Sponza profile uses 1 m probe spacing
 and a 1.6 m first interval; it permits 32,768 receiver cells and 262,144 cached
 intervals within a 1 GiB view budget, subject to device allocation limits. Run
@@ -170,6 +163,30 @@ includes `samples.trace_gpu_ms`, a distribution of Split trace pass GPU
 timestamps observed within the measurement window; it is empty when GI is
 disabled. Startup logs record the first GI dispatch and the first raw readback
 reaching 95% eligible-pixel support; neither event waits for warmup.
+
+The default shadow profile uses two 2048-pixel cascades over 40 m; the sun's
+shadow maps are disabled when its daylight illuminance is zero.
+`--shadow-profile=reference` selects four 2048-pixel cascades over 150 m;
+`--shadow-profile=balanced` selects the default. The default asset profile is
+`source`. An explicit `--asset-profile=balanced` selects a locally cooked bundle
+only; its fidelity is not certified by structural verification alone.
+
+To cook that optional bundle, place the
+[gltfpack 1.3 Windows release](https://github.com/zeux/meshoptimizer/releases/tag/v1.3)
+ZIP and `gltfpack.exe` in `tmp/tools/gltfpack-1.3/`, then run
+`python scripts/optimize_sponza.py` and `python scripts/optimize_sponza.py --verify`.
+The cook verifies the ZIP hash, keeps the supplied assets untouched, and writes
+`assets/sponza-optimized/`; redistribution permission for derivatives is unknown.
+Run the converted scene with
+`cargo run --release --example sponza -- --asset-profile=balanced`.
+The cook retains CPU-readable PNG textures because the GI atlas does not yet
+accept GPU block-compressed textures.
+The benchmark and validation scripts accept `-AssetProfile` and `-ShadowProfile`.
+For matched scene-linear comparisons, add `--capture-raw` to
+`--capture-stability` and use `scripts/check_sponza_quality.py` on the two
+capture prefixes. Schema 14 reports windowed GPU pass distributions in
+`samples.gpu_passes`; unavailable timings have null statistics.
+
 `scripts/validate_sponza_gi.ps1 -Release`
 checks Split with static captures, a moving blocker, and a moving point
 light. Dark camera directions use matched GI-on/off controls instead of
@@ -282,6 +299,19 @@ material texture images to 512 pixels and uses `--max-rays=N` to adjust the
 per-view work budget. To admit those assets and replacement overlap, the
 benchmark allows a 2 GiB scene and a 768 MiB material atlas; this is separate
 from the library's 4 GB low-end memory profile.
+
+Split traces selected receivers with compact dispatch. Budgets below 8,192
+updates space each receiver over up to eight lanes so more warps hide traversal
+latency; at 2,048 updates this cut the trace pass from 12.4 to 10.6 ms (p50).
+Primary transport is then split into four compute passes: closest hits, a
+recording run of hit shading that stores its shadow queries, those queries
+traced one per lane, and a replay that shades with the stored answers and
+deposits the intervals. Each pass holds at most one copy of the hit-shading
+code, and the shadow-ray pass is a small kernel. Up to 8,192 receivers per
+frame use this path; any beyond that trace in a single pass as before.
+The compact path's midnight raw-fidelity comparison remains unresolved. On the measured RTX 4070 Laptop GPU, the 1080p
+Vulkan screen did not reach 60 FPS; see [validation notes](docs/validation.md)
+for timings and quality limitations.
 
 ## Research and validation
 

@@ -12,6 +12,10 @@ use bevy::{
 };
 use bevy_slang::{SlangCompiler, SlangSettings, SlangTarget};
 
+#[path = "compact_clear_tests.rs"]
+mod compact_clear_tests;
+#[path = "compact_trace_tests.rs"]
+mod compact_trace_tests;
 #[path = "composite_tests.rs"]
 mod composite_tests;
 #[path = "emitter_tests.rs"]
@@ -1994,6 +1998,7 @@ fn gpu_split_r2_prefix_uses_selected_rays_and_world_grid_keys() {
 [[vk::binding(0, 0)]] ConstantBuffer<Parameters> params;
 [[vk::binding(6, 0)]] RWStructuredBuffer<Atomic<uint>> heads;
 [[vk::binding(7, 0)]] RWStructuredBuffer<Entry> entries;
+[[vk::binding(10, 0)]] [format("rgba32f")] WTexture2D<float4> irradiance;
 [[vk::binding(13, 0)]] RWStructuredBuffer<uint4> testResults;
 "#,
     );
@@ -2053,6 +2058,17 @@ void inspectDirectory(uint3 id : SV_DispatchThreadID) {
     if (id.x == 0u)
         testResults[2u * count] = uint4(
             heads[rootRayOffsetHead(params)].load(), probeDirectoryCapacity(params), 0u, 0u);
+    if (id.x < params.size.z) {
+        uint base = 2u * count + 6u;
+        testResults[base + id.x] = uint4(
+            heads[traceSamplesHead(params) + id.x].load(), 0u, 0u, 0u);
+        if (id.x == 0u)
+            testResults[base + params.size.z] = uint4(
+                heads[traceCountHead(params)].load(),
+                heads[traceArgsHead(params)].load(),
+                heads[traceArgsHead(params) + 1u].load(),
+                heads[traceArgsHead(params) + 2u].load());
+    }
 }
 
 [shader("compute")]
@@ -2150,10 +2166,14 @@ void inspectIntervals(uint3 id : SV_DispatchThreadID) {
     let inspect = make_pipeline("inspectDirectory");
     let inspect_intervals = make_pipeline("inspectIntervals");
 
-    let head_words = (2 * CACHE_BUCKETS + 36 + 8 * directory_capacity + 1) as usize;
+    let head_words =
+        (2 * CACHE_BUCKETS + 36 + 8 * directory_capacity + 1 + 4 + CANDIDATES) as usize;
     let count_base = (2 * CACHE_BUCKETS + 36 + 4 * directory_capacity) as usize;
     let mut initial_heads = vec![u32::MAX; head_words];
     initial_heads[count_base..].fill(0);
+    let root = (2 * CACHE_BUCKETS + 36 + 8 * directory_capacity) as usize;
+    initial_heads[root + 3] = 1;
+    initial_heads[root + 4] = 1;
     let head_bytes: Vec<u8> = initial_heads
         .iter()
         .flat_map(|word| word.to_le_bytes())
@@ -2168,13 +2188,21 @@ void inspectIntervals(uint3 id : SV_DispatchThreadID) {
         contents: &entry_bytes,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
     });
-    let result_rows = descriptor_count * 2 + 6;
+    let result_rows = descriptor_count * 2 + 7 + CANDIDATES as usize;
     let results = device.create_buffer(&BufferDescriptor {
         label: Some("split_r2_prefix_results"),
         size: (result_rows * 16) as u64,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let hit_texture = temporal_test_texture_sized(
+        device,
+        "split_prefix_secondary_hits",
+        TextureFormat::Rgba32Float,
+        TextureUsages::STORAGE_BINDING,
+        UVec2::new(CANDIDATES, 1),
+    );
+    let hit_view = hit_texture.create_view(&TextureViewDescriptor::default());
 
     let mut base_parameters = temporal_test_parameters(0);
     base_parameters.size = UVec4::new(CANDIDATES, 1, CANDIDATES, CACHE_BUCKETS);
@@ -2207,6 +2235,12 @@ void inspectIntervals(uint3 id : SV_DispatchThreadID) {
             bindings.push(BindGroupEntry {
                 binding: 7,
                 resource: entries.as_entire_binding(),
+            });
+        }
+        if std::ptr::eq(pipeline, &directions) {
+            bindings.push(BindGroupEntry {
+                binding: 10,
+                resource: BindingResource::TextureView(&hit_view),
             });
         }
         if has_results {
@@ -2258,14 +2292,7 @@ void inspectIntervals(uint3 id : SV_DispatchThreadID) {
         );
     }
     let direction_parameters = make_parameters(0);
-    let direction_group = make_group(
-        &directions,
-        &direction_parameters,
-        false,
-        true,
-        false,
-        false,
-    );
+    let direction_group = make_group(&directions, &direction_parameters, true, true, false, false);
     let _ = dispatch_and_wait(
         &directions,
         &direction_group,
@@ -2362,6 +2389,24 @@ void inspectIntervals(uint3 id : SV_DispatchThreadID) {
     let root_and_capacity = output_u32x4(&result_bytes_read, descriptor_count * 2);
     assert_eq!(root_and_capacity[0], selected_count);
     assert_eq!(root_and_capacity[1], directory_capacity);
+    let list_base = descriptor_count * 2 + 6;
+    let list_header = output_u32x4(&result_bytes_read, list_base + CANDIDATES as usize);
+    // Compact traces space small budgets over more lanes (`traceLaneStride`).
+    let lane_stride = (8192 / SELECTED_BUDGET).clamp(1, 8);
+    assert_eq!(
+        list_header,
+        [
+            selected_count,
+            (selected_count - 1) * lane_stride / 64 + 1,
+            1,
+            1
+        ]
+    );
+    let mut compact: Vec<_> = (0..selected_count as usize)
+        .map(|slot| output_u32x4(&result_bytes_read, list_base + slot)[0])
+        .collect();
+    compact.sort_unstable();
+    assert_eq!(compact, (0..selected_count).collect::<Vec<_>>());
     assert!(root_and_capacity[0] <= SELECTED_BUDGET);
     assert_eq!(
         output_u32x4(&result_bytes_read, 0)[0],
@@ -3161,11 +3206,18 @@ void readRankState(uint3 id : SV_DispatchThreadID) {
     };
     let make_state = |fair_mask: Option<&[bool]>, selected_count: u32, weighted: bool| {
         let mut heads_words =
-            vec![u32::MAX; (2 * BUCKETS + 36 + 8 * DIRECTORY_CAPACITY as u32) as usize];
+            vec![
+                u32::MAX;
+                2 * BUCKETS as usize + 36 + 8 * DIRECTORY_CAPACITY + 5 + CANDIDATES as usize
+            ];
         let count_base = 2 * BUCKETS as usize + 36 + 4 * DIRECTORY_CAPACITY;
         for count in 0..4 * DIRECTORY_CAPACITY {
             heads_words[count_base + count] = 0;
         }
+        let root = 2 * BUCKETS as usize + 36 + 8 * DIRECTORY_CAPACITY;
+        heads_words[root..].fill(0);
+        heads_words[root + 3] = 1;
+        heads_words[root + 4] = 1;
         heads_words[2 * BUCKETS as usize + 7] = selected_count;
         let heads = device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("split_cold_priority_heads"),
@@ -4049,5 +4101,159 @@ fn gpu_dense_16_cubed_sdf_matches_cpu_and_production_spherical_mapping() {
             "direction mismatch at dense address {address}: {direction:?} != {:?}",
             expected_directions[address]
         );
+    }
+}
+
+#[test]
+#[ignore = "requires slangc and a desktop GPU"]
+fn gpu_compact_direction_group_boundaries() {
+    const WIDTH: u32 = 13;
+    const COUNT: u32 = 65;
+    const BUCKETS: u32 = 16;
+    const ENTRY_WORDS: usize = 272 / 4;
+    let split = include_str!("../shaders/split.slang");
+    let section = |start: &str, end: &str| {
+        let tail = &split[split.find(start).unwrap()..];
+        &tail[..tail.find(end).unwrap()]
+    };
+    let source = format!(
+        r#"#include "common.slang"
+[[vk::binding(0, 0)]] ConstantBuffer<Parameters> params;
+[[vk::binding(6, 0)]] RWStructuredBuffer<Atomic<uint>> heads;
+[[vk::binding(7, 0)]] RWStructuredBuffer<Entry> entries;
+[[vk::binding(10, 0)]] [format("rgba32f")] WTexture2D<float4> irradiance;
+{}
+{}"#,
+        section("uint probeDescriptorIndex(", "uint findProbeNode("),
+        section("void generateDirections(", "uint currentCapacity("),
+    );
+    // The extraction starts at the function, so supply its compute entry attributes.
+    let source = source.replace(
+        "void generateDirections(",
+        "[shader(\"compute\")]\n[numthreads(8, 8, 1)]\nvoid generateDirections(",
+    );
+    let shader = SlangCompiler::default()
+        .compile_bundle(
+            "compact_directions_test.slang",
+            &[
+                ("common.slang", include_str!("../shaders/common.slang")),
+                ("compact_directions_test.slang", &source),
+            ],
+            &SlangSettings {
+                target: SlangTarget::Wgsl,
+                entry_points: vec!["generateDirections".into()],
+                optimization: Some(2),
+                ..default()
+            },
+        )
+        .unwrap();
+    let bevy::shader::Source::Wgsl(source) = shader.source else {
+        panic!("expected WGSL")
+    };
+    let options = WgpuSettings::default();
+    let resources = block_on(initialize_renderer(
+        options.backends.unwrap_or(Backends::PRIMARY),
+        None,
+        &options,
+    ));
+    let device = &resources.0;
+    let queue = &resources.1;
+    let module = device.create_and_validate_shader_module(ShaderModuleDescriptor {
+        label: Some("compact_boundaries"),
+        source: ShaderSource::Wgsl(source),
+    });
+    let pipeline = device.create_compute_pipeline(&RawComputePipelineDescriptor {
+        label: Some("compact_boundaries"),
+        layout: None,
+        module: &module,
+        entry_point: Some("generateDirections"),
+        compilation_options: default(),
+        cache: None,
+    });
+    let mut parameters = temporal_test_parameters(0);
+    parameters.size = UVec4::new(WIDTH, 5, COUNT, BUCKETS);
+    let mut uniform = UniformBuffer::from(parameters);
+    uniform.write_buffer(device, queue);
+    let texture = temporal_test_texture_sized(
+        device,
+        "compact_hits",
+        TextureFormat::Rgba32Float,
+        TextureUsages::STORAGE_BINDING,
+        UVec2::new(WIDTH, 5),
+    );
+    let view = texture.create_view(&TextureViewDescriptor::default());
+    let root = (2 * BUCKETS + 36 + 8 * (COUNT * 4).next_power_of_two()) as usize;
+    for selected in [0u32, 1, 63, 64, 65] {
+        let mut words = vec![0u32; root + 5 + COUNT as usize];
+        words[root + 3] = 1;
+        words[root + 4] = 1;
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let heads = device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("compact_heads"),
+            contents: &bytes,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        });
+        let mut descriptors = vec![0u32; COUNT as usize * 8 * ENTRY_WORDS];
+        for sample in 0..COUNT {
+            for variant in 0..2 {
+                let index = ((variant * COUNT + sample) * 4) as usize;
+                let chosen = sample < selected && (sample % 3 == 0 || variant == sample % 2);
+                // A marked but invalid descriptor must never nominate a sample.
+                let invalid = sample >= selected && variant == 0;
+                descriptors[index * ENTRY_WORDS + 16] =
+                    if invalid { u32::MAX } else { index as u32 };
+                descriptors[index * ENTRY_WORDS + 22] = u32::from(chosen || invalid);
+            }
+        }
+        let bytes: Vec<_> = descriptors
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let entries = device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("compact_entries"),
+            contents: &bytes,
+            usage: BufferUsages::STORAGE,
+        });
+        let group = device.create_bind_group(
+            "compact_boundaries",
+            &pipeline.get_bind_group_layout(0).into(),
+            &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.binding().unwrap(),
+                },
+                BindGroupEntry {
+                    binding: 6,
+                    resource: heads.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 7,
+                    resource: entries.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 10,
+                    resource: BindingResource::TextureView(&view),
+                },
+            ],
+        );
+        let output = crate::scene::traversal_tests::dispatch_readback(
+            device,
+            queue,
+            &pipeline,
+            &group,
+            &heads,
+            (words.len() * 4) as u64,
+            WIDTH.div_ceil(8),
+        );
+        let word =
+            |index: usize| u32::from_le_bytes(output[index * 4..index * 4 + 4].try_into().unwrap());
+        assert_eq!(word(root + 1), selected);
+        assert_eq!(
+            [word(root + 2), word(root + 3), word(root + 4)],
+            [selected.div_ceil(64), 1, 1]
+        );
+        let mut ids: Vec<_> = (0..selected as usize).map(|i| word(root + 5 + i)).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..selected).collect::<Vec<_>>());
     }
 }

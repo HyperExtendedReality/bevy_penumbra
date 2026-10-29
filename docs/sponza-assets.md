@@ -19,11 +19,24 @@ material omits `alphaMode`, which means opaque. The leaves use geometric outline
 The example's separate masked leaf cards use a generated RGBA image with explicit
 zero/one alpha regions.
 
-The current example applies a 512-pixel material texture limit and loads one scene
-at a time. This keeps the demo's asset use bounded; it is not a source-resolution
-texture residency result. Measurements from earlier renderer versions are not
-included here because they do not describe the current Split Radiance Cascades
-implementation.
+The example defaults to the supplied source scene and caps material textures at
+512 pixels. `--asset-profile=balanced` selects a locally generated derivative
+under `assets/sponza-optimized/`; it keeps the courtyard, curtains and ivy.
+The derivative uses ordinary glTF 2.0 with indexed float-attribute geometry and
+role-filtered PNGs, not block-compressed GPU textures. Its current cook contains
+6,276,355 triangles and 80 PNGs totaling 34,369,063 bytes, versus 10,809,942
+triangles and 2,180,411,830 PNG bytes in the source. File sizes are not GPU
+residency. Recreate and validate the bundle with:
+
+```powershell
+python scripts/optimize_sponza.py
+python scripts/optimize_sponza.py --verify
+```
+
+The cook leaves originals untouched. The bundle is ignored by Git; derivative
+redistribution permission is not established. Five fixed daytime views passed
+the image comparison, but this is not a complete camera-motion or night
+certification. See `docs/validation.md` for measurement conditions.
 
 SHA-256 of the supplied scene and mesh files:
 

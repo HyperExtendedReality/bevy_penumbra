@@ -111,6 +111,8 @@ float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
     float tolerance = surfaceTolerance(params);
     float3 sum = 0.0;
     float support = 0.0;
+    // Bilinear taps that were evaluated and rejected; the test is deterministic.
+    uint rejectedTaps = 0u;
     [unroll] for (uint tap = 0u; tap < 4u; ++tap) {
         int2 bit = int2(tap & 1u, tap >> 1u);
         int2 samplePixel = base + bit;
@@ -119,7 +121,10 @@ float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
         if (!(weight > 0.0)) continue;
         float3 candidate;
         if (!compositeCompatibleCandidate(samplePixel, targetRaster.xy,
-                                          position, normal, tolerance, candidate)) continue;
+                                          position, normal, tolerance, candidate)) {
+            rejectedTaps |= 1u << tap;
+            continue;
+        }
         sum += candidate * weight;
         support += weight;
     }
@@ -139,6 +144,8 @@ float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
                 float2 delta = (float2(sampleLocal) - local) / float(scale);
                 float distanceSquared = dot(delta, delta);
                 if (distanceSquared > nearestDistanceSquared) continue;
+                if (uint(x) <= 1u && uint(y) <= 1u
+                    && (rejectedTaps & (1u << (uint(x) + 2u * uint(y)))) != 0u) continue;
                 float3 candidate;
                 if (!compositeCompatibleCandidate(samplePixel, targetRaster.xy,
                                                   position, normal, tolerance, candidate)) continue;

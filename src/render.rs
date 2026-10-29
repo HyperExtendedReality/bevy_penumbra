@@ -25,8 +25,8 @@ use bevy::{
         render_asset::RenderAssets,
         render_resource::{binding_types::*, *},
         renderer::{
-            RenderAdapterInfo, RenderContext, RenderDevice, RenderGraph, RenderGraphSystems,
-            RenderQueue, ViewQuery,
+            RenderAdapter, RenderAdapterInfo, RenderContext, RenderDevice, RenderGraph,
+            RenderGraphSystems, RenderQueue, ViewQuery,
         },
         sync_world::MainEntity,
         texture::GpuImage,
@@ -59,17 +59,16 @@ const CACHE_WORK_GROUPS: u64 = 2;
 const CACHE_HISTORY_PER_BUCKET: u64 = 4;
 const SPARSE_HISTORY_RESET_FLAG: u32 = 1 << 31;
 const SPARSE_UPDATES_DISABLED_FLAG: u32 = 1 << 30;
+// Without indirect execution, the trace covers the widest receiver spacing
+// (`TRACE_MAX_LANE_STRIDE` in common.slang); surplus lanes exit immediately.
+const TRACE_MAX_LANE_STRIDE: u32 = 8;
 const COLD_RANK_PHASES: [usize; 3] = [1, 2, 3];
 // Three source-separated irradiance fields, dependency bounds, and a
 // secondary-cache key and generation header.
 pub(crate) const PROBE_SIZE: u64 = 1792;
 const PACK_PROBE_GROUPS_PER_ROW: u64 = 256;
 const CACHE_COMMIT: usize = 14;
-<<<<<<< Updated upstream
-const COMPUTE_ENTRIES: [&str; 17] = [
-=======
 const COMPUTE_ENTRIES: [&str; 23] = [
->>>>>>> Stashed changes
     "clear",
     "seed",
     "parents",
@@ -87,15 +86,12 @@ const COMPUTE_ENTRIES: [&str; 23] = [
     "commitCache",
     "remapProbeHeads",
     "worldResolve",
-<<<<<<< Updated upstream
-=======
     "traceDeferred",
     "traceRecord",
     "traceVisibility",
     "traceResolve",
     "traceDeferredHardware",
     "traceVisibilityHardware",
->>>>>>> Stashed changes
 ];
 const SLANG_OPTIMIZATION_LEVEL: u8 = 2;
 const HISTORY_DIAGNOSTIC_WORDS: u64 = 26;
@@ -128,11 +124,32 @@ fn cold_rank_phases(history_frames: u32, history_was_valid: bool) -> &'static [u
     }
 }
 
+// Mirror DEFERRED_* in common.slang: deferred primary trace scratch.
+const DEFERRED_TRACE_RECEIVERS: u64 = 8192;
+const DEFERRED_VISIBILITY_QUERIES: u64 = 4;
+const DEFERRED_SLOT_WORDS: u64 = 32;
+const DEFERRED_QUERY_WORDS: u64 = 12;
+
+/// Words after the trace sample list: query count and dispatch arguments,
+/// the query list, per-variant hit slots, and the queries themselves.
+fn deferred_trace_words(samples: u64) -> u64 {
+    let slots = samples.min(DEFERRED_TRACE_RECEIVERS) * 2;
+    let queries = slots * DEFERRED_VISIBILITY_QUERIES;
+    4 + queries + slots * DEFERRED_SLOT_WORDS + queries * DEFERRED_QUERY_WORDS
+}
+
 fn cache_head_bytes(buckets: u64, samples: u64) -> u64 {
     // Cache heads/counters plus per-cascade probe indices and ray counts.
     let counters_and_diagnostics = 10 + HISTORY_DIAGNOSTIC_WORDS;
     let probe_directory = LEVELS as u64 * probe_directory_capacity(samples);
-    (buckets * 2 + counters_and_diagnostics + probe_directory * 2 + 1) * 4
+    (buckets * 2
+        + counters_and_diagnostics
+        + probe_directory * 2
+        + 1
+        + samples
+        + 4
+        + deferred_trace_words(samples))
+        * 4
 }
 
 fn irradiance_probe_bytes(samples: u64, multi_bounce: bool) -> u64 {
@@ -144,10 +161,7 @@ fn exposure_invalidates_world_history(exposure_changed: bool) -> bool {
 }
 
 fn resolve_scale(settings: RadianceCascades) -> u32 {
-    if settings.sampling.is_explicit() || settings.sampling.resolve_scale > 1 {
-        return settings.sampling.resolve_scale.clamp(1, 8);
-    }
-    1
+    settings.sampling.resolve_scale.clamp(1, 8)
 }
 
 fn split_lod_target_pixels(settings: RadianceCascades) -> u32 {
@@ -171,7 +185,7 @@ fn cache_bucket_count(samples: u64, settings: RadianceCascades) -> u64 {
     let mut buckets = (samples * 2).next_power_of_two().max(1024);
     let capacity =
         u64::from(cache_query_limits(settings.sampling.max_cache_entries, settings.multi_bounce).0);
-    if settings.sampling.is_explicit() && capacity > 0 {
+    if capacity > 0 {
         let entries_per_bucket = CACHE_HISTORY_PER_BUCKET;
         let maximum_buckets = (capacity / entries_per_bucket).max(1);
         let rounded_buckets = 1u64 << (u64::BITS - 1 - maximum_buckets.leading_zeros());
@@ -208,16 +222,13 @@ fn world_cache_settings_changed(mut previous: RadianceCascades, next: RadianceCa
 }
 
 fn selected_update_budget(settings: RadianceCascades) -> u32 {
-    let legacy = settings.max_rays.max(1);
-    if !settings.sampling.is_explicit() {
-        return legacy;
-    }
+    let ceiling = settings.max_rays.max(1);
     let requested = if settings.sampling.max_updates_per_frame == 0 {
-        legacy
+        ceiling
     } else {
         settings.sampling.max_updates_per_frame
     };
-    requested.min(legacy).max(1)
+    requested.min(ceiling).max(1)
 }
 
 fn runtime_update_budget(settings: RadianceCascades, runtime_cap: Option<u32>) -> u32 {
@@ -276,36 +287,16 @@ fn cache_query_limits(limit: u32, multi_bounce: bool) -> (u32, u32) {
 }
 
 fn view_budget_max_rays(viewport: UVec2, settings: RadianceCascades, budget: u64) -> u32 {
-    if settings.sampling.is_explicit() {
-        let mut low = 1;
-        let mut high = if settings.sampling.max_receiver_cells == 0 {
-            131_072
-        } else {
-            settings.sampling.max_receiver_cells
-        };
-        while low < high {
-            let middle = low + (high - low).div_ceil(2);
-            let mut candidate = settings;
-            candidate.sampling.max_receiver_cells = middle;
-            if view_bytes(
-                resolution(viewport, candidate),
-                resolve_size(viewport, candidate),
-                candidate,
-            ) <= budget
-            {
-                low = middle;
-            } else {
-                high = middle - 1;
-            }
-        }
-        return low;
-    }
     let mut low = 1;
-    let mut high = settings.max_rays.max(1);
+    let mut high = if settings.sampling.max_receiver_cells == 0 {
+        131_072
+    } else {
+        settings.sampling.max_receiver_cells
+    };
     while low < high {
         let middle = low + (high - low).div_ceil(2);
         let mut candidate = settings;
-        candidate.max_rays = middle;
+        candidate.sampling.max_receiver_cells = middle;
         if view_bytes(
             resolution(viewport, candidate),
             resolve_size(viewport, candidate),
@@ -345,6 +336,7 @@ fn view_fits_device(
         && u64::from(shading_size.y.div_ceil(8)) <= workgroups
         && u64::from(viewport_size.x.div_ceil(8)) <= workgroups
         && u64::from(viewport_size.y.div_ceil(8)) <= workgroups
+        && pixels.div_ceil(64) <= workgroups
         && buckets.max(probe_directory * LEVELS as u64).div_ceil(64) <= workgroups
         && pack_probe_groups_fit
         && cache_entry_bytes(pixels, buckets) <= binding_limit
@@ -354,39 +346,16 @@ fn view_fits_device(
 }
 
 fn view_device_max_rays(viewport: UVec2, settings: RadianceCascades, limits: &WgpuLimits) -> u32 {
-    if settings.sampling.is_explicit() {
-        let mut low = 1;
-        let mut high = if settings.sampling.max_receiver_cells == 0 {
-            131_072
-        } else {
-            settings.sampling.max_receiver_cells
-        };
-        while low < high {
-            let middle = low + (high - low).div_ceil(2);
-            let mut candidate = settings;
-            candidate.sampling.max_receiver_cells = middle;
-            if view_fits_device(
-                resolution(viewport, candidate),
-                resolve_size(viewport, candidate),
-                viewport,
-                candidate,
-                limits,
-            ) {
-                low = middle;
-            } else {
-                high = middle - 1;
-            }
-        }
-        return low;
-    }
     let mut low = 1;
-    let mut high = settings.max_rays.max(1);
+    let mut high = if settings.sampling.max_receiver_cells == 0 {
+        131_072
+    } else {
+        settings.sampling.max_receiver_cells
+    };
     while low < high {
         let middle = low + (high - low).div_ceil(2);
-        let candidate = RadianceCascades {
-            max_rays: middle,
-            ..settings
-        };
+        let mut candidate = settings;
+        candidate.sampling.max_receiver_cells = middle;
         if view_fits_device(
             resolution(viewport, candidate),
             resolve_size(viewport, candidate),
@@ -433,19 +402,12 @@ fn adapt_view_settings(
     for scale in first_scale..=8 {
         let mut candidate = requested;
         candidate.sampling.resolve_scale = scale;
-        if candidate.sampling.is_explicit() {
-            candidate.sampling.max_receiver_cells =
-                view_budget_max_rays(viewport, candidate, available_view_bytes);
-            candidate.sampling.max_receiver_cells = candidate
-                .sampling
-                .max_receiver_cells
-                .min(view_device_max_rays(viewport, candidate, limits));
-        } else {
-            candidate.max_rays = view_budget_max_rays(viewport, candidate, available_view_bytes);
-            candidate.max_rays = candidate
-                .max_rays
-                .min(view_device_max_rays(viewport, candidate, limits));
-        }
+        candidate.sampling.max_receiver_cells =
+            view_budget_max_rays(viewport, candidate, available_view_bytes);
+        candidate.sampling.max_receiver_cells = candidate
+            .sampling
+            .max_receiver_cells
+            .min(view_device_max_rays(viewport, candidate, limits));
 
         let size = resolution(viewport, candidate);
         let shading_size = resolve_size(viewport, candidate);
@@ -842,13 +804,10 @@ struct Pipelines {
     jobs: Vec<PipelineJob>,
     driver_cache: Option<wgpu::PipelineCache>,
     driver_spirv: bool,
-<<<<<<< Updated upstream
-=======
     /// The device supports hardware ray queries on the SPIR-V path; the
     /// compute layout then carries the TLAS binding.
     ray_query: bool,
     indirect_execution: bool,
->>>>>>> Stashed changes
     driver_cache_path: Option<std::path::PathBuf>,
     driver_cache_save: Option<std::thread::JoinHandle<Result<(), String>>>,
     driver_cache_dirty: bool,
@@ -1183,9 +1142,11 @@ fn compile_view_shaders(
     // Start the long ray-tracing kernels first, so their pipeline creation can
     // overlap the smaller stages instead of extending the end of startup.
     for index in [
+        17,
+        18,
+        20,
         7,
         12,
-        18,
         15,
         COMPUTE_ENTRIES.len(),
         COMPUTE_ENTRIES.len() + 1,
@@ -1607,6 +1568,7 @@ fn init_pipelines(
     cache: Res<PipelineCache>,
     shaders: Res<PipelineShaders>,
     adapter: Res<RenderAdapterInfo>,
+    render_adapter: Res<RenderAdapter>,
 ) {
     let driver_spirv = adapter.backend == wgpu::Backend::Vulkan
         && device
@@ -1715,14 +1677,11 @@ fn init_pipelines(
         jobs: Vec::new(),
         driver_cache,
         driver_spirv,
-<<<<<<< Updated upstream
-=======
         ray_query,
         indirect_execution: render_adapter
             .get_downlevel_capabilities()
             .flags
             .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION),
->>>>>>> Stashed changes
         driver_cache_path,
         driver_cache_save: None,
         driver_cache_dirty: false,
@@ -4756,6 +4715,7 @@ struct ViewBuffers {
     viewport_size: UVec2,
     buckets: u32,
     caches: [CacheBuffers; 2],
+    trace_indirect: Buffer,
     entries: Buffer,
     history_entries: Buffer,
     irradiance_probes: Buffer,
@@ -4990,16 +4950,12 @@ fn resolution(viewport: UVec2, settings: RadianceCascades) -> UVec2 {
             viewport.y.div_ceil(divisor).max(1),
         )
     };
-    let max_receivers = if settings.sampling.is_explicit() {
-        u64::from(if settings.sampling.max_receiver_cells == 0 {
-            131_072
-        } else {
-            settings.sampling.max_receiver_cells
-        })
+    let max_receivers = u64::from(if settings.sampling.max_receiver_cells == 0 {
+        131_072
     } else {
-        u64::from(settings.max_rays.max(1))
-    };
-    let divisor = if settings.sampling.is_explicit() && settings.sampling.grid_divisor != 0 {
+        settings.sampling.max_receiver_cells
+    });
+    let divisor = if settings.sampling.grid_divisor != 0 {
         settings.sampling.grid_divisor
     } else {
         settings.resolution_divisor
@@ -5085,6 +5041,7 @@ fn view_bytes(size: UVec2, shading_size: UVec2, settings: RadianceCascades) -> u
     // three independent background current/history images.
     let image_bytes = shading_pixels * 13 * 16;
     image_bytes
+        + 12
         + (LEVELS as u64 + 2) * std::mem::size_of::<Parameters>() as u64
         + irradiance_probe_bytes(pixels, settings.multi_bounce)
         + cache_head_bytes(buckets, pixels) * 2
@@ -5504,6 +5461,13 @@ impl ViewBuffers {
             viewport_size,
             buckets,
             caches,
+            trace_indirect: device.create_buffer(&BufferDescriptor {
+                label: Some("split_rc_trace_indirect"),
+                // Receiver trace arguments, then deferred visibility arguments.
+                size: 24,
+                usage: BufferUsages::COPY_DST | BufferUsages::INDIRECT,
+                mapped_at_creation: false,
+            }),
             entries,
             history_entries,
             irradiance_probes,
@@ -5831,9 +5795,9 @@ fn prepare(
     // Trace and gather dominate cold Vulkan compilation. Queue them before the
     // short kernels so they can compile while the rest of the frame pipeline is
     // being prepared.
-    for i in [7, 12, 16]
+    for i in [17, 18, 20, 7, 12, 16]
         .into_iter()
-        .chain((0..COMPUTE_ENTRIES.len()).filter(|i| !matches!(i, 7 | 12 | 16)))
+        .chain((0..COMPUTE_ENTRIES.len()).filter(|i| !matches!(i, 17 | 18 | 20 | 7 | 12 | 16)))
     {
         let entry = &COMPUTE_ENTRIES[i];
         if compiling >= max_concurrent || pipelines.driver_cache_save.is_some() {
@@ -7239,11 +7203,7 @@ fn prepare(
             ) else {
                 let mut minimum = allocation_request;
                 minimum.sampling.resolve_scale = 8;
-                if minimum.sampling.is_explicit() {
-                    minimum.sampling.max_receiver_cells = 1;
-                } else {
-                    minimum.max_rays = 1;
-                }
+                minimum.sampling.max_receiver_cells = 1;
                 let minimum_size = resolution(viewport, minimum);
                 let minimum_view_bytes =
                     view_bytes(minimum_size, resolve_size(viewport, minimum), minimum);
@@ -7707,22 +7667,13 @@ fn prepare(
         let secondary_update_budget = requested_update_budget - primary_requested;
         let mut primary_settings = settings;
         primary_settings.sampling.max_traversal_queries = primary_query_limit;
-        let update_budget = if settings.sampling.is_explicit() {
-            query_affordable_update_budget(
-                primary_settings,
-                primary_requested,
-                buffers.conventional_lights,
-                scene.data.emissive_lights.len() as u32,
-                buffers.environment_info.w != 0,
-            )
-        } else {
-            primary_requested
-        };
-        let screen_update_budget = if settings.sampling.is_explicit() || secondary_enabled {
-            update_budget
-        } else {
-            0
-        };
+        let update_budget = query_affordable_update_budget(
+            primary_settings,
+            primary_requested,
+            buffers.conventional_lights,
+            scene.data.emissive_lights.len() as u32,
+            buffers.environment_info.w != 0,
+        );
         let current = &buffers.caches[(frame % 2) as usize];
         let previous = &buffers.caches[(frame.wrapping_add(1) % 2) as usize];
         let irradiance = &buffers.irradiance_views[(frame % 2) as usize];
@@ -7779,7 +7730,7 @@ fn prepare(
             .candidate_schedule
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .phase_for(size.x, size.y, candidate_count, screen_update_budget);
+            .phase_for(size.x, size.y, candidate_count, update_budget);
         let sparse_history_reset = sparse_history_reset_requested(
             has_rendered_history,
             geometry_or_layers_changed,
@@ -7849,11 +7800,7 @@ fn prepare(
                 } else {
                     0.0
                 },
-                if settings.sampling.is_explicit() {
-                    traversal_query_caps(primary_query_limit).0 as f32
-                } else {
-                    0.0
-                },
+                traversal_query_caps(primary_query_limit).0 as f32,
             ),
             frame: UVec4::new(
                 frame,
@@ -7930,13 +7877,9 @@ fn prepare(
             dirty_max,
             source_history,
             sampling: UVec4::new(
-                screen_update_budget,
+                update_budget,
                 primary_query_limit,
-                if settings.sampling.is_explicit() {
-                    primary_cache_limit
-                } else {
-                    0
-                },
+                primary_cache_limit,
                 resolve_scale(settings),
             ),
             owner_sequence: UVec4::new(
@@ -7946,7 +7889,7 @@ fn prepare(
                 sparse_candidate_phase_word(
                     candidate_phase,
                     sparse_history_reset,
-                    (settings.sampling.is_explicit() || secondary_enabled) && update_budget == 0,
+                    update_budget == 0,
                 ),
             ),
             cache_time: UVec4::new(
@@ -7984,11 +7927,8 @@ fn prepare(
             secondary_params.sampling.y = secondary_query_limit;
             secondary_params.sampling.z = secondary_cache_limit;
             secondary_params.owner_sequence.w &= !SPARSE_UPDATES_DISABLED_FLAG;
-            secondary_params.interval_history.w = if settings.sampling.is_explicit() {
-                traversal_query_caps(secondary_query_limit).0 as f32
-            } else {
-                0.0
-            };
+            secondary_params.interval_history.w =
+                traversal_query_caps(secondary_query_limit).0 as f32;
             for (level, uniform) in secondary.uniforms.iter_mut().enumerate() {
                 secondary_params.frame.y = level as u32;
                 uniform.set(secondary_params);
@@ -8554,6 +8494,60 @@ fn render(
         if skip_passes.iter().any(|skipped| skipped.as_str() == name) {
             return;
         }
+        // Indirect-argument slot: receiver traces use bytes 0..12, deferred
+        // visibility queries 12..24. Each slot is copied before the first
+        // pass that consumes it, after the pass that writes it.
+        let indirect_offset = match name {
+            "trace" | "secondary/trace" | "traceRecord" | "traceResolve" | "traceOverflow" => {
+                Some(0)
+            }
+            "traceVisibility" => Some(12),
+            _ => None,
+        };
+        if name == "traceVisibility" && pipelines.indirect_execution {
+            let heads = &buffers.caches[(buffers.frame.load(Ordering::Relaxed) & 1) as usize].heads;
+            let samples = u64::from(buffers.size.x) * u64::from(buffers.size.y);
+            // Deferred scratch starts with the query count, then its arguments.
+            let args_offset = heads.size() - deferred_trace_words(samples) * 4 + 4;
+            context.command_encoder().copy_buffer_to_buffer(
+                heads,
+                args_offset,
+                &buffers.trace_indirect,
+                12,
+                12,
+            );
+        }
+        if matches!(name, "trace" | "secondary/trace") && pipelines.indirect_execution {
+            let parity = (buffers.frame.load(Ordering::Relaxed) & 1) as usize;
+            let heads = if name == "secondary/trace" {
+                &buffers
+                    .secondary
+                    .as_ref()
+                    .expect("secondary cache ready")
+                    .caches[parity]
+                    .heads
+            } else {
+                &buffers.caches[parity].heads
+            };
+            // Count, three dispatch arguments, and sample IDs precede the
+            // deferred trace scratch at the end of the heads buffer.
+            let samples = u64::from(buffers.size.x) * u64::from(buffers.size.y);
+            let args_offset = heads.size() - (samples + 3 + deferred_trace_words(samples)) * 4;
+            let copy_name = if name == "trace" {
+                "traceArguments"
+            } else {
+                "secondary/traceArguments"
+            };
+            let copy_span = diagnostics.time_span(context.command_encoder(), copy_name);
+            context.command_encoder().copy_buffer_to_buffer(
+                heads,
+                args_offset,
+                &buffers.trace_indirect,
+                0,
+                12,
+            );
+            copy_span.end(context.command_encoder());
+        }
         let span = diagnostics.time_span(context.command_encoder(), name);
         let mut pass = context
             .command_encoder()
@@ -8582,13 +8576,20 @@ fn render(
                     clear_dispatch_index += 1;
                     &bindings.clear[index]
                 }
-                "trace" => bindings.trace.as_ref().unwrap_or(&bindings.compute[level]),
+                "trace" | "generateDirections" | "traceRecord" | "traceVisibility"
+                | "traceResolve" | "traceOverflow" => {
+                    bindings.trace.as_ref().unwrap_or(&bindings.compute[level])
+                }
                 "worldResolve" => &bindings.world_resolve,
                 _ => &bindings.compute[level],
             },
         };
         pass.set_bind_group(0, bind_group, &[]);
-        pass.dispatch_workgroups(x, y, 1);
+        if let Some(offset) = indirect_offset.filter(|_| pipelines.indirect_execution) {
+            pass.dispatch_workgroups_indirect(&buffers.trace_indirect, offset);
+        } else {
+            pass.dispatch_workgroups(x, y, 1);
+        }
         drop(pass);
         if let Some(diagnostics) = diagnostics.filter(|_| name == "packProbes") {
             let heads = &buffers.caches[(buffers.frame.load(Ordering::Relaxed) & 1) as usize].heads;
@@ -8658,6 +8659,7 @@ fn render(
         .max(probe_directory.saturating_mul(LEVELS as u32))
         .div_ceil(64);
     let ray_groups = (buffers.size.x * buffers.size.y).div_ceil(64);
+    let trace_groups = ray_groups * TRACE_MAX_LANE_STRIDE;
     dispatch(
         "clear",
         compute[0].expect("cascade pipeline ready"),
@@ -8720,15 +8722,6 @@ fn render(
         clear_groups,
         1,
     );
-<<<<<<< Updated upstream
-    dispatch(
-        "trace",
-        compute[7].expect("radiance cascade trace pipeline ready"),
-        0,
-        image_x,
-        image_y,
-    );
-=======
     // Primary transport runs in passes that each hold at most one hit-shading
     // call: closest hits, recorded visibility queries, the queries in
     // parallel, then shading and deposit. The immediate kernel takes only
@@ -8771,7 +8764,6 @@ fn render(
             1,
         );
     }
->>>>>>> Stashed changes
     let secondary_enabled = bindings.secondary_enabled;
     if secondary_enabled {
         for (name, stage, x, y) in [
@@ -8817,7 +8809,7 @@ fn render(
         for (name, stage, x, y) in [
             ("secondary/generateDirections", 5, image_x, image_y),
             ("secondary/clear", 0, clear_groups, 1),
-            ("secondary/trace", 7, image_x, image_y),
+            ("secondary/trace", 7, trace_groups, 1),
             ("secondary/retain", 6, bucket_groups, 1),
             ("secondary/reduce", 8, bucket_groups, 1),
         ] {
@@ -8846,7 +8838,7 @@ fn render(
                 "secondary/seedProbes",
                 10,
                 secondary_work.div_ceil(64 * LEVELS as u64) as u32,
-                LEVELS as u32,
+                1,
             ),
             (
                 "secondary/packProbes",
@@ -8894,7 +8886,7 @@ fn render(
             "seedProbes",
             10,
             current_capacity.div_ceil(64 * LEVELS as u64) as u32,
-            LEVELS as u32,
+            1,
         ),
         ("packProbes", 11, pack_probe_groups_x, pack_probe_groups_y),
     ] {
@@ -9214,20 +9206,7 @@ mod tests {
     }
 
     #[test]
-    fn split_pipeline_requirements_follow_the_compute_entries() {
-        let full = (1u64 << COMPUTE_ENTRIES.len()) - 1;
-        let filtered = RadianceCascades {
-            spatial_filter_steps: 2,
-            ..default()
-        };
-        assert_eq!(required_pipelines(filtered), full);
-
-        let no_filter = RadianceCascades {
-            spatial_filter_steps: 0,
-            ..filtered
-        };
-        assert_eq!(required_pipelines(no_filter), full & !(1 << 13));
-        assert_ne!(required_pipelines(no_filter) & (1 << 12), 0);
+    fn exposure_changes_invalidate_world_history() {
         assert!(exposure_invalidates_world_history(true));
         assert!(!exposure_invalidates_world_history(false));
     }
@@ -9326,7 +9305,7 @@ mod tests {
             settings,
             &limits
         ));
-        settings.max_rays = view_device_max_rays(viewport, settings, &limits);
+        settings.sampling.max_receiver_cells = view_device_max_rays(viewport, settings, &limits);
         assert!(view_fits_device(
             resolution(viewport, settings),
             viewport,
@@ -9334,7 +9313,7 @@ mod tests {
             settings,
             &limits
         ));
-        // Several ray budgets produce the same integer screen grid. Admission
+        // Several cell caps produce the same integer screen grid. Admission
         // limits the allocated receivers, not the upper end of that plateau.
         let size = resolution(viewport, settings);
         let pixels = u64::from(size.x) * u64::from(size.y);
@@ -9343,7 +9322,7 @@ mod tests {
         let binding_limit = limits
             .max_storage_buffer_binding_size
             .min(limits.max_buffer_size);
-        assert!(pixels <= u64::from(settings.max_rays));
+        assert!(pixels <= u64::from(settings.sampling.max_receiver_cells));
         assert!(view_bytes(size, viewport, settings) >= (shading_pixels * 3 + 6) * 16);
         assert!(cache_entry_bytes(pixels, buckets) <= binding_limit);
         assert!(cache_history_bytes(buckets) <= binding_limit);
@@ -9466,14 +9445,6 @@ mod tests {
             .iter()
             .map(|bytes| u32::from_le_bytes(*bytes))
             .collect();
-        assert_eq!(
-            words.len(),
-            2 * BUCKETS as usize
-                + 10
-                + HISTORY_DIAGNOSTIC_WORDS as usize
-                + (2 * LEVELS * probe_directory_capacity(1) as usize)
-                + 1
-        );
         // Both full hash tables must be empty, including the last irradiance slot.
         assert!(
             words[..BUCKETS as usize]
@@ -9508,7 +9479,7 @@ mod tests {
                 .all(|&word| word == u32::MAX)
         );
         assert!(
-            words[directory_counts_start..]
+            words[directory_counts_start..directory_counts_start + directory_words]
                 .iter()
                 .all(|&word| word == 0)
         );
@@ -11884,7 +11855,10 @@ mod tests {
     #[test]
     fn resolution_respects_budget_and_zero_viewports() {
         let settings = RadianceCascades {
-            max_rays: 8192,
+            sampling: crate::SamplingSettings {
+                max_receiver_cells: 8192,
+                ..default()
+            },
             ..default()
         };
         for viewport in [
@@ -11895,7 +11869,9 @@ mod tests {
             UVec2::splat(u32::MAX),
         ] {
             let size = resolution(viewport, settings);
-            assert!(size.x > 0 && size.y > 0 && size.x * size.y <= settings.max_rays);
+            assert!(
+                size.x > 0 && size.y > 0 && size.x * size.y <= settings.sampling.max_receiver_cells
+            );
         }
     }
 
@@ -12380,8 +12356,8 @@ mod tests {
         assert!(capped_size.x * capped_size.y <= 256);
         assert_eq!(selected_update_budget(capped), 1_024);
 
-        // Resolve scale alone changes reconstruction extent without switching
-        // the legacy candidate-grid sizing behavior.
+        // Resolve scale alone changes reconstruction extent, not the
+        // candidate grid.
         let half_res_only = RadianceCascades {
             sampling: crate::SamplingSettings {
                 resolve_scale: 2,

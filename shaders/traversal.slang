@@ -11,9 +11,8 @@ static const uint MAX_LEAF_INSTANCES = 4096u;
 
 // A denied traversal is not a miss: treating it as sky or an unoccluded
 // shadow sample would inject energy (or claim false visibility). The ticket
-// counter is reset by the cache-clear pass once per frame. A zero budget keeps
-// legacy settings unbounded while still recording attempts when the buffer is
-// present.
+// counter is reset by the cache-clear pass once per frame. A zero budget is
+// unbounded while still recording attempts when the buffer is present.
 static const uint HIT_QUERY_UNSUPPORTED = 4u;
 #ifndef GI_TRAVERSAL_CHECK
 bool admitTransportQuery(uint admissionLimit) {
@@ -27,12 +26,11 @@ bool admitTransportQuery(uint admissionLimit) {
 
     uint limit = params.sampling.y;
     if (admissionLimit != 0u) limit = min(limit, admissionLimit);
-    uint admitted = heads[admittedIndex].load();
-    [loop] while (admitted < limit) {
-        uint previous = heads[admittedIndex].compareExchange(admitted, admitted + 1u);
-        if (previous == admitted) return true;
-        admitted = previous;
-    }
+    // Every receiver starts its first query together; a compare-exchange retry
+    // loop on this one counter serializes them. Take a ticket and return it
+    // when over the limit: never over-admits, and the final count is exact.
+    if (heads[admittedIndex].add(1u) < limit) return true;
+    heads[admittedIndex].add(0xffffffffu);
     return false;
 }
 uint ordinaryTransportAdmissionLimit() {
@@ -1013,13 +1011,101 @@ bool traceOccluded(float3 origin, float3 direction, float limit,
 #endif
 }
 
+#ifndef GI_TRAVERSAL_CHECK
+// Deferred primary traces run hit shading twice. Recording stores each
+// visibility query instead of tracing it and answers "visible"; that answer
+// is discarded with the rest of the recording run. Queries depend only on
+// the hit and earlier query positions, never on earlier answers, so replay
+// issues the same sequence (or a prefix, when a query is unsupported) and
+// reads the answers the visibility pass stored. Queries beyond the per-slot
+// capacity are traced during replay.
+static const uint VISIBILITY_TRACE = 0u;
+static const uint VISIBILITY_RECORD = 1u;
+static const uint VISIBILITY_REPLAY = 2u;
+static uint visibilityMode = VISIBILITY_TRACE;
+static uint visibilitySlot = 0u;
+static uint visibilityQueries = 0u;
+static const uint VISIBILITY_BLOCKED = 1u;
+static const uint VISIBILITY_SUPPORTED = 2u;
+static const uint VISIBILITY_INTERSECTS_ROOT = 4u;
+
+void storeVisibilityQuery(uint query, float3 origin, float3 direction, float limit,
+                          uint admissionLimit) {
+    uint word = deferredQueryHead(query, params);
+    [unroll] for (uint i = 0u; i < 3u; ++i) {
+        heads[word + i].store(asuint(origin[i]));
+        heads[word + 3u + i].store(asuint(direction[i]));
+    }
+    heads[word + 6u].store(asuint(limit));
+    heads[word + 7u].store(admissionLimit);
+}
+
+// Trace one stored query and keep the root interval its dependency needs.
+void traceVisibilityQuery(uint query) {
+    uint word = deferredQueryHead(query, params);
+    float3 origin, direction;
+    [unroll] for (uint i = 0u; i < 3u; ++i) {
+        origin[i] = asfloat(heads[word + i].load());
+        direction[i] = asfloat(heads[word + 3u + i].load());
+    }
+    bool supported, intersectsRoot;
+    float entry, exit;
+    bool blocked = traceOccluded(origin, direction, asfloat(heads[word + 6u].load()),
+        supported, heads[word + 7u].load(), intersectsRoot, entry, exit);
+    heads[word + 8u].store((blocked ? VISIBILITY_BLOCKED : 0u)
+        | (supported ? VISIBILITY_SUPPORTED : 0u)
+        | (intersectsRoot ? VISIBILITY_INTERSECTS_ROOT : 0u));
+    heads[word + 9u].store(asuint(entry));
+    heads[word + 10u].store(asuint(exit));
+}
+#endif
+
 bool traceOccludedTracked(float3 origin, float3 direction, float limit,
                           out bool querySupported, out DependencyContext dependency,
                           uint admissionLimit = 0u) {
     bool intersectsRoot;
     float entry, exit;
-    bool blocked = traceOccluded(origin, direction, limit, querySupported, admissionLimit,
-                                 intersectsRoot, entry, exit);
+    bool blocked;
+#ifndef GI_TRAVERSAL_CHECK
+    uint deferredQuery = visibilityQueries;
+    if (visibilityMode != VISIBILITY_TRACE) ++visibilityQueries;
+    if (visibilityMode == VISIBILITY_RECORD) {
+        if (deferredQuery < DEFERRED_VISIBILITY_QUERIES)
+            storeVisibilityQuery(visibilitySlot * DEFERRED_VISIBILITY_QUERIES + deferredQuery,
+                                 origin, direction, limit, admissionLimit);
+        querySupported = true;
+        dependency = dependencyEmpty();
+        return false;
+    }
+    bool replayed = false;
+    if (visibilityMode == VISIBILITY_REPLAY && deferredQuery < DEFERRED_VISIBILITY_QUERIES) {
+        uint word = deferredQueryHead(
+            visibilitySlot * DEFERRED_VISIBILITY_QUERIES + deferredQuery, params);
+        float3 recordedOrigin, recordedDirection;
+        [unroll] for (uint i = 0u; i < 3u; ++i) {
+            recordedOrigin[i] = asfloat(heads[word + i].load());
+            recordedDirection[i] = asfloat(heads[word + 3u + i].load());
+        }
+        // The recording ran in another kernel. Use its answer only for the
+        // same ray; any divergence is traced here instead.
+        if (distance(recordedDirection, direction) <= 1e-4
+            && distance(recordedOrigin, origin) <= 1e-4 * max(1.0, length(origin))) {
+            // The dependency segment follows the ray that was actually traced.
+            origin = recordedOrigin;
+            direction = recordedDirection;
+            uint flags = heads[word + 8u].load();
+            blocked = (flags & VISIBILITY_BLOCKED) != 0u;
+            querySupported = (flags & VISIBILITY_SUPPORTED) != 0u;
+            intersectsRoot = (flags & VISIBILITY_INTERSECTS_ROOT) != 0u;
+            entry = asfloat(heads[word + 9u].load());
+            exit = asfloat(heads[word + 10u].load());
+            replayed = true;
+        }
+    }
+    if (!replayed)
+#endif
+    blocked = traceOccluded(origin, direction, limit, querySupported, admissionLimit,
+                            intersectsRoot, entry, exit);
     dependency = dependencyUnknown();
     if (!querySupported) return blocked;
     dependency = dependencyEmpty();

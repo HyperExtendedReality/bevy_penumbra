@@ -475,6 +475,61 @@ uint probeDirectoryBase(uint level, Parameters p) {
 uint rootRayOffsetHead(Parameters p) {
     return probeDirectoryBase(0u, p) + 8u * probeDirectoryCapacity(p);
 }
+uint traceCountHead(Parameters p) {
+    return rootRayOffsetHead(p) + 1u;
+}
+uint traceArgsHead(Parameters p) {
+    return rootRayOffsetHead(p) + 2u;
+}
+// A software-BVH trace is a long chain of dependent loads, and the Split
+// budget selects only a few thousand receivers. Packing them densely leaves
+// too few resident warps to hide that latency, while the pixel grid spreads
+// them over many mostly idle warps that need several waves. Compact traces
+// therefore space receivers so a small budget still dispatches about this
+// many lanes; at or above it each lane traces one receiver.
+static const uint TRACE_TARGET_LANES = 8192u;
+static const uint TRACE_MAX_LANE_STRIDE = 8u;
+uint traceLaneStride(Parameters p) {
+    // A zero budget selects every receiver.
+    if (p.sampling.x == 0u) return 1u;
+    return clamp(TRACE_TARGET_LANES / p.sampling.x, 1u, TRACE_MAX_LANE_STRIDE);
+}
+uint traceSamplesHead(Parameters p) {
+    return rootRayOffsetHead(p) + 5u;
+}
+// Deferred primary trace scratch follows the sample list. The closest-hit
+// pass records each hit and the visibility queries its shading would issue;
+// a separate lean pass traces those queries in parallel; the resolve pass
+// replays shading with the stored answers and deposits the intervals.
+// Mirrors DEFERRED_TRACE_* in render.rs.
+static const uint DEFERRED_TRACE_RECEIVERS = 8192u;
+static const uint DEFERRED_VISIBILITY_QUERIES = 4u; // per receiver variant
+static const uint DEFERRED_SLOT_WORDS = 32u;
+static const uint DEFERRED_QUERY_WORDS = 12u;
+uint deferredTraceCapacity(Parameters p) {
+    return min(p.size.z, DEFERRED_TRACE_RECEIVERS);
+}
+// [query count, three dispatch arguments, query list, variant slots, queries]
+uint deferredQueryCountHead(Parameters p) {
+    return traceSamplesHead(p) + p.size.z;
+}
+uint deferredQueryArgsHead(Parameters p) {
+    return deferredQueryCountHead(p) + 1u;
+}
+uint deferredQueryListHead(Parameters p) {
+    return deferredQueryCountHead(p) + 4u;
+}
+uint deferredSlotHead(uint slot, Parameters p) {
+    return deferredQueryListHead(p)
+        + deferredTraceCapacity(p) * 2u * DEFERRED_VISIBILITY_QUERIES
+        + slot * DEFERRED_SLOT_WORDS;
+}
+uint deferredQueryHead(uint query, Parameters p) {
+    return deferredSlotHead(deferredTraceCapacity(p) * 2u, p) + query * DEFERRED_QUERY_WORDS;
+}
+uint deferredTraceEnd(Parameters p) {
+    return deferredQueryHead(deferredTraceCapacity(p) * 2u * DEFERRED_VISIBILITY_QUERIES, p);
+}
 uint probeDirectoryHead(uint level, uint slot, Parameters p) {
     return probeDirectoryBase(level, p) + slot;
 }

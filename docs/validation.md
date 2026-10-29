@@ -1,7 +1,5 @@
 # Validation
 
-<<<<<<< Updated upstream
-=======
 ## Hardware ray-query traversal — October 29
 
 Same device, driver, scene and settings as the section below. With
@@ -205,7 +203,6 @@ certification is claimed. Records are under `tmp/rendering-before-*`,
 `tmp/rendering-compact-*`, `tmp/assets-*-quality-0-0.json`,
 `tmp/shadow-balanced-benchmark/` and `tmp/workload-*/`.
 
->>>>>>> Stashed changes
 ## Active CPU and Split trace profiling
 
 The Sponza benchmark now records the Split trace pass distribution in
@@ -1517,9 +1514,9 @@ Sponza uses geometric receiver normals for temporal and spatial compatibility,
 validates history depth in the previous camera's projection, and retains history
 through empty Monte Carlo neighborhoods. Cache history capacity includes both
 ray layers. The imported scene uses two-sided native materials to match software
-GI visibility. `bevy_texture_cache` now supplies PNG mip levels, generated in
-linear color space for sRGB images; its disk cache still stores base pixels and
-applies color-space settings and mips separately for each load.
+GI visibility. `bevy_texture_cache` supplies PNG mip levels generated in linear
+color space for sRGB images. The disk cache stores complete mip chains separately
+for sRGB and linear requests; older base-pixel entries are converted on first use.
 
 ### October 10 Sponza performance and temporal pass
 

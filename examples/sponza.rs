@@ -13,6 +13,7 @@ use bevy::{
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     gltf::{GltfAssetLabel, GltfLoaderSettings},
+    light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
     pbr::DefaultOpaqueRendererMethod,
     prelude::*,
     render::{
@@ -42,12 +43,61 @@ use std::{
 const COURTYARD: &str = "NewSponza_Main_glTF_003.gltf";
 const CURTAINS: &str = "NewSponza_Curtains_glTF.gltf";
 const IVY: &str = "NewSponza_IvyGrowth_glTF.gltf";
+const BALANCED_SCENES: [&str; 3] = [
+    "sponza-optimized/NewSponza_Main_glTF_003.gltf",
+    "sponza-optimized/NewSponza_Curtains_glTF.gltf",
+    "sponza-optimized/NewSponza_IvyGrowth_glTF.gltf",
+];
+const GPU_PASS_PATHS: [&str; 8] = [
+    "render/early deferred prepass/elapsed_gpu",
+    "render/gi_receiver_identity/elapsed_gpu",
+    "render/deferred_lighting/elapsed_gpu",
+    "render/smaa/elapsed_gpu",
+    "render/split_rc/generateDirections/elapsed_gpu",
+    "render/split_rc/traceArguments/elapsed_gpu",
+    "render/split_rc/worldResolve/elapsed_gpu",
+    "render/split_rc/composition/elapsed_gpu",
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum AssetProfile {
+    Source,
+    Balanced,
+    Custom,
+}
+
+impl AssetProfile {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Balanced => "balanced",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ShadowProfile {
+    Reference,
+    Balanced,
+}
+
+impl ShadowProfile {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Balanced => "balanced",
+        }
+    }
+}
+
 const TEXTURE_SIZE: u32 = 512;
 // Secondary mesh/environment NEE each use one sample per ray-hit surface.
 const SPONZA_LIGHT_SAMPLES: u32 = 2;
 // Keep the requested Sponza quality profile fixed while measuring its cost.
-const SPONZA_UPDATE_BUDGET: u32 = 8_192;
+const SPONZA_UPDATE_BUDGET: u32 = 2_048;
 const SPONZA_TRAVERSAL_QUERY_BUDGET: u32 = 131_072;
+const SPONZA_GRID_DIVISOR: u32 = 4;
 const SPONZA_RESOLVE_SCALE: u32 = 4;
 const SPONZA_PROBE_SPACING_METERS: f32 = 1.0;
 const SPONZA_INTERVAL_LENGTH_METERS: f32 = 1.6;
@@ -70,6 +120,9 @@ struct Demo {
     first_gi_dispatch_at: Option<std::time::Instant>,
     first_95pct_support_logged: bool,
     scenes: Vec<String>,
+    asset_profile: AssetProfile,
+    shadow_profile: ShadowProfile,
+    capture_raw: bool,
     capture_size: (u32, u32),
     capture_prefix: Option<String>,
     hour: f32,
@@ -140,6 +193,7 @@ struct RawGiDiagnostics {
 
 #[derive(Clone)]
 struct RawGiSample {
+    size: UVec2,
     frame_id: u64,
     dispatch: RadianceCascadesDispatch,
     submitted_at: std::time::Instant,
@@ -274,21 +328,22 @@ struct DebugOverlay;
 fn main() -> AppExit {
     let startup_started = std::time::Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut scenes = [COURTYARD, CURTAINS, IVY].map(str::to_owned).to_vec();
+    let mut scene_override = None;
+    let mut asset_profile = AssetProfile::Source;
+    let mut shadow_profile = ShadowProfile::Balanced;
+    let mut capture_raw = false;
+    let mut explicit_capture = false;
     let mut hour = 12.0;
     let mut capture = false;
     let mut benchmark = false;
     let mut benchmark_windowed = false;
     let mut benchmark_vsync = false;
+    let mut no_vsync = false;
     let mut benchmark_no_gi = false;
     let mut multi_bounce = false;
-<<<<<<< Updated upstream
-    let mut resolution_divisor = SPONZA_RESOLVE_SCALE;
-=======
     let mut cached_hit_sky = false;
     let mut hardware_ray_queries = true;
     let mut resolution_divisor = SPONZA_GRID_DIVISOR;
->>>>>>> Stashed changes
     let mut max_rays = SPONZA_UPDATE_BUDGET;
     let mut max_traversal_queries = SPONZA_TRAVERSAL_QUERY_BUDGET;
     let mut warmup_frames = 120;
@@ -306,7 +361,21 @@ fn main() -> AppExit {
                 !value.is_empty(),
                 "--scene requires a path relative to assets/"
             );
-            scenes = vec![value.to_owned()];
+            scene_override = Some(value.to_owned());
+        } else if let Some(value) = arg.strip_prefix("--asset-profile=") {
+            asset_profile = match value {
+                "source" => AssetProfile::Source,
+                "balanced" => AssetProfile::Balanced,
+                _ => panic!("--asset-profile must be source or balanced"),
+            };
+        } else if let Some(value) = arg.strip_prefix("--shadow-profile=") {
+            shadow_profile = match value {
+                "reference" => ShadowProfile::Reference,
+                "balanced" => ShadowProfile::Balanced,
+                _ => panic!("--shadow-profile must be reference or balanced"),
+            };
+        } else if arg == "--capture-raw" {
+            capture_raw = true;
         } else if let Some(value) = arg.strip_prefix("--time=") {
             hour = value
                 .parse::<f32>()
@@ -317,6 +386,7 @@ fn main() -> AppExit {
             );
         } else if arg == "--capture" {
             capture = true;
+            explicit_capture = true;
         } else if arg == "--capture-moving-sun" {
             capture = true;
             sun_capture = true;
@@ -343,6 +413,8 @@ fn main() -> AppExit {
             benchmark_windowed = true;
         } else if arg == "--benchmark-vsync" {
             benchmark_vsync = true;
+        } else if arg == "--no-vsync" {
+            no_vsync = true;
         } else if arg == "--benchmark-no-gi" {
             benchmark = true;
             benchmark_windowed = true;
@@ -395,10 +467,37 @@ fn main() -> AppExit {
             // Parsed below once capture/benchmark mode is known.
         } else {
             panic!(
-                "Unknown argument {arg}; use --scene=path.gltf, --time=10, --max-rays=1024, --max-traversal-queries=131072, --resolution-divisor=8, --width=160, --height=120, --camera-pose-frame=88 with --capture-stability, --capture-prefix=path, --capture, --capture-motion, --capture-camera-motion, --capture-moving-sun, --capture-stability, --multi-bounce, --benchmark, or --benchmark-offscreen-no-gi"
+                "Unknown argument {arg}; use --scene=path.gltf, --time=10, --max-rays=1024, --max-traversal-queries=131072, --resolution-divisor=8, --width=160, --height=120, --camera-pose-frame=88 with --capture-stability, --capture-prefix=path, --capture, --capture-motion, --capture-camera-motion, --capture-moving-sun, --capture-stability, --multi-bounce, --no-vsync, --benchmark, or --benchmark-offscreen-no-gi"
             );
         }
     }
+    assert!(
+        !capture_raw
+            || ((explicit_capture || stability_capture) && !motion_capture && !sun_capture),
+        "--capture-raw requires --capture or --capture-stability"
+    );
+    let scenes = if let Some(scene) = scene_override {
+        asset_profile = AssetProfile::Custom;
+        vec![scene]
+    } else if asset_profile == AssetProfile::Balanced {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let manifest = assets.join("sponza-optimized/manifest.json");
+        let valid = |path: &Path| std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0);
+        if !valid(&manifest)
+            || BALANCED_SCENES.iter().any(|scene| {
+                let gltf = assets.join(scene);
+                !valid(&gltf) || !valid(&gltf.with_extension("bin"))
+            })
+        {
+            eprintln!(
+                "Balanced Sponza assets are missing or invalid; run python scripts/optimize_sponza.py"
+            );
+            return AppExit::error();
+        }
+        BALANCED_SCENES.map(str::to_owned).to_vec()
+    } else {
+        [COURTYARD, CURTAINS, IVY].map(str::to_owned).to_vec()
+    };
     assert!(
         !sun_capture || (!motion_capture && !stability_capture),
         "--capture-moving-sun cannot be combined with another capture mode"
@@ -427,6 +526,10 @@ fn main() -> AppExit {
             synchronous_pipeline_compilation: false,
             ..default()
         });
+    assert!(
+        !no_vsync || (!capture && !benchmark),
+        "--no-vsync is for the interactive window; windowed benchmarks already request AutoNoVsync"
+    );
     assert!(!(capture && benchmark), "choose --capture or --benchmark");
     if capture || (benchmark && !benchmark_windowed) {
         app.add_plugins(
@@ -450,7 +553,7 @@ fn main() -> AppExit {
                     title: CONTROLS.into(),
                     resolution: WindowResolution::new(capture_size.0, capture_size.1)
                         .with_scale_factor_override(1.0),
-                    present_mode: if benchmark_windowed && !benchmark_vsync {
+                    present_mode: if no_vsync || (benchmark_windowed && !benchmark_vsync) {
                         PresentMode::AutoNoVsync
                     } else {
                         PresentMode::AutoVsync
@@ -476,6 +579,9 @@ fn main() -> AppExit {
             first_gi_dispatch_at: None,
             first_95pct_support_logged: false,
             scenes,
+            asset_profile,
+            shadow_profile,
+            capture_raw,
             capture_size,
             capture_prefix,
             hour,
@@ -706,6 +812,19 @@ fn setup(
             RadianceCascadesGeometry,
         ));
     }
+    let (shadow_size, shadow_cascades) = match demo.shadow_profile {
+        ShadowProfile::Reference => (2048, CascadeShadowConfigBuilder::default().build()),
+        ShadowProfile::Balanced => (
+            2048,
+            CascadeShadowConfigBuilder {
+                num_cascades: 2,
+                maximum_distance: 40.0,
+                ..default()
+            }
+            .build(),
+        ),
+    };
+    commands.insert_resource(DirectionalLightShadowMap { size: shadow_size });
     commands.spawn((
         Sun,
         DirectionalLight {
@@ -713,6 +832,7 @@ fn setup(
             ..default()
         },
         Transform::default(),
+        shadow_cascades,
     ));
     let mut settings = RadianceCascades::low_end();
     apply_sponza_profile(&mut settings, &demo);
@@ -775,8 +895,18 @@ fn setup(
              diagnostics: Res<DiagnosticsStore>,
              status: Res<RadianceCascadesStatus>,
              mut sun_raw: Option<ResMut<SunCaptureRaw>>,
-             views: Query<&RadianceCascades>| {
+             views: Query<&RadianceCascades>,
+             raw_outputs: Query<&RadianceCascadesRawOutput>,
+             images: Res<Assets<Image>>| {
                 let raw_frame = status.take_raw_frame().flatten();
+                let Some(size) = raw_outputs.iter().find_map(|output| {
+                    images.get(&output.0).map(|image| {
+                        UVec2::new(image.texture_descriptor.size.width, image.texture_descriptor.size.height)
+                    })
+                }) else { return };
+                if size.x == 0 || size.y == 0 || event.data.len() != size.x as usize * size.y as usize * 16 {
+                    return;
+                }
                 let diagnostic_value = |name: &str| {
                     diagnostics
                         .iter()
@@ -913,6 +1043,7 @@ fn setup(
                 }
                 let latest_raw_sample = dispatch.zip(raw_frame).map(|(dispatch, frame)| {
                     RawGiSample {
+                        size,
                         frame_id,
                         dispatch,
                         submitted_at: frame.submitted_at,
@@ -1309,6 +1440,7 @@ fn lighting(
     let daylight = direction.y.max(0.0);
     for (mut light, mut transform) in &mut sun {
         light.illuminance = 100_000.0 * daylight;
+        light.shadow_maps_enabled = daylight > 0.0;
         light.color = Color::linear_rgb(1.0, 0.55 + daylight * 0.4, 0.3 + daylight * 0.6);
         *transform = Transform::default().looking_to(-direction, Vec3::Y);
     }
@@ -1340,6 +1472,8 @@ struct PerformanceSamples {
     frame_interval: Vec<f64>,
     main_schedule_cpu: Vec<f64>,
     render_schedule_cpu: Vec<f64>,
+    gpu_pass_points: [Vec<(bevy::platform::time::Instant, f64)>; 8],
+    gpu_pass_last: [Option<bevy::platform::time::Instant>; 8],
     frame_points: Vec<(bevy::platform::time::Instant, f64)>,
     trace_points: Vec<(bevy::platform::time::Instant, f64)>,
     frame_interval_points: Vec<(bevy::platform::time::Instant, f64)>,
@@ -1481,6 +1615,18 @@ fn performance(
                     && d.value().is_some()
             }))
     {
+        for (index, path) in GPU_PASS_PATHS.iter().enumerate() {
+            if let Some(diagnostic) = diagnostics.iter().find(|d| d.path().as_str() == *path) {
+                let last = state.gpu_pass_last[index];
+                for measurement in diagnostic
+                    .measurements()
+                    .filter(|m| last.is_none_or(|t| m.time > t))
+                {
+                    state.gpu_pass_points[index].push((measurement.time, measurement.value));
+                    state.gpu_pass_last[index] = Some(measurement.time);
+                }
+            }
+        }
         if !demo.benchmark_no_gi
             && let Some(measurement) = diagnostics
                 .iter()
@@ -1782,12 +1928,32 @@ fn benchmark_json(
     traversal: &str,
 ) -> String {
     let backend_requested = std::env::var("WGPU_BACKEND").unwrap_or_default();
+    let asset_paths = demo
+        .scenes
+        .iter()
+        .map(|path| json_string(path))
+        .collect::<Vec<_>>()
+        .join(",");
+    let gpu_passes = GPU_PASS_PATHS
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let values = samples.gpu_pass_points[index]
+                .iter()
+                .filter_map(|(time, value)| {
+                    (samples
+                        .measurement_start
+                        .is_some_and(|start| *time >= start)
+                        && samples.measurement_end.is_some_and(|end| *time <= end))
+                    .then_some(*value)
+                })
+                .collect::<Vec<_>>();
+            format!("{}:{}", json_string(path), timing_json(&values))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-<<<<<<< Updated upstream
-        "{{\"schema_version\":13,\"crate_version\":{},\"os\":{},\"architecture\":{},\"requested_backend\":{},\"renderer\":{},\"benchmark_mode\":{},\"present_mode_requested\":{},\"gi_enabled\":{},\"scene\":{{\"name\":\"sponza_courtyard_curtains_ivy\",\"width\":{},\"height\":{},\"shader_path\":{}}},\"transport\":\"Split\",\"settings\":{{\"multi_bounce\":{},\"grid_divisor\":{},\"updates_per_frame\":{},\"max_traversal_queries\":{},\"emissive_samples\":{SPONZA_LIGHT_SAMPLES},\"resolve_scale\":{},\"geometry_upload_bytes_per_frame\":{SPONZA_GEOMETRY_UPLOAD_BYTES_PER_FRAME},\"max_receiver_cells\":{SPONZA_SPLIT_MAX_RECEIVER_CELLS},\"max_cache_entries\":{SPONZA_SPLIT_MAX_CACHE_ENTRIES},\"probe_spacing_m\":{SPONZA_PROBE_SPACING_METERS},\"interval_length_m\":{SPONZA_INTERVAL_LENGTH_METERS},\"history_frames\":64,\"temporal_blend\":0.985,\"scene_gpu_budget_bytes\":{SCENE_GPU_BUDGET},\"atlas_budget_bytes\":{ATLAS_GPU_BUDGET},\"view_gpu_budget_bytes\":{VIEW_GPU_BUDGET}}},\"quality\":{{\"supported_pixels\":{},\"eligible_pixels\":{},\"support_ratio\":{},\"total_pixels\":{},\"frame_id\":{},\"dispatch_sequence\":{},\"scene_revision\":{},\"geometry_revision\":{},\"lighting_revision\":{}}},\"samples\":{{\"warmup_requested\":{},\"warmup_observed\":{},\"measured_gpu_requested\":{},\"measured_interval_s\":{{\"start\":{},\"end\":{}}},\"gi_gpu_ms\":{},\"trace_gpu_ms\":{},\"penumbra_gpu_frame_ms\":{},\"frame_interval_diagnostic_ms\":{},\"main_schedule_cpu_ms\":{},\"render_schedule_cpu_ms\":{}}},\"diagnostics\":{}}}\n",
-=======
         "{{\"schema_version\":14,\"crate_version\":{},\"os\":{},\"architecture\":{},\"requested_backend\":{},\"renderer\":{},\"benchmark_mode\":{},\"present_mode_requested\":{},\"gi_enabled\":{},\"scene\":{{\"name\":\"sponza_courtyard_curtains_ivy\",\"width\":{},\"height\":{},\"shader_path\":{},\"asset_profile\":{},\"asset_paths\":[{asset_paths}]}},\"transport\":\"Split\",\"settings\":{{\"shadow_profile\":{},\"multi_bounce\":{},\"cached_hit_sky\":{},\"hardware_ray_queries\":{},\"traversal\":{},\"grid_divisor\":{},\"updates_per_frame\":{},\"max_traversal_queries\":{},\"emissive_samples\":{SPONZA_LIGHT_SAMPLES},\"resolve_scale\":{},\"geometry_upload_bytes_per_frame\":{SPONZA_GEOMETRY_UPLOAD_BYTES_PER_FRAME},\"max_receiver_cells\":{SPONZA_SPLIT_MAX_RECEIVER_CELLS},\"max_cache_entries\":{SPONZA_SPLIT_MAX_CACHE_ENTRIES},\"probe_spacing_m\":{SPONZA_PROBE_SPACING_METERS},\"interval_length_m\":{SPONZA_INTERVAL_LENGTH_METERS},\"history_frames\":64,\"temporal_blend\":0.985,\"scene_gpu_budget_bytes\":{SCENE_GPU_BUDGET},\"atlas_budget_bytes\":{ATLAS_GPU_BUDGET},\"view_gpu_budget_bytes\":{VIEW_GPU_BUDGET}}},\"quality\":{{\"supported_pixels\":{},\"eligible_pixels\":{},\"support_ratio\":{},\"total_pixels\":{},\"frame_id\":{},\"dispatch_sequence\":{},\"scene_revision\":{},\"geometry_revision\":{},\"lighting_revision\":{}}},\"samples\":{{\"warmup_requested\":{},\"warmup_observed\":{},\"measured_gpu_requested\":{},\"measured_interval_s\":{{\"start\":{},\"end\":{}}},\"gi_gpu_ms\":{},\"trace_gpu_ms\":{},\"penumbra_gpu_frame_ms\":{},\"frame_interval_diagnostic_ms\":{},\"main_schedule_cpu_ms\":{},\"render_schedule_cpu_ms\":{},\"gpu_passes\":{{{gpu_passes}}}}},\"diagnostics\":{}}}\n",
->>>>>>> Stashed changes
         json_string(env!("CARGO_PKG_VERSION")),
         json_string(std::env::consts::OS),
         json_string(std::env::consts::ARCH),
@@ -1811,6 +1977,8 @@ fn benchmark_json(
         renderer
             .map(|metadata| json_string(&metadata.shader_path))
             .unwrap_or_else(|| "null".into()),
+        json_string(demo.asset_profile.name()),
+        json_string(demo.shadow_profile.name()),
         demo.multi_bounce,
         demo.cached_hit_sky,
         demo.hardware_ray_queries,
@@ -1843,11 +2011,78 @@ fn benchmark_json(
     )
 }
 
+fn write_capture_raw(path: &str, demo: &Demo) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let sample = demo
+        .latest_raw_sample
+        .as_ref()
+        .filter(|sample| {
+            Some(sample.dispatch.revisions) == demo.last_gi_dispatch
+                && sample.dispatch.sequence > 0
+                && sample.dispatch.revisions.scene > 0
+                && sample.dispatch.revisions.geometry > 0
+                && sample.dispatch.revisions.lighting > 0
+        })
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "no matching committed raw GI sample",
+            )
+        })?;
+    let width = sample.size.x as usize;
+    let height = sample.size.y as usize;
+    let count = width.checked_mul(height).unwrap_or(0);
+    if count == 0
+        || sample.radiance.len() != count
+        || sample.eligible.len() != count
+        || sample.supported.len() != count
+        || sample
+            .radiance
+            .iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+    {
+        return Err(Error::new(ErrorKind::InvalidData, "invalid raw GI sample"));
+    }
+    let path = Path::new(path);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut pfm = format!("PF\n{width} {height}\n-1.0\n").into_bytes();
+    for row in sample.radiance.chunks_exact(width).rev() {
+        for pixel in row {
+            for value in pixel {
+                pfm.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    std::fs::write(path.with_extension("pfm"), pfm)?;
+    for (extension, supported_only) in [("mask.pgm", true), ("eligible.pgm", false)] {
+        let mut pgm = format!("P5\n{width} {height}\n255\n").into_bytes();
+        pgm.extend(
+            sample
+                .eligible
+                .iter()
+                .zip(&sample.supported)
+                .map(|(&eligible, &supported)| {
+                    if eligible && (!supported_only || supported) {
+                        255
+                    } else {
+                        0
+                    }
+                }),
+        );
+        std::fs::write(path.with_extension(extension), pgm)?;
+    }
+    Ok(())
+}
+
 fn capture_frame(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time<Real>>,
     diagnostics: Res<DiagnosticsStore>,
+    status: Res<RadianceCascadesStatus>,
     mut demo: ResMut<Demo>,
     sun_raw: Option<Res<SunCaptureRaw>>,
     mut exit: MessageWriter<AppExit>,
@@ -1886,6 +2121,12 @@ fn capture_frame(
     {
         return;
     }
+    if demo.capture_raw
+        && demo.capture_stage != 1
+        && status.last_dispatch().map(|dispatch| dispatch.revisions) != demo.last_gi_dispatch
+    {
+        return;
+    }
     demo.requested = true;
     if demo.capture_stage == 0 {
         for diagnostic in diagnostics.iter().filter(|d| {
@@ -1901,6 +2142,13 @@ fn capture_frame(
         || format!("screenshots/sponza_{stage}.png"),
         |prefix| format!("{prefix}_{stage}.png"),
     );
+    if demo.capture_raw && demo.capture_stage != 1 {
+        if let Err(error) = write_capture_raw(&path, &demo) {
+            error!("Could not write Sponza raw capture: {error}");
+            exit.write(AppExit::error());
+            return;
+        }
+    }
     commands
         .spawn(Screenshot::image(demo.target.clone().unwrap()))
         .observe(
@@ -2830,6 +3078,7 @@ fn capture_motion(
 fn capture_stability(
     mut commands: Commands,
     time: Res<Time<Real>>,
+    status: Res<RadianceCascadesStatus>,
     mut demo: ResMut<Demo>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -2855,12 +3104,24 @@ fn capture_stability(
     if demo.loaded != demo.scenes.len() || !demo.gi_ready || demo.requested {
         return;
     }
+    if demo.capture_raw
+        && status.last_dispatch().map(|dispatch| dispatch.revisions) != demo.last_gi_dispatch
+    {
+        return;
+    }
     let frame = demo.stability_frame;
     demo.requested = true;
     let path = demo.capture_prefix.as_ref().map_or_else(
         || format!("screenshots/sponza_src_stability_{frame:03}.png"),
         |prefix| format!("{prefix}_stability_{frame:03}.png"),
     );
+    if demo.capture_raw {
+        if let Err(error) = write_capture_raw(&path, &demo) {
+            error!("Could not write Sponza raw capture: {error}");
+            exit.write(AppExit::error());
+            return;
+        }
+    }
     commands
         .spawn(Screenshot::image(demo.target.clone().unwrap()))
         .observe(
@@ -3413,6 +3674,7 @@ mod tests {
         assert_eq!(motion_light_state(u32::MAX), 4);
 
         let make_sample = |radiance: Vec<[f32; 3]>, supported: bool| RawGiSample {
+            size: bevy::prelude::UVec2::new(radiance.len() as u32, 1),
             frame_id: 1,
             dispatch: RadianceCascadesDispatch {
                 sequence: 1,
@@ -3471,6 +3733,7 @@ mod tests {
     #[test]
     fn light_response_compares_common_support_without_relaxing_coverage_or_residual_gates() {
         let make_sample = |radiance: Vec<[f32; 3]>, supported: Vec<bool>| RawGiSample {
+            size: bevy::prelude::UVec2::new(radiance.len() as u32, 1),
             frame_id: 1,
             dispatch: RadianceCascadesDispatch {
                 sequence: 1,
@@ -3529,6 +3792,7 @@ mod tests {
     #[test]
     fn motion_capture_waits_for_encoded_samples_after_each_history_change() {
         let make_sample = |sequence: u64, lighting: u64, value: f32| RawGiSample {
+            size: bevy::prelude::UVec2::new(32, 1),
             frame_id: sequence,
             dispatch: RadianceCascadesDispatch {
                 sequence,
@@ -3673,6 +3937,7 @@ mod tests {
     #[test]
     fn pending_motion_capture_uses_the_encoded_pose_revisions() {
         let sample = |sequence, geometry, lighting| RawGiSample {
+            size: bevy::prelude::UVec2::ZERO,
             frame_id: sequence,
             dispatch: RadianceCascadesDispatch {
                 sequence,
@@ -3705,6 +3970,7 @@ mod tests {
     #[test]
     fn motion_response_window_and_settled_sample_have_distinct_deadlines() {
         let make_sample = |submitted_at| RawGiSample {
+            size: bevy::prelude::UVec2::new(32, 1),
             frame_id: 1,
             dispatch: RadianceCascadesDispatch {
                 sequence: 1,
@@ -3747,6 +4013,7 @@ mod tests {
     #[test]
     fn motion_capture_support_gate_uses_only_eligible_pixels() {
         let mut sample = RawGiSample {
+            size: bevy::prelude::UVec2::new(20, 1),
             frame_id: 1,
             dispatch: RadianceCascadesDispatch {
                 sequence: 1,
@@ -3877,6 +4144,9 @@ mod tests {
             first_gi_dispatch_at: None,
             first_95pct_support_logged: false,
             scenes: Vec::new(),
+            asset_profile: super::AssetProfile::Source,
+            shadow_profile: super::ShadowProfile::Reference,
+            capture_raw: false,
             capture_size: (640, 360),
             capture_prefix: None,
             hour: 23.0,
@@ -3928,33 +4198,6 @@ mod tests {
         .init_resource::<Assets<StandardMaterial>>()
         .add_message::<AppExit>()
         .add_systems(Update, (controls, capture_motion));
-        let mut profile = RadianceCascades::low_end();
-        apply_sponza_profile(&mut profile, app.world().resource::<Demo>());
-        assert!(profile.multi_bounce);
-        assert_eq!(
-            (profile.probe_spacing, profile.interval_length),
-            (SPONZA_PROBE_SPACING_METERS, SPONZA_INTERVAL_LENGTH_METERS)
-        );
-        let profile_json = benchmark_json(
-            app.world().resource::<Demo>(),
-            &PerformanceSamples::default(),
-            &DiagnosticsStore::default(),
-            None,
-        );
-        assert!(profile_json.contains("\"probe_spacing_m\":1,\"interval_length_m\":1.6"));
-        assert!(profile_json.contains("\"multi_bounce\":true"));
-        assert_eq!(
-            profile.sampling.max_receiver_cells,
-            SPONZA_SPLIT_MAX_RECEIVER_CELLS
-        );
-        assert_eq!(
-            profile.sampling.max_cache_entries,
-            SPONZA_SPLIT_MAX_CACHE_ENTRIES
-        );
-        assert_eq!(
-            (profile.temporal_blend, profile.history_frames),
-            (0.985, 64)
-        );
         let camera = app.world_mut().spawn(RadianceCascades::default()).id();
         app.world_mut()
             .resource_mut::<Time>()
@@ -3978,8 +4221,6 @@ mod tests {
         let gi = app.world().get::<RadianceCascades>(camera).unwrap();
         assert_eq!(gi.intensity, 0.0);
         assert_eq!(gi.history_epoch, 1);
-<<<<<<< Updated upstream
-=======
         // H switches traversal without resetting GI history.
         let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
         keys.reset_all();
@@ -4019,6 +4260,5 @@ mod tests {
             assert_eq!(light.shadow_maps_enabled, shadows, "hour {hour}");
             assert_eq!(light.illuminance > 0.0, shadows, "hour {hour}");
         }
->>>>>>> Stashed changes
     }
 }
