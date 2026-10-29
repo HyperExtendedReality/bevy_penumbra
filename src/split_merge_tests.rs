@@ -5,7 +5,11 @@ fn production_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let source = &source[source.find(start).expect("production section start")..];
     &source[..source.find(end).expect("production section end")]
 }
+const SOURCE_BACKGROUND: u32 = 1;
+const SOURCE_EMISSIVE: u32 = 2;
+const SOURCE_PUNCTUAL: u32 = 4;
 
+const ENTRY_SIZE: usize = 272;
 const MERGE_CASES: &str = r#"
 Entry observed(float radiance, float beta, uint count, uint level) {
     Entry value = (Entry)0;
@@ -58,23 +62,25 @@ void temporalCases() {
     DependencyContext rayDependency = dependencyEmpty();
     dependencyIncludeSegment(rayDependency, float3(0.0), float3(0.0, 0.0, 20000.0), 0.0);
     DependencyContext outgoingDependency = dependencyEmpty();
+    TransportRadiance radiance = (TransportRadiance)0;
     heads[0].store(EMPTY);
     deposit(0u, float3(0.5), float3(0.0), float3(0.0, 0.0, 1.0),
-        hit, float3(0.0), 0u, rayDependency, 0.0, 20000.0, 0.0, outgoingDependency);
+        hit, radiance, 0u, rayDependency, 0.0, 20000.0, 0.0, outgoingDependency);
     mergeEntry(3u);
     results[11] = entries[3].merged;
     heads[0].store(EMPTY);
     hit.distance = 20000.0;
     hit.triangle = 0u;
+    radiance.background = float3(4.0, 2.0, 1.0);
     deposit(0u, float3(0.5), float3(0.0), float3(0.0, 0.0, 1.0),
-        hit, float3(4.0, 2.0, 1.0), 0u, rayDependency, 0.0, 20000.0, 0.0, outgoingDependency);
+        hit, radiance, 0u, rayDependency, 0.0, 20000.0, 0.0, outgoingDependency);
     mergeEntry(3u);
     results[12] = entries[3].merged;
     results[13] = entries[3].dependencyMax;
     entries[3] = (Entry)0;
     hit.errors = HIT_QUERY_UNSUPPORTED;
     deposit(0u, float3(0.5), float3(0.0), float3(0.0, 0.0, 1.0),
-        hit, float3(4.0, 2.0, 1.0), 0u, rayDependency, 0.0, 20000.0, 0.0, outgoingDependency);
+        hit, radiance, 0u, rayDependency, 0.0, 20000.0, 0.0, outgoingDependency);
     results[14] = float4(float(entries[3].samples), float(entries[3].valid), 0.0, 0.0);
 }
 void supportCases() {
@@ -99,7 +105,7 @@ void supportCases() {
         DependencyContext dependency = dependencyEmpty();
         float4 lightDependency = emptyLightHitBounds();
         results[0] = interpolateMergedChildren(int3(0), float3(0.5, 0.0, 0.0),
-            0u, 1u, 0u, false, dependency, lightDependency);
+            0u, 1u, 0u, BACKGROUND_SOURCE, dependency, lightDependency);
         Entry parent = observed(2.0, 0.5, 1u, 0u);
         parent.origin.xyz = float3(1.0, 0.5, 0.5) * spacing(params, 1u, 0u);
         entries[32] = parent;
@@ -147,7 +153,7 @@ void supportCases() {
         DependencyContext dependency = dependencyEmpty();
         float4 lightDependency = emptyLightHitBounds();
         results[7] = interpolateMergedChildren(int3(0), float3(0.5, 0.0, 0.0),
-            0u, 1u, 0u, false, dependency, lightDependency);
+            0u, 1u, 0u, BACKGROUND_SOURCE, dependency, lightDependency);
     } else if (stage == 7u) {
         [loop] for (uint index = 0u; index < 32u; ++index)
             entries[index].merged = float4(0.0, 0.0, 1.0, 0.25);
@@ -157,6 +163,21 @@ void supportCases() {
         entries[32].origin.xyz = float3(0.5) * spacing(params, 1u, 0u);
         mergeEntry(32u);
         results[8] = entries[32].merged;
+    } else if (stage == 8u) {
+        [loop] for (uint index = 0u; index < 32u; ++index)
+            entries[index].merged = 0.0;
+        [unroll] for (uint corner = 1u; corner < 8u; corner += 2u)
+            entries[corner].merged = float4(6.0, 3.0, 1.0, 1.0);
+        DependencyContext dependency = dependencyEmpty();
+        float4 lightHitBounds = emptyLightHitBounds();
+        results[9] = interpolateMergedChildren(int3(0),
+            float3(2e-6, 0.5, 0.5), 0u, 1u, 0u, BACKGROUND_SOURCE,
+            dependency, lightHitBounds);
+        DependencyContext tinyDependency = dependencyEmpty();
+        float4 tinyLightHitBounds = emptyLightHitBounds();
+        results[10] = interpolateMergedChildren(int3(0),
+            float3(0.5e-6, 0.5, 0.5), 0u, 1u, 0u, BACKGROUND_SOURCE,
+            tinyDependency, tinyLightHitBounds);
     }
 }
 void dependencyGeometryCases() {
@@ -213,11 +234,76 @@ void dependencyLightCases() {
         && all(crossingPath.maximum >= params.lightDirtyMin.xyz);
     results[15] = float4(rayCrossesLight ? 1.0 : 0.0,
         lightHitBoundsIntersectLocalLightDirty(outsideHit) ? 1.0 : 0.0,
-        radianceHistoryEligible(crossingPath, outsideHit) ? 1.0 : 0.0,
-        radianceHistoryEligible(crossingPath, emptyLightHitBounds()) ? 1.0 : 0.0);
+        radianceHistoryEligible(crossingPath, outsideHit, PUNCTUAL_SOURCE) ? 1.0 : 0.0,
+        radianceHistoryEligible(crossingPath, emptyLightHitBounds(),
+            PUNCTUAL_SOURCE) ? 1.0 : 0.0);
     results[16] = float4(radianceHistoryEligible(crossingPath,
-        unknownLightHitBounds()) ? 1.0 : 0.0, 0.0, 0.0, 0.0);
+        unknownLightHitBounds(), PUNCTUAL_SOURCE) ? 1.0 : 0.0, 0.0, 0.0, 0.0);
 }
+void emissiveRemovalCases() {
+    uint stage = params.frame.w;
+    if (stage > 6u) return;
+    Entry old = observed(8.0, 0.2, 1u, 0u);
+    old.samples = asuint(4.0);
+    old.origin.w = 4.0;
+    old.emissiveInterval = float4(8.0, 8.0, 8.0, 4.0);
+    old.emissiveMerged = float4(10.0, 10.0, 10.0, 0.8);
+    old.boundaryInterval = lightHitBoundsAt(float3(5.0, 0.0, 0.0));
+    old.boundaryMerged = old.boundaryInterval;
+    DependencyContext dependency = dependencyEmpty();
+    DependencyContext mergedDependency = dependencyEmpty();
+    if (stage == 0u) {
+        // Both raw J and composed I include the sampled source path, although
+        // the outgoing radiance-evaluation hit is outside its source AABB.
+        dependencyIncludeBounds(dependency, float3(-5.0, 0.0, 0.0),
+            float3(5.0, 0.0, 0.0));
+        dependencyIncludeBounds(mergedDependency, float3(-5.0, 0.0, 0.0),
+            float3(5.0, 0.0, 0.0));
+    } else if (stage == 1u) {
+        // Raw J is independent, but the old composed field also depended on
+        // an emissive source in its child cascade.
+        dependencyIncludeBounds(dependency, float3(2.0, -0.1, -0.1),
+            float3(3.0, 0.1, 0.1));
+        dependencyIncludeBounds(mergedDependency, float3(-5.0, 0.0, 0.0),
+            float3(5.0, 0.0, 0.0));
+    } else if (stage == 2u) {
+        dependency = dependencyUnknown();
+        mergedDependency = dependencyUnknown();
+    } else if (stage == 3u) {
+        // A measured black interval remains supported and independent.
+        old.emissiveInterval.xyz = 0.0;
+        old.emissiveMerged = float4(0.0, 0.0, 0.0, 0.8);
+        old.boundaryInterval = emptyLightHitBounds();
+        old.boundaryMerged = emptyLightHitBounds();
+    } else {
+        dependencyIncludeBounds(dependency, float3(2.0, -0.1, -0.1),
+            float3(3.0, 0.1, 0.1));
+        dependencyIncludeBounds(mergedDependency, float3(2.0, -0.1, -0.1),
+            float3(3.0, 0.1, 0.1));
+    }
+    if (stage == 5u || stage == 6u) {
+        old.boundaryInterval = lightHitBoundsAt(float3(2.5, 0.0, 0.0));
+        old.boundaryMerged = old.boundaryInterval;
+    }
+    storeEntryDependency(old, dependency);
+    storeEntryMergedDependency(old, mergedDependency);
+    previousEntries[0] = old;
+    entries[0] = observed(0.0, 0.0, 0u, 0u);
+    entries[0].key = old.key;
+    heads[0].store(EMPTY);
+    retain(uint3(0u, 0u, 0u));
+
+    uint retainedIndex = currentCapacity();
+    results[stage * 3u] = entries[retainedIndex].emissiveMerged;
+    mergeEntry(retainedIndex);
+    results[stage * 3u + 1u] = float4(
+        entries[retainedIndex].emissiveInterval.x,
+        entries[retainedIndex].interval.w,
+        entries[retainedIndex].emissiveInterval.w,
+        entries[retainedIndex].origin.w);
+    results[stage * 3u + 2u] = entries[retainedIndex].emissiveMerged;
+}
+
 void recordLightRevision(uint slot, Entry value) {
     results[slot] = value.interval;
     results[slot + 1u] = float4(asfloat(value.samples), value.origin.w,
@@ -339,8 +425,8 @@ void multiHitLightCases() {
 void globalLightCases() {
     uint retainedIndex = currentCapacity();
     if (params.frame.w == 0u) {
-        // A terminal escape is a measured zero owned by Bevy's direct sky;
-        // keep this actual observation through a global radiometric revision.
+        // A changed background has no local dependency proof: even a previously
+        // measured escape zero becomes unknown until a current observation.
         Entry old = observed(0.0, 0.0, 1u, 0u);
         old.samples = asuint(4.0);
         old.origin.w = 4.0;
@@ -606,6 +692,120 @@ void fourCascadeCases() {
         results[12] = entries[532].merged;
     }
 }
+void sourceSeparatedCases() {
+    uint stage = params.frame.w;
+    uint retainedIndex = currentCapacity();
+    if (stage == 0u) {
+        Entry old = observed(2.0, 0.5, 1u, 0u);
+        old.interval = float4(2.0, 2.0, 2.0, 0.5);
+        old.samples = asuint(4.0);
+        old.origin.w = 4.0;
+        old.merged = float4(4.0, 4.0, 4.0, 0.5);
+        old.emissiveInterval = float4(3.0, 3.0, 3.0, 4.0);
+        old.emissiveMerged = float4(6.0, 6.0, 6.0, 0.5);
+        old.punctualInterval = float4(5.0, 5.0, 5.0, 4.0);
+        old.punctualMerged = float4(10.0, 10.0, 10.0, 0.5);
+        old.boundaryInterval = lightHitBoundsAt(float3(0.5));
+        old.boundaryMerged = old.boundaryInterval;
+        storeEntryDependency(old, dependencyEmpty());
+        storeEntryMergedDependency(old, dependencyEmpty());
+        previousEntries[0] = old;
+    } else if (stage == 1u) {
+        entries[0] = observed(0.0, 1.0, 0u, 0u);
+        entries[0].key = previousEntries[0].key;
+        heads[0].store(EMPTY);
+        retain(uint3(0u, 0u, 0u));
+        mergeEntry(retainedIndex);
+        Entry value = entries[retainedIndex];
+        results[32] = value.interval;
+        results[33] = float4(asfloat(value.samples), value.origin.w,
+            value.emissiveInterval.w, value.punctualInterval.w);
+        results[34] = value.emissiveInterval;
+        results[35] = value.emissiveMerged;
+        results[36] = value.punctualInterval;
+        results[37] = value.punctualMerged;
+    } else if (stage == 2u) {
+        previousEntries[0] = entries[retainedIndex];
+        heads[0].store(EMPTY);
+        retain(uint3(0u, 0u, 0u));
+        mergeEntry(retainedIndex);
+        Entry value = entries[retainedIndex];
+        results[39] = value.punctualInterval;
+        results[40] = value.punctualMerged;
+    } else if (stage == 3u) {
+        previousEntries[0] = entries[retainedIndex];
+        heads[0].store(EMPTY);
+        retain(uint3(0u, 0u, 0u));
+        mergeEntry(retainedIndex);
+        Entry value = entries[retainedIndex];
+        results[54] = value.punctualMerged;
+    } else if (stage == 4u) {
+        previousEntries[0] = entries[retainedIndex];
+        entries[0] = observed(0.0, 1.0, 0u, 0u);
+        entries[0].key = previousEntries[0].key;
+        heads[0].store(EMPTY);
+        retain(uint3(0u, 0u, 0u));
+        mergeEntry(retainedIndex);
+        Entry value = entries[retainedIndex];
+        results[46] = value.punctualInterval;
+        results[47] = value.punctualMerged;
+        results[49] = float4(asfloat(value.samples), value.origin.w,
+            value.emissiveInterval.w, value.punctualInterval.w);
+    } else if (stage == 5u) {
+        previousEntries[0] = entries[retainedIndex];
+        heads[0].store(EMPTY);
+        retain(uint3(0u, 0u, 0u));
+        mergeEntry(retainedIndex);
+        Entry value = entries[retainedIndex];
+        results[50] = value.punctualInterval;
+        results[51] = value.punctualMerged;
+        results[53] = float4(asfloat(value.samples), value.origin.w,
+            value.emissiveInterval.w, value.punctualInterval.w);
+    } else if (stage == 6u) {
+        Entry value = observed(2.0, 0.5, 1u, 0u);
+        value.emissiveInterval = float4(3.0, 3.0, 3.0, 1.0);
+        value.punctualInterval = float4(5.0, 5.0, 5.0, 1.0);
+        value.boundaryInterval = emptyLightHitBounds();
+        value.boundaryMerged = emptyLightHitBounds();
+        storeEntryDependency(value, dependencyEmpty());
+        storeEntryMergedDependency(value, dependencyEmpty());
+        entries[0] = value;
+        heads[0].store(EMPTY);
+        mergeEntry(0u);
+        value = entries[0];
+        results[43] = value.merged;
+        results[44] = value.emissiveMerged;
+        results[45] = value.punctualMerged;
+    }
+}
+void sourceFractionalSupportCases() {
+    // Four angular children, each with two spatial corners in one collision
+    // bucket. Every source has a different support pattern, including black.
+    [unroll] for (uint child = 0u; child < 4u; ++child) {
+        uint direction = (child & 1u) + (child >> 1u) * 16u;
+        [unroll] for (uint corner = 0u; corner < 2u; ++corner) {
+            uint index = child * 2u + corner;
+            entries[index] = observed(0.0, 0.0, 1u, 1u);
+            entries[index].key = int4(int(corner), 0, 0, int(direction | (1u << 12u)));
+            entries[index].next = index + 1u < 8u ? index + 1u : EMPTY;
+            entries[index].merged = corner == 0u
+                ? float4(2.0, 0.0, 0.0, 1.0) : float4(0.0, 0.0, 10.0, 0.25);
+            entries[index].emissiveMerged = corner == 0u
+                ? float4(0.0, 4.0, 0.0, 0.5) : float4(0.0, 0.0, 0.0, 1.0);
+            entries[index].punctualMerged = corner == 0u
+                ? 0.0 : float4(6.0, 6.0, 0.0, 0.5);
+        }
+    }
+    heads[0].store(0u);
+    entries[8] = observed(0.0, 1.0, 1u, 0u);
+    entries[8].origin.xyz = float3(1.0, 0.5, 0.5) * spacing(params, 1u, 0u);
+    entries[8].emissiveInterval.w = 1.0;
+    entries[8].punctualInterval.w = 1.0;
+    mergeEntry(8u);
+    results[0] = entries[8].merged;
+    results[1] = entries[8].emissiveMerged;
+    results[2] = entries[8].punctualMerged;
+}
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void checkMerge(uint3 id : SV_DispatchThreadID) {
@@ -620,7 +820,10 @@ void checkMerge(uint3 id : SV_DispatchThreadID) {
     else if (params.frame.z == 8u) crossFrameLightCases();
     else if (params.frame.z == 9u) betaGeometryCases();
     else if (params.frame.z == 10u) betaGeometryPredicateCases();
-    else betaBlendGeometryCases();
+    else if (params.frame.z == 11u) betaBlendGeometryCases();
+    else if (params.frame.z == 12u) emissiveRemovalCases();
+    else if (params.frame.z == 13u) sourceSeparatedCases();
+    else if (params.frame.z == 14u) sourceFractionalSupportCases();
 }
 "#;
 
@@ -655,9 +858,9 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
             "uint mergeVisibilityAdmissionLimit(",
         ),
         ("uint transportCacheBucket(", "float splitIntervalEnd("),
-        ("float splitIntervalEnd(", "uint probeDirectoryCapacity("),
+        ("float splitIntervalEnd(", "uint probeCountHead("),
         ("uint findEntry(", "uint findIrradianceProbe("),
-        ("float4 interpolateMergedChildren(", "[shader"),
+        ("void interpolateMergedChildSources(", "[shader"),
         ("uint currentCapacity(", "[shader"),
         ("void retain(", "void deposit("),
         ("void reduce(", "void mergeEntry("),
@@ -785,9 +988,11 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
             parameters.dirty_min = Vec4::new(0.0, 0.0, 0.0, 1.0);
             parameters.dirty_max = Vec4::ONE;
         } else if case == 3 {
-            parameters.transport.w = 1.0;
+            parameters.source_history = UVec4::new(SOURCE_PUNCTUAL, SOURCE_PUNCTUAL, 0, 0);
             parameters.light_dirty_min = Vec4::new(0.0, 0.0, 0.0, 1.0);
             parameters.light_dirty_max = Vec4::ONE;
+        } else if case == 14 {
+            parameters.source_history = UVec4::new(SOURCE_EMISSIVE | SOURCE_PUNCTUAL, 0, 0, 0);
         }
         let mut parameters = UniformBuffer::from(parameters);
         parameters.write_buffer(device, queue);
@@ -799,10 +1004,10 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
             })
         };
         let heads = make_buffer("split_merge_heads", &[0u8; 64 * 4]);
-        let entries = make_buffer("split_merge_entries", &[0u8; 1024 * 208]);
+        let entries = make_buffer("split_merge_entries", &[0u8; 1024 * ENTRY_SIZE]);
         let previous_heads = make_buffer("split_merge_previous_heads", &[0u8; 4]);
-        let previous_entries = make_buffer("split_merge_previous_entries", &[0u8; 208]);
-        let output = make_buffer("split_merge_results", &[0u8; 48 * 16]);
+        let previous_entries = make_buffer("split_merge_previous_entries", &[0u8; ENTRY_SIZE]);
+        let output = make_buffer("split_merge_results", &[0u8; 64 * 16]);
         let group = device.create_bind_group(
             "split_merge_regression",
             &pipeline.get_bind_group_layout(0).into(),
@@ -873,17 +1078,8 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
                 let dirty_light = stage == 0 || stage == 4;
                 parameters.get_mut().frame.y = 0;
                 parameters.get_mut().frame.w = stage;
-                parameters.get_mut().transport.w = if dirty_light { 1.0 } else { 0.0 };
-                parameters.get_mut().light_dirty_min = if dirty_light {
-                    Vec4::new(0.25, 0.25, 0.25, 1.0)
-                } else {
-                    Vec4::ZERO
-                };
-                parameters.get_mut().light_dirty_max = if dirty_light {
-                    Vec4::new(0.75, 0.75, 0.75, 1.0)
-                } else {
-                    Vec4::ZERO
-                };
+                parameters.get_mut().source_history =
+                    UVec4::new(0, if dirty_light { SOURCE_BACKGROUND } else { 0 }, 0, 0);
                 parameters.write_buffer(device, queue);
                 let mut encoder =
                     device.create_command_encoder(&CommandEncoderDescriptor::default());
@@ -900,17 +1096,8 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
                 let dirty_light = stage == 3;
                 parameters.get_mut().frame.y = 0;
                 parameters.get_mut().frame.w = stage;
-                parameters.get_mut().transport.w = if dirty_light { 1.0 } else { 0.0 };
-                parameters.get_mut().light_dirty_min = if dirty_light {
-                    Vec4::new(0.70, -0.1, -0.1, 1.0)
-                } else {
-                    Vec4::ZERO
-                };
-                parameters.get_mut().light_dirty_max = if dirty_light {
-                    Vec4::new(0.80, 0.1, 0.1, 1.0)
-                } else {
-                    Vec4::ZERO
-                };
+                parameters.get_mut().source_history =
+                    UVec4::new(0, if dirty_light { SOURCE_BACKGROUND } else { 0 }, 0, 0);
                 parameters.write_buffer(device, queue);
                 let mut encoder =
                     device.create_command_encoder(&CommandEncoderDescriptor::default());
@@ -926,9 +1113,8 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
             for stage in 0..=3 {
                 parameters.get_mut().frame.y = 0;
                 parameters.get_mut().frame.w = stage;
-                parameters.get_mut().transport.w = if stage < 3 { 1.0 } else { 0.0 };
-                parameters.get_mut().light_dirty_min = Vec4::ZERO;
-                parameters.get_mut().light_dirty_max = Vec4::ZERO;
+                parameters.get_mut().source_history =
+                    UVec4::new(0, if stage < 3 { SOURCE_BACKGROUND } else { 0 }, 0, 0);
                 parameters.write_buffer(device, queue);
                 let mut encoder =
                     device.create_command_encoder(&CommandEncoderDescriptor::default());
@@ -945,17 +1131,8 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
                 parameters.get_mut().frame.y = 0;
                 parameters.get_mut().frame.w = stage;
                 let dirty_light = stage == 1;
-                parameters.get_mut().transport.w = if dirty_light { 1.0 } else { 0.0 };
-                parameters.get_mut().light_dirty_min = if dirty_light {
-                    Vec4::new(0.24, -0.01, -0.01, 1.0)
-                } else {
-                    Vec4::ZERO
-                };
-                parameters.get_mut().light_dirty_max = if dirty_light {
-                    Vec4::new(0.26, 0.01, 0.01, 1.0)
-                } else {
-                    Vec4::ZERO
-                };
+                parameters.get_mut().source_history =
+                    UVec4::new(0, if dirty_light { SOURCE_BACKGROUND } else { 0 }, 0, 0);
                 parameters.write_buffer(device, queue);
                 let mut encoder =
                     device.create_command_encoder(&CommandEncoderDescriptor::default());
@@ -1009,15 +1186,11 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
                 parameters.get_mut().frame.y = 0;
                 parameters.get_mut().frame.w = stage;
                 if stage == 0 {
-                    parameters.get_mut().transport.w = 1.0;
-                    parameters.get_mut().light_dirty_min = Vec4::new(0.45, -0.1, -0.1, 1.0);
-                    parameters.get_mut().light_dirty_max = Vec4::new(0.55, 0.1, 0.1, 1.0);
+                    parameters.get_mut().source_history = UVec4::new(0, SOURCE_BACKGROUND, 0, 0);
                     parameters.get_mut().dirty_min = Vec4::ZERO;
                     parameters.get_mut().dirty_max = Vec4::ZERO;
                 } else {
-                    parameters.get_mut().transport.w = 0.0;
-                    parameters.get_mut().light_dirty_min = Vec4::ZERO;
-                    parameters.get_mut().light_dirty_max = Vec4::ZERO;
+                    parameters.get_mut().source_history = UVec4::ZERO;
                     parameters.get_mut().dirty_min = Vec4::new(0.0, -0.1, -0.1, 1.0);
                     parameters.get_mut().dirty_max = Vec4::new(1.0, 0.1, 0.1, 1.0);
                 }
@@ -1035,6 +1208,81 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
             // dispatch_readback performs one final dispatch; stage 2 is inert.
             parameters.get_mut().frame.w = 2;
             parameters.write_buffer(device, queue);
+        } else if case == 12 {
+            for stage in 0..=6 {
+                parameters.get_mut().frame.y = 0;
+                parameters.get_mut().frame.w = stage;
+                parameters.get_mut().source_history = UVec4::new(
+                    SOURCE_EMISSIVE | SOURCE_PUNCTUAL,
+                    if stage < 5 {
+                        SOURCE_EMISSIVE
+                    } else {
+                        SOURCE_EMISSIVE | SOURCE_PUNCTUAL
+                    },
+                    0,
+                    0,
+                );
+                parameters.get_mut().emissive_dirty_min =
+                    Vec4::new(0.45, -0.1, -0.1, if stage == 4 { 0.0 } else { 1.0 });
+                parameters.get_mut().emissive_dirty_max = Vec4::new(0.55, 0.1, 0.1, 0.0);
+                parameters.get_mut().light_dirty_min = if stage == 5 {
+                    Vec4::new(2.4, -0.1, -0.1, 1.0)
+                } else if stage == 6 {
+                    Vec4::new(4.9, -0.1, -0.1, 1.0)
+                } else {
+                    Vec4::ZERO
+                };
+                parameters.get_mut().light_dirty_max = if stage == 5 {
+                    Vec4::new(2.6, 0.1, 0.1, 1.0)
+                } else if stage == 6 {
+                    Vec4::new(5.1, 0.1, 0.1, 1.0)
+                } else {
+                    Vec4::ZERO
+                };
+                parameters.write_buffer(device, queue);
+                let mut encoder =
+                    device.create_command_encoder(&CommandEncoderDescriptor::default());
+                {
+                    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(&pipeline);
+                    pass.set_bind_group(0, &group, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+                queue.submit([encoder.finish()]);
+            }
+            // dispatch_readback performs one final dispatch; stage 7 is inert.
+            parameters.get_mut().frame.w = 7;
+            parameters.write_buffer(device, queue);
+        } else if case == 13 {
+            for stage in 0..=5 {
+                parameters.get_mut().frame.x = 1024 + stage;
+                parameters.get_mut().frame.y = 0;
+                parameters.get_mut().frame.w = stage;
+                parameters.get_mut().history.z = 1.0;
+                parameters.get_mut().source_history = match stage {
+                    0 => UVec4::new(SOURCE_EMISSIVE | SOURCE_PUNCTUAL, 0, 0, 0),
+                    1 => UVec4::new(SOURCE_EMISSIVE | SOURCE_PUNCTUAL, SOURCE_PUNCTUAL, 0, 0),
+                    2 => UVec4::new(SOURCE_EMISSIVE, 0, 0, 0),
+                    3 => UVec4::new(SOURCE_EMISSIVE, 0, 0, 0),
+                    4 => UVec4::new(SOURCE_PUNCTUAL, SOURCE_PUNCTUAL, 0, 0),
+                    _ => UVec4::new(SOURCE_PUNCTUAL, 0, 0, 0),
+                };
+                parameters.write_buffer(device, queue);
+                let mut encoder =
+                    device.create_command_encoder(&CommandEncoderDescriptor::default());
+                {
+                    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(&pipeline);
+                    pass.set_bind_group(0, &group, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+                queue.submit([encoder.finish()]);
+            }
+            parameters.get_mut().frame.w = 6;
+            parameters.get_mut().source_history =
+                UVec4::new(SOURCE_EMISSIVE | SOURCE_PUNCTUAL, 0, 0, 0);
+            parameters.get_mut().history.z = 0.0;
+            parameters.write_buffer(device, queue);
         }
         let bytes = crate::scene::traversal_tests::dispatch_readback(
             device,
@@ -1042,10 +1290,10 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
             &pipeline,
             &group,
             &output,
-            48 * 16,
+            64 * 16,
             1,
         );
-        std::array::from_fn::<_, 48, _>(|index| output_vec4(&bytes, index))
+        std::array::from_fn::<_, 64, _>(|index| output_vec4(&bytes, index))
     };
     let close = |actual: f32, expected: f32| {
         assert!(
@@ -1127,6 +1375,16 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
     close(result[7][3], 0.625);
     close(result[8][0], 0.8);
     close(result[8][2], 0.2);
+    assert!((result[9][0] - 6.0).abs() < 2e-4);
+    assert!(
+        (result[9][3] - 2e-6).abs() < 2e-8,
+        "interpolation preserves positive support below the old corner cutoff"
+    );
+    assert!((result[10][0] - 6.0).abs() < 2e-4);
+    assert!(
+        (result[10][3] - 0.5e-6).abs() < 2e-8,
+        "interpolation preserves support below the old empty-total cutoff"
+    );
     close(result[8][3], 0.625);
 
     let dependency = run(0.5, 0.0, 2);
@@ -1135,9 +1393,9 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
     close(dependency[13][2], 2.0);
 
     let local_light = run(0.5, 0.5, 3);
-    close(local_light[14][0], 2.0);
+    close(local_light[14][0], 6.0);
     close(local_light[14][1], 0.5);
-    close(local_light[14][2], 1.0);
+    close(local_light[14][2], 2.0);
     close(local_light[14][3], 2.0);
     assert_eq!(local_light[15], [1.0, 0.0, 1.0, 1.0]);
     assert_eq!(local_light[16][0], 0.0, "unknown light bounds reject reuse");
@@ -1228,18 +1486,19 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
 
     let global_light = run(0.5, 0.5, 7);
     close(global_light[30][0], 0.0);
-    close(global_light[31][0], 4.0);
+    close(global_light[31][0], 0.0);
     close(global_light[31][1], 4.0);
-    close(global_light[31][2], 1.0);
-    assert_eq!(global_light[32], [0.0, 0.0, 0.0, 1.0]);
+    close(global_light[31][2], 0.0);
+    assert_eq!(global_light[32], [0.0; 4]);
     close(global_light[33][0], 0.0);
-    close(global_light[34][0], 4.0);
+    close(global_light[34][0], 0.0);
     close(global_light[34][1], 4.0);
-    close(global_light[34][2], 1.0);
-    assert_eq!(global_light[35], [0.0, 0.0, 0.0, 1.0]);
+    close(global_light[34][2], 0.0);
+    assert_eq!(global_light[35], [0.0; 4]);
     close(global_light[36][0], 0.0);
     close(global_light[37][0], 0.0);
     close(global_light[37][1], 4.0);
+    close(global_light[37][2], 0.0);
     assert_eq!(global_light[38], [0.0; 4]);
     close(global_light[39][0], 0.0);
     close(global_light[40][0], 0.0);
@@ -1303,4 +1562,105 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
     close(beta_blend[46][0], 0.0);
     close(beta_blend[46][1], 0.0);
     assert_eq!(beta_blend[47][0], 0.0);
+    let emissive = run(0.5, 0.5, 12);
+    assert_eq!(
+        emissive[0], [0.0; 4],
+        "overlapping merged dependencies clear old I during retention"
+    );
+    close(emissive[1][0], 0.0);
+    close(emissive[1][1], 0.2);
+    close(emissive[1][2], 0.0);
+    close(emissive[1][3], 4.0);
+    assert_eq!(
+        emissive[2], [0.0; 4],
+        "overlapping raw dependencies reject J even if old I was retained"
+    );
+    assert_eq!(
+        emissive[3], [0.0; 4],
+        "overlapping merged dependencies clear I even when raw J is disjoint"
+    );
+    close(emissive[4][0], 8.0);
+    close(emissive[4][1], 0.2);
+    close(emissive[4][2], 4.0);
+    close(emissive[4][3], 4.0);
+    assert_eq!(
+        emissive[5],
+        [10.0, 10.0, 10.0, 0.8],
+        "premultiplied J=8 reconstructs conditional mean 10 at support .8"
+    );
+    assert_eq!(
+        emissive[6], [0.0; 4],
+        "unknown dependencies reject local removal reuse"
+    );
+    close(emissive[7][0], 0.0);
+    close(emissive[7][1], 0.2);
+    assert_eq!(emissive[8], [0.0; 4]);
+    assert_eq!(
+        emissive[9],
+        [0.0, 0.0, 0.0, 0.8],
+        "measured black remains supported under source removal"
+    );
+    close(emissive[10][0], 0.0);
+    close(emissive[10][1], 0.2);
+    close(emissive[10][2], 4.0);
+    close(emissive[10][3], 4.0);
+    assert_eq!(emissive[11], [0.0, 0.0, 0.0, 0.8]);
+    assert_eq!(
+        emissive[12], [0.0; 4],
+        "a source change without a safe-removal box remains global"
+    );
+    close(emissive[13][0], 0.0);
+    close(emissive[13][1], 0.2);
+    assert_eq!(emissive[14], [0.0; 4]);
+    assert_eq!(
+        emissive[15],
+        [10.0, 10.0, 10.0, 0.8],
+        "a punctual revision must preserve independent emissive history"
+    );
+    close(emissive[16][0], 8.0);
+    close(emissive[16][1], 0.2);
+    close(emissive[16][2], 4.0);
+    close(emissive[16][3], 4.0);
+    assert_eq!(emissive[17], [10.0, 10.0, 10.0, 0.8]);
+    assert_eq!(
+        emissive[18],
+        [10.0, 10.0, 10.0, 0.8],
+        "both local domains may reuse disjoint dependencies"
+    );
+    close(emissive[19][0], 8.0);
+    close(emissive[19][1], 0.2);
+    close(emissive[19][2], 4.0);
+    close(emissive[19][3], 4.0);
+    assert_eq!(emissive[20], [10.0, 10.0, 10.0, 0.8]);
+
+    let sources = run(0.5, 0.5, 13);
+    assert_eq!(sources[32], [2.0, 2.0, 2.0, 0.5]);
+    assert_eq!(sources[33], [4.0, 4.0, 4.0, 0.0]);
+    assert_eq!(sources[34], [3.0, 3.0, 3.0, 4.0]);
+    assert_eq!(sources[35], [6.0, 6.0, 6.0, 0.5]);
+    assert_eq!(sources[36], [0.0; 4]);
+    assert_eq!(sources[37], [0.0; 4]);
+    assert_eq!(sources[39], [0.0; 4]);
+    assert_eq!(sources[40], [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(sources[43], [4.0, 4.0, 4.0, 0.5]);
+    assert_eq!(sources[44], [6.0, 6.0, 6.0, 0.5]);
+    assert_eq!(sources[45], [10.0, 10.0, 10.0, 0.5]);
+    assert_eq!(sources[46], [0.0; 4]);
+    assert_eq!(sources[47], [0.0; 4]);
+    assert_eq!(sources[49], [4.0, 4.0, 0.0, 0.0]);
+    assert_eq!(sources[50], [0.0; 4]);
+    assert_eq!(sources[51], [0.0; 4]);
+    assert_eq!(sources[53], [4.0, 4.0, 0.0, 0.0]);
+    assert_eq!(sources[54], [0.0, 0.0, 0.0, 1.0]);
+
+    let source_children = run(0.5, 0.5, 14);
+    for (actual, expected) in source_children[0].iter().zip([1.6, 0.0, 2.0, 0.625]) {
+        close(*actual, expected);
+    }
+    for (actual, expected) in source_children[1].iter().zip([0.0, 4.0 / 3.0, 0.0, 0.75]) {
+        close(*actual, expected);
+    }
+    for (actual, expected) in source_children[2].iter().zip([6.0, 6.0, 0.0, 0.25]) {
+        close(*actual, expected);
+    }
 }

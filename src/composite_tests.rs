@@ -4,13 +4,15 @@ use bevy::render::render_resource::binding_types::{texture_2d, uniform_buffer};
 
 const CHECK_COMPOSITE: &str = r#"
 #include "composite.slang"
-[[vk::binding(9, 0)]] RWStructuredBuffer<float4> results;
+[[vk::binding(12, 0)]] RWStructuredBuffer<float4> results;
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void checkComposite(uint3 thread : SV_DispatchThreadID) {
     if (any(thread.xy >= params.viewport.zw)) return;
     uint2 pixel = params.viewport.xy + thread.xy;
-    results[thread.y * params.viewport.z + thread.x] = float4(reconstructCompositeGi(pixel), 1.0);
+    results[thread.y * params.viewport.z + thread.x] = float4(
+        reconstructCompositeGi(pixel, depthTexture.Load(int3(pixel, 0)),
+                               gbuffer.Load(int3(pixel, 0))), 1.0);
 }
 "#;
 
@@ -33,11 +35,13 @@ struct CompositeFixture {
     gbuffer: Vec<[u32; 4]>,
     irradiance: Vec<[f32; 4]>,
     receivers: Vec<[f32; 4]>,
+    probes: Vec<([i32; 4], [f32; 3])>,
 }
 
 impl CompositeFixture {
     fn new(scale: u32, origin: UVec2, extent: UVec2) -> Self {
         let mut parameters = temporal_test_parameters(0);
+        parameters.size.z = 16;
         parameters.viewport = UVec4::new(origin.x, origin.y, extent.x, extent.y);
         parameters.sampling.w = scale;
         let full_size = origin + extent;
@@ -53,6 +57,7 @@ impl CompositeFixture {
             gbuffer: vec![[0, 0, 0, 0x0080_0800]; count],
             irradiance: vec![[2.0, 3.0, 5.0, 0.5]; resolve_count],
             receivers: vec![[1.0, 2.0, 8_390_656.0, 65_537.0]; resolve_count],
+            probes: Vec::new(),
         }
     }
 
@@ -160,6 +165,47 @@ impl CompositeFixture {
         );
         let mut parameters = UniformBuffer::from(self.parameters);
         parameters.write_buffer(device, queue);
+        let capacity = (self.parameters.size.z * 4).next_power_of_two() as usize;
+        let base = (2 * self.parameters.size.w + 36) as usize;
+        let mut heads = vec![u32::MAX; base + capacity];
+        let mut entries = vec![0u32; self.probes.len().max(1) * 68];
+        let mut directional = vec![0u32; capacity * 2 * 440];
+        for (index, (key, color)) in self.probes.iter().enumerate() {
+            for (word, value) in key.iter().enumerate() {
+                entries[index * 68 + word] = *value as u32;
+            }
+            let mut hash = (key[0] as u32).wrapping_mul(0x8da6_b343)
+                ^ (key[1] as u32).wrapping_mul(0xd816_3841)
+                ^ (key[2] as u32).wrapping_mul(0xcb1a_b31f)
+                ^ (key[3] as u32).wrapping_mul(0x1656_67b1);
+            hash ^= hash >> 16;
+            hash = hash.wrapping_mul(0x7feb_352d);
+            hash ^= hash >> 15;
+            let mut slot = hash as usize & (capacity - 1);
+            while heads[base + slot] != u32::MAX {
+                slot = (slot + 1) & (capacity - 1);
+            }
+            heads[base + slot] = index as u32;
+            for texel in 0..36 {
+                for component in 0..3 {
+                    directional[slot * 440 + texel * 4 + component] = color[component].to_bits();
+                }
+                directional[slot * 440 + texel * 4 + 3] = 1.0f32.to_bits();
+            }
+        }
+        let storage = |label, words: &[u32]| {
+            device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some(label),
+                contents: &words
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect::<Vec<_>>(),
+                usage: BufferUsages::STORAGE,
+            })
+        };
+        let heads = storage("composite_test_probe_heads", &heads);
+        let entries = storage("composite_test_probe_entries", &entries);
+        let directional = storage("composite_test_directional", &directional);
         let output_size = u64::from(self.parameters.viewport.z * self.parameters.viewport.w) * 16;
         let output = device.create_buffer(&BufferDescriptor {
             label: Some("composite_test_output"),
@@ -203,6 +249,18 @@ impl CompositeFixture {
                 },
                 BindGroupEntry {
                     binding: 9,
+                    resource: heads.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 10,
+                    resource: entries.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 11,
+                    resource: directional.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 12,
                     resource: output.as_entire_binding(),
                 },
             ],
@@ -289,6 +347,10 @@ fn gpu_composite_upsample_respects_receiver_geometry_and_support() {
                     "composite.slang",
                     include_str!("../shaders/composite.slang"),
                 ),
+                (
+                    "world_resolve.slang",
+                    include_str!("../shaders/world_resolve.slang"),
+                ),
                 ("composite_check.slang", CHECK_COMPOSITE),
             ],
             &SlangSettings {
@@ -327,6 +389,24 @@ fn gpu_composite_upsample_respects_receiver_geometry_and_support() {
                 (7, texture_2d(TextureSampleType::Uint)),
                 (
                     9,
+                    bevy::render::render_resource::binding_types::storage_buffer_read_only_sized(
+                        false, None,
+                    ),
+                ),
+                (
+                    10,
+                    bevy::render::render_resource::binding_types::storage_buffer_read_only_sized(
+                        false, None,
+                    ),
+                ),
+                (
+                    11,
+                    bevy::render::render_resource::binding_types::storage_buffer_read_only_sized(
+                        false, None,
+                    ),
+                ),
+                (
+                    12,
                     bevy::render::render_resource::binding_types::storage_buffer::<Vec<Vec4>>(
                         false,
                     ),
@@ -436,7 +516,10 @@ fn gpu_composite_upsample_respects_receiver_geometry_and_support() {
         ("source ineligible", [2.0, 3.0, 5.0]),
         ("black", [1.0, 1.5, 2.5]),
         ("no compatible fallback", [0.0; 3]),
-        ("compatible neighbor outside bilinear footprint", [2.0, 3.0, 5.0]),
+        (
+            "compatible neighbor outside bilinear footprint",
+            [2.0, 3.0, 5.0],
+        ),
         ("supported black bilinear suppresses fallback", [0.0; 3]),
         ("target identity", [0.0; 3]),
         ("target normal", [0.0; 3]),
@@ -500,6 +583,36 @@ fn gpu_composite_upsample_respects_receiver_geometry_and_support() {
         }
         assert_rgb(check(&fixture)[output_index], expected, case);
     }
+    // No reduced-resolution anchor lands on this receiver. Resolve the world
+    // field at its own position and normal, rather than returning black or
+    // accepting another receiver's bright screen sample.
+    let mut narrow = CompositeFixture::new(4, UVec2::new(3, 2), UVec2::new(9, 5));
+    narrow
+        .receivers
+        .iter_mut()
+        .for_each(|receiver| receiver[0] = 7.0);
+    for z in -1..=0 {
+        for y in -1..=0 {
+            for x in -1..=0 {
+                narrow.probes.push(([x, y, z, 0], [7.0, 11.0, 13.0]));
+            }
+        }
+    }
+    assert_rgb(
+        check(&narrow)[output_index],
+        [7.0, 11.0, 13.0],
+        "sub-grid receiver uses world probes",
+    );
+    narrow
+        .receivers
+        .iter_mut()
+        .for_each(|receiver| receiver[0] = 1.0);
+    narrow.irradiance.fill([0.0, 0.0, 0.0, 0.5]);
+    assert_rgb(
+        check(&narrow)[output_index],
+        [0.0; 3],
+        "supported black screen result is not replaced by probes",
+    );
     // On a sloped plane, depth must be evaluated at the clamped integer anchor
     // of the final partial tile, not at its off-viewport nominal center.
     let mut edge = CompositeFixture::new(4, UVec2::new(3, 2), UVec2::new(9, 5));

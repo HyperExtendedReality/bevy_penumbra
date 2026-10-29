@@ -17,6 +17,7 @@ struct CheckParameters {
     size: UVec4,
     layers: UVec4,
 }
+const TRACKED_RESULT_SLOTS: usize = 14;
 
 #[derive(Clone, Copy, Debug)]
 struct Ray {
@@ -1265,6 +1266,30 @@ fn trace_gpu_for_layers(
     refit_pipeline: &ComputePipeline,
     layers: &RenderLayers,
 ) -> Vec<u8> {
+    trace_gpu_for_layers_with_targets(
+        data,
+        (rays, &[]),
+        device,
+        queue,
+        pipeline,
+        refit_pipeline,
+        layers,
+    )
+}
+
+fn trace_gpu_for_layers_with_targets(
+    data: &SceneData,
+    (rays, emissive_targets): (&[Ray], &[Option<Vec3>]),
+    device: &bevy::render::renderer::RenderDevice,
+    queue: &bevy::render::renderer::RenderQueue,
+    pipeline: &ComputePipeline,
+    refit_pipeline: &ComputePipeline,
+    layers: &RenderLayers,
+) -> Vec<u8> {
+    assert!(
+        emissive_targets.is_empty() || emissive_targets.len() == rays.len(),
+        "emissive endpoints must match the ray count"
+    );
     let (lights, conventional, selector) = view_lights(data, layers);
     let mut lights = StorageBuffer::from(lights);
     lights.write_buffer(device, queue);
@@ -1311,10 +1336,16 @@ fn trace_gpu_for_layers(
     );
     let values: Vec<_> = rays
         .iter()
-        .flat_map(|ray| {
+        .enumerate()
+        .flat_map(|(index, ray)| {
+            let emitter_target = emissive_targets
+                .get(index)
+                .and_then(|target| *target)
+                .map_or(Vec4::ZERO, |target| target.extend(1.0));
             [
                 ray.origin.extend(ray.limit),
                 ray.direction.extend(u32::from(ray.any_hit) as f32),
+                emitter_target,
             ]
         })
         .collect();
@@ -1322,7 +1353,7 @@ fn trace_gpu_for_layers(
     input.write_buffer(device, queue);
     let output = device.create_buffer(&BufferDescriptor {
         label: Some("traversal_check_output"),
-        size: rays.len() as u64 * 176,
+        size: rays.len() as u64 * TRACKED_RESULT_SLOTS as u64 * 16,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -1367,7 +1398,7 @@ fn trace_gpu_for_layers(
         pipeline,
         &group,
         &output,
-        rays.len() as u64 * 176,
+        rays.len() as u64 * TRACKED_RESULT_SLOTS as u64 * 16,
         (rays.len() as u32).div_ceil(64),
     )
 }
@@ -1436,6 +1467,12 @@ fn check_gpu_for_layers(
                     <= 1e-5 * distance.abs().max(1.0))
             && (words[3] & !expected_errors) == 0
             && (!hit || words[3] == expected_errors);
+        if hit && words[11] != 0 {
+            failures.push(format!(
+                "ray {index}: texture LOD mismatch in slots {:#x}",
+                words[11]
+            ));
+        }
         let valid = accelerated_valid
             && if !hit {
                 expected.is_empty()
@@ -1554,6 +1591,48 @@ fn forced_deep_scene(data: &SceneData, blas: bool) -> SceneData {
     ));
     deep
 }
+fn forced_cyclic_blas_scene(data: &SceneData, instance_index: usize) -> SceneData {
+    let mut malformed = data.clone();
+    let mut nodes = malformed.blas_nodes.as_ref().clone();
+    let root = malformed.instances[instance_index].root as usize;
+    let bounds = nodes[root];
+    // The ray intersects this node, follows its left child back to itself, and
+    // misses the right child. No accepted blocker is found before the step cap.
+    nodes[root] = BvhNode {
+        min: bounds.min,
+        max: bounds.max,
+        first: root as u32,
+        count: 0,
+    };
+    nodes[root + 1] = BvhNode {
+        min: Vec3::splat(100.0),
+        max: Vec3::splat(101.0),
+        first: 0,
+        count: 1,
+    };
+    malformed.blas_words = Arc::new(node_words(&nodes, malformed.nodes.len() as u32));
+    malformed.blas_nodes = Arc::new(nodes);
+    malformed
+}
+
+fn forced_oversized_blas_leaf(data: &SceneData, instance_index: usize) -> SceneData {
+    let mut malformed = data.clone();
+    let mut nodes = malformed.blas_nodes.as_ref().clone();
+    let instance = &malformed.instances[instance_index];
+    let root = instance.root as usize;
+    let bounds = nodes[root];
+    // This requests an enormous range beyond this instance's real primitives;
+    // the shader must clip the scan but cannot claim that a miss was complete.
+    nodes[root] = BvhNode {
+        min: bounds.min,
+        max: bounds.max,
+        first: instance.first,
+        count: u32::MAX - instance.first,
+    };
+    malformed.blas_words = Arc::new(node_words(&nodes, malformed.nodes.len() as u32));
+    malformed.blas_nodes = Arc::new(nodes);
+    malformed
+}
 
 fn check_masked_traversal(
     device: &bevy::render::renderer::RenderDevice,
@@ -1574,6 +1653,8 @@ fn check_masked_traversal(
         .init_resource::<Assets<Image>>()
         .init_resource::<GiScene>()
         .add_systems(Update, update_scene);
+    app.world_mut()
+        .spawn((Camera::default(), RadianceCascades::default()));
     let alphas = [0u8, 80, 180, 255];
     let rgba = |phase| {
         (0..12)
@@ -1679,7 +1760,7 @@ fn check_masked_traversal(
     let front = app
         .world_mut()
         .spawn((
-            Mesh3d(front_mesh),
+            Mesh3d(front_mesh.clone()),
             MeshMaterial3d(front_material.clone()),
             RadianceCascadesGeometry,
             GlobalTransform::from(Transform::from_scale(Vec3::new(-1.2, 0.7, 1.0))),
@@ -1819,6 +1900,11 @@ fn check_masked_traversal(
                     }
                     continue;
                 }
+                assert_eq!(
+                    words[11], 0,
+                    "texture LOD mismatch in slots {:#x}: phase={phase}, ray={ray:?}",
+                    words[11],
+                );
                 let entity = data.instances[words[2] as usize].entity;
                 let is_front = entity == front;
                 assert!(
@@ -1881,6 +1967,71 @@ fn check_masked_traversal(
         }
     }
     assert!(front_hits > 500 && back_hits > 500 && misses > 500);
+    // Blended surfaces remain in the acceleration structure. Fully transparent
+    // texels must transmit, opaque texels must block, and fractional coverage
+    // must agree statistically for both closest-hit and shadow rays.
+    app.world_mut()
+        .resource_mut::<Assets<StandardMaterial>>()
+        .get_mut(&front_material)
+        .unwrap()
+        .alpha_mode = AlphaMode::Blend;
+    app.world_mut()
+        .resource_mut::<Assets<StandardMaterial>>()
+        .get_mut(&front_material)
+        .unwrap()
+        .base_color = Color::WHITE;
+    app.world_mut()
+        .resource_mut::<Assets<Mesh>>()
+        .get_mut(&front_mesh)
+        .unwrap()
+        .insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[1.0; 4]; 4]);
+    app.update();
+    let data = app.world().resource::<GiScene>().data.clone();
+    assert_eq!(
+        data.instances.len(),
+        2,
+        "blended panel must remain resident"
+    );
+    let records = trace_gpu(&data, &rays, device, queue, pipeline, refit_pipeline);
+    let mut observed = [0usize; 256];
+    let mut totals = [0usize; 256];
+    for (ray, record) in rays.iter().zip(records.as_chunks::<176>().0) {
+        if ray.any_hit && ray.limit > 3.0 {
+            continue;
+        }
+        let words: Vec<_> = record
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| u32::from_le_bytes(*v))
+            .collect();
+        assert_eq!(
+            words[7], 0,
+            "shadow and closest-hit alpha coverage diverged: {ray:?}"
+        );
+        let u = (ray.origin.x / -1.2 + 1.0) * 0.5;
+        let v = (ray.origin.y / 0.7 + 1.0) * 0.5;
+        let uv = affine.transform_point2(Vec2::new(u, v));
+        let tx = (uv.x.rem_euclid(1.0) * 4.0).floor() as usize;
+        let mirrored = uv.y.rem_euclid(2.0);
+        let ty = (mirrored.min(2.0 - mirrored) * 3.0).floor().min(2.0) as usize;
+        let alpha = usize::from(255 - alphas[(tx + ty) % 4]);
+        let front_hit = words[1] != u32::MAX && data.instances[words[2] as usize].entity == front;
+        totals[alpha] += 1;
+        observed[alpha] += usize::from(front_hit);
+        if alpha == 0 || alpha == 255 {
+            assert_eq!(front_hit, alpha == 255, "blend endpoint: {ray:?}");
+        }
+    }
+    for alpha in [75usize, 175] {
+        assert!(totals[alpha] > 100);
+        let fraction = observed[alpha] as f32 / totals[alpha] as f32;
+        assert!(
+            (fraction - alpha as f32 / 255.0).abs() < 0.06,
+            "alpha {alpha}: observed {fraction}, {} samples",
+            totals[alpha]
+        );
+    }
     println!(
         "{} masked/opaque queries through image edits and motion: {front_hits} front, {back_hits} back, {misses} rejected shadows",
         rays.len() * 9
@@ -1922,6 +2073,8 @@ fn gpu_traversal_matches_brute_force_through_motion_and_asset_edits() {
         .init_resource::<Assets<StandardMaterial>>()
         .init_resource::<GiScene>()
         .add_systems(Update, update_scene);
+    app.world_mut()
+        .spawn((Camera::default(), RadianceCascades::default()));
     let cube = app
         .world_mut()
         .resource_mut::<Assets<Mesh>>()
@@ -2186,11 +2339,17 @@ fn gpu_tracked_traversal_bounds_primary_and_nee_dependencies() {
         .init_resource::<Assets<StandardMaterial>>()
         .init_resource::<GiScene>()
         .add_systems(Update, update_scene);
+    app.world_mut()
+        .spawn((Camera::default(), RadianceCascades::default()));
 
     let mesh = app
         .world_mut()
         .resource_mut::<Assets<Mesh>>()
         .add(Rectangle::new(2.0, 2.0));
+    let cycle_mesh = app
+        .world_mut()
+        .resource_mut::<Assets<Mesh>>()
+        .add(Cuboid::default());
     let material = app
         .world_mut()
         .resource_mut::<Assets<StandardMaterial>>()
@@ -2199,13 +2358,31 @@ fn gpu_tracked_traversal_bounds_primary_and_nee_dependencies() {
             double_sided: true,
             ..default()
         });
-    app.world_mut().spawn((
-        Mesh3d(mesh.clone()),
-        MeshMaterial3d(material.clone()),
-        RadianceCascadesGeometry,
-        InheritedVisibility::VISIBLE,
-        GlobalTransform::from(Transform::from_xyz(0.0, 0.0, 1.0)),
-    ));
+    let primary_panel = app
+        .world_mut()
+        .spawn((
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(material.clone()),
+            RadianceCascadesGeometry,
+            InheritedVisibility::VISIBLE,
+            GlobalTransform::from(Transform::from_xyz(0.0, 0.0, 1.0)),
+        ))
+        .id();
+    // Visit this nearer shadow-panel before the real blocker. Its distinct
+    // BLAS loops independently while the farther panel still proves blocked.
+    let cycle_panel = app
+        .world_mut()
+        .spawn((
+            Mesh3d(cycle_mesh),
+            MeshMaterial3d(material.clone()),
+            RadianceCascadesGeometry,
+            InheritedVisibility::VISIBLE,
+            GlobalTransform::from(
+                Transform::from_xyz(2.5, 1.5, 2.0)
+                    .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+            ),
+        ))
+        .id();
     // This separated panel expands the scene root without covering the center
     // primary ray or the unblocked shadow ray at y=0.
     app.world_mut().spawn((
@@ -2218,9 +2395,11 @@ fn gpu_tracked_traversal_bounds_primary_and_nee_dependencies() {
                 .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
         ),
     ));
-    wait_for_blas_builds(&mut app, 1);
-    wait_for_scene_instances(&mut app, 2);
+    wait_for_blas_builds(&mut app, 2);
+    wait_for_scene_instances(&mut app, 3);
     let data = app.world().resource::<GiScene>().data.as_ref().clone();
+    let primary_instance = data.instance_indices[&primary_panel] as usize;
+    let cycle_instance = data.instance_indices[&cycle_panel] as usize;
 
     let options = WgpuSettings::default();
     let resources = block_on(initialize_renderer(
@@ -2310,7 +2489,7 @@ fn gpu_tracked_traversal_bounds_primary_and_nee_dependencies() {
         &RenderLayers::default(),
     );
     let word = |ray: usize, slot: usize, channel: usize| {
-        let index = (ray * 11 + slot) * 16 + channel * 4;
+        let index = (ray * TRACKED_RESULT_SLOTS + slot) * 16 + channel * 4;
         u32::from_le_bytes(bytes[index..index + 4].try_into().unwrap())
     };
     let scalar = |ray: usize, slot: usize, channel: usize| f32::from_bits(word(ray, slot, channel));
@@ -2321,6 +2500,33 @@ fn gpu_tracked_traversal_bounds_primary_and_nee_dependencies() {
             point[axis] >= minimum - 1e-5 && point[axis] <= maximum + 1e-5
         })
     };
+
+    for ray in 0..rays.len() {
+        assert_eq!(
+            [scalar(ray, 11, 0), scalar(ray, 11, 1), scalar(ray, 11, 2)],
+            [2.0, 3.0, 5.0],
+            "directional conventional light contribution belongs to BACKGROUND"
+        );
+        assert_eq!(
+            [scalar(ray, 12, 0), scalar(ray, 12, 1), scalar(ray, 12, 2)],
+            [0.0; 3],
+            "conventional lights do not add radiance to EMISSIVE"
+        );
+        assert_eq!(
+            [scalar(ray, 13, 0), scalar(ray, 13, 1), scalar(ray, 13, 2)],
+            [24.0, 30.0, 36.0],
+            "finite point and spot contributions belong to PUNCTUAL"
+        );
+        assert_eq!(
+            [
+                scalar(ray, 11, 0) + scalar(ray, 13, 0),
+                scalar(ray, 11, 1) + scalar(ray, 13, 1),
+                scalar(ray, 11, 2) + scalar(ray, 13, 2),
+            ],
+            [26.0, 33.0, 41.0],
+            "directional, point, and spot contributions are each counted once"
+        );
+    }
 
     assert_ne!(word(0, 0, 1), u32::MAX, "primary ray must hit its receiver");
     assert_eq!(
@@ -2396,6 +2602,220 @@ fn gpu_tracked_traversal_bounds_primary_and_nee_dependencies() {
         word(3, 3, 2),
         1,
         "root-clipped shadow dependency is known empty"
+    );
+
+    // Keep this endpoint-bias case isolated from the cyclic-BLAS blocker scene.
+    let mut endpoint_app = App::new();
+    endpoint_app
+        .add_plugins(MinimalPlugins)
+        .init_resource::<Assets<Mesh>>()
+        .init_resource::<Assets<StandardMaterial>>()
+        .init_resource::<GiScene>()
+        .add_systems(Update, update_scene);
+    endpoint_app
+        .world_mut()
+        .spawn((Camera::default(), RadianceCascades::default()));
+    let endpoint_mesh = endpoint_app
+        .world_mut()
+        .resource_mut::<Assets<Mesh>>()
+        .add(Rectangle::new(2.0, 2.0));
+    let endpoint_material = endpoint_app
+        .world_mut()
+        .resource_mut::<Assets<StandardMaterial>>()
+        .add(StandardMaterial {
+            cull_mode: None,
+            double_sided: true,
+            emissive: bevy::color::LinearRgba::new(2.0, 1.0, 0.5, 1.0),
+            ..default()
+        });
+    let root_material = endpoint_app
+        .world_mut()
+        .resource_mut::<Assets<StandardMaterial>>()
+        .add(StandardMaterial {
+            cull_mode: None,
+            double_sided: true,
+            ..default()
+        });
+    endpoint_app.world_mut().spawn((
+        Mesh3d(endpoint_mesh.clone()),
+        MeshMaterial3d(endpoint_material),
+        RadianceCascadesGeometry,
+        InheritedVisibility::VISIBLE,
+        GlobalTransform::from(Transform::from_xyz(0.0, 0.0, 1.0)),
+    ));
+    endpoint_app.world_mut().spawn((
+        Mesh3d(endpoint_mesh),
+        MeshMaterial3d(root_material),
+        RadianceCascadesGeometry,
+        InheritedVisibility::VISIBLE,
+        GlobalTransform::from(
+            Transform::from_xyz(5.0, 1.5, 0.5)
+                .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+        ),
+    ));
+    wait_for_blas_builds(&mut endpoint_app, 1);
+    wait_for_scene_instances(&mut endpoint_app, 2);
+    let endpoint_data = endpoint_app
+        .world()
+        .resource::<GiScene>()
+        .data
+        .as_ref()
+        .clone();
+    let source = endpoint_data
+        .emissive_lights
+        .first()
+        .expect("endpoint fixture includes an emissive source");
+    let sample_uv = Vec2::new(0.25, 0.5);
+    let root = sample_uv.x.sqrt();
+    let emitter_target = source.position.truncate()
+        + source.edge1.truncate() * (root * (1.0 - sample_uv.y))
+        + source.edge2.truncate() * (root * sample_uv.y);
+    let target_distance = emitter_target.length();
+    let target_bias = (0.0001f32 * 0.25).min(target_distance * 0.001);
+    let endpoint_rays = [Ray {
+        origin: Vec3::ZERO,
+        direction: emitter_target / target_distance,
+        limit: target_distance - target_bias,
+        any_hit: false,
+    }];
+    let endpoint_bytes = trace_gpu_for_layers_with_targets(
+        &endpoint_data,
+        (&endpoint_rays, &[Some(emitter_target)]),
+        device,
+        queue,
+        &tracked,
+        &refit,
+        &RenderLayers::default(),
+    );
+    let endpoint_word = |slot: usize, channel: usize| {
+        let index = slot * 16 + channel * 4;
+        u32::from_le_bytes(endpoint_bytes[index..index + 4].try_into().unwrap())
+    };
+    assert_eq!(
+        endpoint_word(3, 0),
+        0,
+        "biased NEE shadow query stops before the source"
+    );
+    assert_eq!(
+        endpoint_word(3, 1),
+        1,
+        "biased NEE shadow query remains supported"
+    );
+    assert_eq!(
+        endpoint_word(10, 0),
+        0,
+        "the unbiased target endpoint lies outside the biased visibility segment"
+    );
+    assert_eq!(
+        endpoint_word(10, 1),
+        1,
+        "tracked visibility dependency includes the sampled emitter target"
+    );
+    let cyclic = forced_cyclic_blas_scene(&data, cycle_instance);
+    let exhausted_rays = [
+        Ray {
+            origin: Vec3::new(0.0, 1.5, 2.0),
+            direction: Vec3::X,
+            limit: 3.0,
+            any_hit: false,
+        },
+        Ray {
+            origin: Vec3::new(0.0, 1.5, 2.0),
+            direction: Vec3::X,
+            limit: 10.0,
+            any_hit: false,
+        },
+    ];
+    let exhausted_bytes = trace_gpu_for_layers(
+        &cyclic,
+        &exhausted_rays,
+        device,
+        queue,
+        &tracked,
+        &refit,
+        &RenderLayers::default(),
+    );
+    let exhausted_word = |ray: usize, slot: usize, channel: usize| {
+        let index = (ray * TRACKED_RESULT_SLOTS + slot) * 16 + channel * 4;
+        u32::from_le_bytes(exhausted_bytes[index..index + 4].try_into().unwrap())
+    };
+    assert_eq!(
+        exhausted_word(0, 0, 3) & 4,
+        4,
+        "a first-hit ray through an exhausted BLAS is unsupported"
+    );
+    assert_eq!(
+        exhausted_word(0, 3, 0),
+        0,
+        "an exhausted clear ray is not blocked"
+    );
+    assert_eq!(
+        exhausted_word(0, 3, 1),
+        0,
+        "step-budget exhaustion is not a supported clear result"
+    );
+    assert_eq!(
+        exhausted_word(0, 3, 2),
+        0,
+        "an exhausted shadow query leaves its tracked dependency unknown"
+    );
+    assert_eq!(
+        exhausted_word(1, 3, 0),
+        1,
+        "a later accepted blocker still proves the ray blocked"
+    );
+    assert_eq!(
+        exhausted_word(1, 3, 1),
+        1,
+        "a proven blocker remains supported after an earlier branch exhausts"
+    );
+
+    let oversized = forced_oversized_blas_leaf(&data, primary_instance);
+    let leaf_ray = [Ray {
+        // Travel parallel to the primary panel so its clipped primitive scan
+        // finds no blocker, despite intersecting the leaf bounds.
+        origin: Vec3::new(0.0, 0.0, 1.0),
+        direction: Vec3::X,
+        limit: 10.0,
+        any_hit: false,
+    }];
+    let leaf_bytes = trace_gpu_for_layers(
+        &oversized,
+        &leaf_ray,
+        device,
+        queue,
+        &tracked,
+        &refit,
+        &RenderLayers::default(),
+    );
+    let leaf_word = |slot: usize, channel: usize| {
+        let index = slot * 16 + channel * 4;
+        u32::from_le_bytes(leaf_bytes[index..index + 4].try_into().unwrap())
+    };
+    assert_eq!(
+        leaf_word(0, 1),
+        u32::MAX,
+        "the overlarge leaf fixture misses its actual primitives"
+    );
+    assert_eq!(
+        leaf_word(0, 3) & 4,
+        4,
+        "a clipped closest-hit leaf cannot publish a supported miss"
+    );
+    assert_eq!(
+        leaf_word(3, 0),
+        0,
+        "a clipped shadow leaf miss remains unblocked"
+    );
+    assert_eq!(
+        leaf_word(3, 1),
+        0,
+        "a clipped shadow leaf miss is unsupported"
+    );
+    assert_eq!(
+        leaf_word(3, 2),
+        0,
+        "a clipped shadow leaf miss keeps dependency bounds unknown"
     );
 }
 
@@ -2513,15 +2933,20 @@ fn gpu_shared_edges_and_origin_offsets_are_scale_aware() {
                     diagonal
                 };
                 let origin = Vec3::new(0.0, 0.0, scale * sign);
+                let shorter_limit = if upper {
+                    scale * if sign < 0.0 { 1.0 } else { 2.0 }
+                } else {
+                    scale * 0.5
+                };
                 queries.extend([
                     a.extend(0.0),
                     b.extend(0.0),
                     c.extend(0.0),
-                    origin.extend(0.0),
-                    Vec3::new(0.0, 0.0, -sign).extend(0.0),
+                    origin.extend(scale * 2.0),
+                    Vec3::new(0.0, 0.0, -sign).extend(shorter_limit),
                     Vec3::new(0.0, 0.0, sign).extend(0.0),
                 ]);
-                expected.push((scale, origin, sign));
+                expected.push((scale, origin, sign, upper));
             }
         }
     }
@@ -2556,13 +2981,14 @@ fn gpu_shared_edges_and_origin_offsets_are_scale_aware() {
         .iter()
         .map(|b| f32::from_le_bytes(*b))
         .collect::<Vec<_>>();
-    for (case, (scale, origin, sign)) in expected.iter().enumerate() {
+    for (case, (scale, origin, sign, should_intersect)) in expected.iter().enumerate() {
         let result = &floats[case * 8..case * 8 + 8];
         assert!(
             (result[0] / scale - 1.0).abs() < 1e-5,
             "shared edge missed at scale {scale}: {result:?}"
         );
         assert!(result[1] >= 0.0 && result[2] >= 0.0 && result[1] + result[2] <= 1.0);
+        assert_eq!(result[3], if *should_intersect { 7.0 } else { 1.0 });
         assert!(result[4..7].iter().all(|v| v.is_finite()));
         assert!(
             (result[6] - origin.z) * sign > 0.0,

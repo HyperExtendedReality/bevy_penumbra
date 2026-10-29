@@ -16,8 +16,13 @@ pub(crate) const NO_TEXTURE: u32 = u32::MAX;
 pub(crate) const MATERIAL_WORDS: usize = 8;
 
 pub(crate) fn material_support(material: &StandardMaterial) -> Result<(), &'static str> {
-    if !matches!(material.alpha_mode, AlphaMode::Opaque | AlphaMode::Mask(_)) {
-        return Err("Split Radiance Cascades supports only opaque and alpha-mask materials");
+    if !matches!(
+        material.alpha_mode,
+        AlphaMode::Opaque | AlphaMode::Mask(_) | AlphaMode::Blend | AlphaMode::Premultiplied
+    ) {
+        return Err(
+            "Split Radiance Cascades supports opaque, alpha-mask, and alpha-blended materials",
+        );
     }
     if material.depth_bias != 0.0 {
         return Err("depth bias changes raster receiver depth without changing cascade surfaces");
@@ -134,12 +139,10 @@ pub(crate) fn material_words(
     let base = material.base_color.to_linear().to_vec4();
     let cutoff = match material.alpha_mode {
         AlphaMode::Opaque => -1.0,
+        AlphaMode::Mask(cutoff) if cutoff < 0.0 => -1.0,
         AlphaMode::Mask(cutoff) => cutoff,
-        _ => {
-            return Err(
-                "Split Radiance Cascades supports only opaque and alpha-mask materials".into(),
-            );
-        }
+        AlphaMode::Blend | AlphaMode::Premultiplied => -2.0,
+        _ => return Err("unsupported alpha mode for Split Radiance Cascades".into()),
     };
     let emission = if material.unlit {
         Vec4::ZERO
@@ -647,7 +650,13 @@ mod tests {
         material.depth_map = Some(Handle::default());
         assert!(material_support(&material).is_err());
         material.depth_map = None;
-        material.alpha_mode = AlphaMode::Blend;
+        for mode in [AlphaMode::Blend, AlphaMode::Premultiplied] {
+            material.alpha_mode = mode;
+            assert!(material_support(&material).is_ok());
+            let words = material_words(&material, &TextureAtlas::default(), None).unwrap();
+            assert_eq!(f32::from_bits(words[1].w), -2.0);
+        }
+        material.alpha_mode = AlphaMode::Add;
         assert!(material_support(&material).is_err());
     }
 
@@ -1057,7 +1066,7 @@ impl TextureCache {
         {
             return Err(reason.clone());
         }
-        match self.rebuild(ids.clone(), images, options, changed) {
+        match self.rebuild(&ids, images, options, changed) {
             Ok(()) => {
                 self.failed = None;
                 self.permanent_failure = false;
@@ -1075,7 +1084,7 @@ impl TextureCache {
 
     fn rebuild(
         &mut self,
-        ids: Vec<AssetId<Image>>,
+        ids: &[AssetId<Image>],
         images: Option<&Assets<Image>>,
         options: &TextureOptions,
         changed: bool,
@@ -1084,7 +1093,7 @@ impl TextureCache {
             return Ok(());
         }
         let mut keys = Vec::new();
-        for &id in &ids {
+        for &id in ids {
             let image = images
                 .and_then(|images| images.get(id))
                 .ok_or_else(|| format!("texture {id:?} is not resident"))?;
@@ -1103,7 +1112,7 @@ impl TextureCache {
             return Ok(());
         }
         let mut decoded_bytes = 0usize;
-        for &id in &ids {
+        for &id in ids {
             let image = images
                 .and_then(|images| images.get(id))
                 .expect("checked resident images");
@@ -1156,7 +1165,7 @@ impl TextureCache {
         };
         let mut shelves = Vec::new();
         // shortcut: area-first shelves can still fragment, upgrade to bin packing if failures persist.
-        let mut atlas_ids = ids;
+        let mut atlas_ids = ids.to_vec();
         atlas_ids.sort_by_key(|&id| {
             let size = images
                 .and_then(|images| images.get(id))

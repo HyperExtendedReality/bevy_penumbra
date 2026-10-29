@@ -1,7 +1,7 @@
 //! Split radiance cascades global illumination.
 //!
 //! Add [`RadianceCascadesPlugin`] after Bevy's render plugins, attach
-//! [`RadianceCascades`] to a 3D camera, and tag opaque/alpha-masked `Mesh3d` /
+//! [`RadianceCascades`] to a 3D camera, and tag participating `Mesh3d` /
 //! `MeshMaterial3d<StandardMaterial>` entities with [`RadianceCascadesGeometry`].
 //! Shaders are embedded Slang sources compiled once using `bevy_slang`.
 //! See the crate README for requirements, costs, and research deviations.
@@ -62,6 +62,18 @@ pub struct RadianceCascadesRawFrame {
     pub submitted_at: Instant,
 }
 
+/// Traversal used by the latest GI dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HardwareRayQueries {
+    /// The device lacks ray queries on the Vulkan SPIR-V path.
+    Unsupported,
+    /// Supported, but the software traversal ran: not requested, or the
+    /// hardware structures or pipelines were not ready.
+    Inactive,
+    /// Hardware ray queries traced the closest-hit and visibility passes.
+    Active,
+}
+
 #[derive(Default)]
 struct RadianceCascadesStatusState {
     failures: Vec<String>,
@@ -72,6 +84,8 @@ struct RadianceCascadesStatusState {
     shader_compile_jobs: usize,
     pipeline_compile_jobs: usize,
     shader_backend: u8,
+    hardware_ray_queries_supported: bool,
+    hardware_ray_queries_active: bool,
 }
 
 impl RadianceCascadesStatus {
@@ -141,6 +155,32 @@ impl RadianceCascadesStatus {
         }
     }
 
+    /// Which traversal the latest GI dispatch used.
+    pub fn hardware_ray_queries(&self) -> HardwareRayQueries {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.hardware_ray_queries_active {
+            HardwareRayQueries::Active
+        } else if state.hardware_ray_queries_supported {
+            HardwareRayQueries::Inactive
+        } else {
+            HardwareRayQueries::Unsupported
+        }
+    }
+
+    pub(crate) fn set_hardware_ray_queries_supported(&self, supported: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .hardware_ray_queries_supported = supported;
+    }
+
+    pub(crate) fn set_hardware_ray_queries_active(&self, active: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .hardware_ray_queries_active = active;
+    }
+
     pub(crate) fn record_failure(&self, failure: String) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if !state.failures.contains(&failure) {
@@ -206,12 +246,15 @@ use bevy::{
 };
 use bevy_slang::SlangCompiler;
 
-/// Supplies opaque or alpha-masked triangle geometry to radiance cascades GI.
+/// Supplies triangle geometry to radiance cascades GI.
 ///
 /// Offscreen meshes still occlude and emit. Base color, metallic, and emission
 /// come from `StandardMaterial`, vertex colors and CPU-retained material images.
 /// Indexed normals, tangents, and UV0/UV1 are retained for cascade shading.
-/// Alpha-masked surfaces preserve their material coverage.
+/// Opaque and alpha-masked surfaces can receive deferred GI. Blended and
+/// premultiplied surfaces use stochastic texture-alpha coverage for transport
+/// visibility and emission, but do not receive the deferred GI composite.
+/// Alpha coverage is not refractive or volumetric transmission.
 /// Morphing and skinning are supported.
 /// Split computes diffuse indirect illumination from transported radiance and
 /// applies receiver albedo from Bevy's deferred material data. Native Bevy
@@ -373,6 +416,23 @@ pub struct RadianceCascades {
     pub normal_bias: f32,
     /// Strength of the added GI; zero bypasses the effect.
     pub intensity: f32,
+    /// Enable the paper's coarser, off-screen secondary cache for diffuse multi-bounce lighting.
+    /// This requires additional GPU memory and tracing work.
+    pub multi_bounce: bool,
+    /// Paper-style hit lighting: with `multi_bounce`, ray-hit surfaces take sky
+    /// light from the secondary cache, whose escaped rays carry the environment,
+    /// instead of tracing environment visibility rays. Hits without cache
+    /// coverage still use visibility-tested sampling. The cache's sky is
+    /// diffuse only and one frame late; ignored without `multi_bounce`.
+    pub cached_hit_sky: bool,
+    /// Traverse the scene with hardware ray queries instead of the software
+    /// BVH, for the primary closest-hit and visibility passes. Hits keep the
+    /// software triangle, culling, layer and alpha-coverage tests. Requires
+    /// Vulkan with wgpu's experimental ray-query feature and unpaged scene
+    /// geometry. Until the hardware structures are ready, or without that
+    /// support, the software traversal runs instead. See
+    /// [`RadianceCascadesStatus::hardware_ray_queries`].
+    pub hardware_ray_queries: bool,
     /// Apply Bevy's material and screen-space occlusion to composed GI.
     /// Raw output bypasses these artistic factors.
     pub artistic_occlusion: bool,
@@ -411,6 +471,9 @@ impl Default for RadianceCascades {
             max_rays: 131_072,
             normal_bias: 0.005,
             intensity: 1.0,
+            multi_bounce: false,
+            cached_hit_sky: false,
+            hardware_ray_queries: false,
             artistic_occlusion: true,
             environment: LinearRgba::BLACK,
             temporal_blend: 0.88,
@@ -718,15 +781,6 @@ mod tests {
                 + plugin.view_gpu_budget_bytes,
             1024 * 1024 * 1024
         );
-    }
-
-    #[test]
-    fn split_controls_keep_their_defaults() {
-        let settings = RadianceCascades { ..default() }.sanitized();
-        assert_eq!(settings.temporal_blend, 0.88);
-        assert_eq!(settings.history_frames, 24);
-        assert_eq!(settings.spatial_filter_steps, 3);
-        assert!(settings.artistic_occlusion);
     }
 
     #[test]

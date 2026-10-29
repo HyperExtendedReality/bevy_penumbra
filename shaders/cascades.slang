@@ -24,8 +24,10 @@
 [[vk::binding(25, 0)]] Texture2D<float4> previousReceiverHistory;
 [[vk::binding(26, 0)]] Texture2D<uint4> rasterReceiver;
 [[vk::binding(27, 0)]] Texture2D<uint4> gbuffer;
-[[vk::binding(32, 0)]] RWStructuredBuffer<Atomic<uint>> rootRayOffset;
 [[vk::binding(37, 0)]] Texture2D<float4> dfgTexture;
+[[vk::binding(38, 0)]] [format("rgba32f")] WTexture2D<float4> backgroundOutput;
+[[vk::binding(39, 0)]] Texture2D<float4> currentBackground;
+[[vk::binding(40, 0)]] Texture2D<float4> previousBackground;
 float2 bsdfDfg(float roughness, float nDotV) {
     uint width, height; dfgTexture.GetDimensions(width, height);
     float2 pixel = float2(saturate(nDotV), max(saturate(roughness), 0.089)) * float2(width, height) - 0.5;
@@ -38,11 +40,11 @@ float2 bsdfDfg(float roughness, float nDotV) {
 }
 #include "bsdf.slang"
 #include "traversal.slang"
-SurfaceBsdf hitSurfaceBsdf(Hit hit) {
+SurfaceBsdf hitSurfaceBsdf(Hit hit, float3 baseColor) {
     float4 properties = asfloat(sceneWord(materialBase(hit) + 2u));
     float4 metalRough = materialSample(hit, 2u);
     SurfaceBsdf material;
-    material.baseColor = materialBaseColor(hit).rgb;
+    material.baseColor = baseColor;
     material.metallic = saturate(properties.x * metalRough.b);
     material.perceptualRoughness = saturate(properties.y * metalRough.g);
     material.reflectance = properties.z;
@@ -98,6 +100,12 @@ float3 emissiveResponseTracked(float3 position, float3 normal, float3 geometricN
         float cosine = max(0.0, dot(normal, lightDirection));
         float emitterCosine = max(0.0, sourceCosine(light, lightDirection));
         if (cosine <= 0 || emitterCosine <= 0 || dot(geometricNormal, lightDirection) <= 0) continue;
+        float3 emission = emitterRadiance(light, float3(1-root, root*(1-uv.y), root*uv.y));
+        if (!any(emission > 0.0)) {
+            // Even a zero sample depends on the selected emitter's material.
+            dependencyIncludeVisibilityTarget(dependency, target);
+            continue;
+        }
         float lightPdf = light.edge1.w * lightDistance * lightDistance / (light.color.w * emitterCosine);
         // Evaluate irradiance at the real surface. Reduce only the visibility
         // ray's offset near the light so bias cannot move it across the emitter.
@@ -112,27 +120,33 @@ float3 emissiveResponseTracked(float3 position, float3 normal, float3 geometricN
         bool blocked = traceOccludedTracked(origin, direction,
             distance - min(params.tuning.z * 0.25, distance * 0.001),
             visibilitySupported, visibilityDependency, admissionLimit);
-        dependencyUnion(dependency, visibilityDependency);
         if (!visibilitySupported) { querySupported = false; return 0.0; }
+        // The visibility query deliberately stops before the emitter to avoid
+        // self-intersection. Keep its known endpoint in the dependency so
+        // emissive-history invalidation covers this sampled source surface.
+        dependencyIncludeVisibilityTarget(visibilityDependency, target);
+        dependencyUnion(dependency, visibilityDependency);
         if (blocked) continue;
         float3 response = scatteringResponse(normal, view, lightDirection, roughness, fullBsdf, material, ab);
-        sum += emitterRadiance(light, float3(1-root, root*(1-uv.y), root*uv.y))
-             * (response * cosine / max(lightPdf, 1e-20));
+        sum += emission * (response * cosine / max(lightPdf, 1e-20));
     }
     return sum / float(count);
 }
 
-float3 punctualResponseTracked(float3 position, float3 normal, float3 geometricNormal,
-                       float3 view, float roughness, out bool querySupported,
+void conventionalLightResponseTracked(float3 position, float3 normal, float3 geometricNormal,
+                       float3 view, float roughness, out float3 background,
+                       out float3 punctual, out bool querySupported,
                        inout DependencyContext dependency, uint admissionLimit,
                        bool fullBsdf, SurfaceBsdf material, float2 ab) {
     querySupported = true;
+    background = 0.0;
+    punctual = 0.0;
     float3 offset = rayOffset(position, geometricNormal, params.tuning.z);
-    float3 diffuse = 0;
     [loop] for (uint i = 0; i < params.frame.w; ++i) {
         Light light = lights[i];
+        bool finiteLight = conventionalLightIsPunctual(light);
         float3 toLight = light.position.xyz; float distance = 1e20, attenuation = 1.0;
-        if (light.position.w > 0) {
+        if (finiteLight) {
             toLight -= position; distance = length(toLight);
             if (distance >= light.position.w || distance < params.tuning.z) continue;
             toLight /= distance;
@@ -151,92 +165,98 @@ float3 punctualResponseTracked(float3 position, float3 normal, float3 geometricN
             bool blocked = traceOccludedTracked(offset, toLight, distance - params.tuning.z,
                 visibilitySupported, visibilityDependency, admissionLimit);
             dependencyUnion(dependency, visibilityDependency);
-            if (!visibilitySupported) { querySupported = false; return 0.0; }
-            if (!blocked)
-                diffuse += light.color.xyz * (attenuation * cosine
-                         * scatteringResponse(normal, view, toLight, roughness, fullBsdf, material, ab));
+            if (!visibilitySupported) { querySupported = false; return; }
+            if (!blocked) {
+                float3 contribution = light.color.xyz * (attenuation * cosine
+                    * scatteringResponse(normal, view, toLight, roughness, fullBsdf, material, ab));
+                addConventionalLightRadiance(background, punctual, finiteLight, contribution);
+            }
         }
     }
-    return diffuse;
 }
 
 float4 splitRasterMetadata(uint2 full);
+TransportRadiance clampOutgoingTransportRadiance(TransportRadiance radiance) {
+    float3 total = radiance.background + radiance.emissive + radiance.punctual;
+    if (!all(isfinite(radiance.background)) || !all(isfinite(radiance.emissive))
+        || !all(isfinite(radiance.punctual)) || !all(isfinite(total)))
+        return (TransportRadiance)0;
+    radiance.background = clampOutgoingRadiance(radiance.background, params);
+    radiance.emissive = clampOutgoingRadiance(radiance.emissive, params);
+    radiance.punctual = clampOutgoingRadiance(radiance.punctual, params);
+    return radiance;
+}
 
-float3 outgoingDirectOnlyTracked(float3 origin, float3 direction, Hit hit,
-                        out bool querySupported,
-                        inout DependencyContext dependency, uint admissionLimit) {
+TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 direction, Hit hit,
+                               out bool querySupported,
+                               inout DependencyContext dependency,
+                               uint admissionLimit = 0u) {
+    TransportRadiance radiance = (TransportRadiance)0;
     querySupported = (hit.errors & HIT_QUERY_UNSUPPORTED) == 0u;
-    if (!querySupported) return 0.0;
-    // Ray-hit surfaces include direct environment through NEE. The primary
-    // visible receiver's direct environment remains native Bevy lighting, so
-    // escaped probe rays contribute supported zero radiance to indirect GI.
+    if (!querySupported) return radiance;
+    // Ray-hit surfaces include direct environment through NEE, or through the
+    // secondary cache with cached hit sky. The primary visible receiver's
+    // direct environment remains native Bevy lighting, so escaped primary
+    // rays contribute supported zero radiance to indirect GI.
     if (hit.triangle == EMPTY) {
         bool escapeSupported;
-        float3 escapeRadiance = outgoingEnvironmentEscape(querySupported, escapeSupported);
+        radiance.background = outgoingEnvironmentEscape(direction, querySupported,
+            escapeSupported);
         querySupported = escapeSupported;
-        return escapeRadiance;
+        return radiance;
     }
-    Triangle triangle = worldTriangle(hit);
-    float3 rayEmission = triangle.emission.xyz;
+    float3 baseColor = materialBaseColor(hit).rgb;
+    // Secondary rays already account for direct emitters through hit-point NEE.
+    if (params.environmentScale.z <= 0.5)
+        radiance.emissive = hitEmission(hit, baseColor);
     if ((sceneWord(instanceBase(hit.instance) + 6u).w & 16u) != 0u)
-        return rayEmission;
+        return clampOutgoingTransportRadiance(radiance);
     float3 position = origin + direction * hit.distance;
     HitAttributes attributes = hitAttributes(hit);
     float3 geometricNormal = attributes.geometricNormal;
     if (dot(geometricNormal, direction) > 0) geometricNormal = -geometricNormal;
     float3 normal = hitShadingNormal(hit, attributes, direction);
     if (dot(normal, -direction) <= 0 || dot(normal, geometricNormal) <= 0)
-        return rayEmission;
+        return clampOutgoingTransportRadiance(radiance);
     float3 view = normalize(-direction);
-    float roughness = materialPerceptualRoughness(hit);
-    SurfaceBsdf material = hitSurfaceBsdf(hit);
+    SurfaceBsdf material = hitSurfaceBsdf(hit, baseColor);
+    float roughness = isfinite(material.perceptualRoughness)
+        ? material.perceptualRoughness : 1.0;
     float2 ab = bsdfDfg(roughness, saturate(dot(normal, view)));
     uint directSamples = max(1u, params.lightCounts.z / 2);
     uint directSequence = stochasticSampleFrame(params);
-    bool emissiveSupported, environmentSupported, punctualSupported;
-    float3 emissive = emissiveResponseTracked(position, normal, geometricNormal, view,
+    // Read the cache first: with cached hit sky, a covered hit takes its sky
+    // light from the cache and skips the environment visibility rays. The
+    // lookup reads only the previous frame's cache, so deferred recording and
+    // replay make the same choice and issue the same query sequence.
+    float indirectBackgroundCoverage;
+    TransportRadiance indirect = secondaryFeedback(position, normal, dependency,
+        indirectBackgroundCoverage);
+    bool skyFromCache = cachedHitSky(params) && indirectBackgroundCoverage > 0.0;
+    bool emissiveSupported, environmentSupported = true, conventionalSupported;
+    float3 emissiveNee = emissiveResponseTracked(position, normal, geometricNormal, view,
         roughness, directSamples, directSequence ^ 0xE11E0001u, emissiveSupported,
         dependency, admissionLimit, true, material, ab);
-    float3 environment = environmentResponseTracked(position, normal, geometricNormal, view,
-        roughness, directSamples, directSequence ^ 0xE17A0002u, environmentSupported,
-        dependency, admissionLimit, true, material, ab);
-    float3 punctual = punctualResponseTracked(position, normal, geometricNormal, view,
-        roughness, punctualSupported, dependency, admissionLimit, true, material, ab);
-    float3 direct = emissive + environment + punctual;
-    querySupported = emissiveSupported && environmentSupported && punctualSupported;
-    if (!querySupported) return 0.0;
-    return rayEmission + direct;
-}
+    float3 environment = 0.0;
+    if (!skyFromCache)
+        environment = environmentResponseTracked(position, normal, geometricNormal, view,
+            roughness, directSamples, directSequence ^ 0xE17A0002u, environmentSupported,
+            dependency, admissionLimit, true, material, ab);
+    float3 directional, punctual;
+    conventionalLightResponseTracked(position, normal, geometricNormal, view, roughness,
+        directional, punctual, conventionalSupported, dependency, admissionLimit,
+        true, material, ab);
+    querySupported = emissiveSupported && environmentSupported && conventionalSupported;
+    if (!querySupported) return (TransportRadiance)0;
 
-float3 outgoingSingleBounceTracked(float3 origin, float3 direction, Hit hit,
-                        out bool querySupported,
-                        inout DependencyContext dependency, uint admissionLimit = 0u) {
-    float3 radiance = outgoingDirectOnlyTracked(origin, direction, hit,
-        querySupported, dependency, admissionLimit);
-    return querySupported ? clampOutgoingRadiance(radiance, params) : 0.0;
-}
-
-float3 outgoingSingleBounce(float3 origin, float3 direction, Hit hit,
-                           out bool querySupported,
-                           uint admissionLimit = 0u) {
-    DependencyContext ignoredDependency = dependencyEmpty();
-    return outgoingSingleBounceTracked(origin, direction, hit,
-        querySupported, ignoredDependency, admissionLimit);
-}
-
-float3 outgoingRadianceTracked(float3 origin, float3 direction, Hit hit,
-                               out bool querySupported,
-                               inout DependencyContext dependency,
-                               uint admissionLimit = 0u) {
-    return outgoingSingleBounceTracked(origin, direction, hit,
-        querySupported, dependency, admissionLimit);
-}
-
-float3 outgoingRadiance(float3 origin, float3 direction, Hit hit,
-                        out bool querySupported,
-                        uint admissionLimit = 0u) {
-    return outgoingSingleBounce(origin, direction, hit,
-        querySupported, admissionLimit);
+    radiance.background = environment + directional;
+    radiance.emissive += emissiveNee;
+    radiance.punctual = punctual;
+    float3 diffuse = bsdfDiffuseColor(material) * (1.0 - bsdfSpecularEnergy(material, ab));
+    radiance.background += indirect.background * diffuse;
+    radiance.emissive += indirect.emissive * diffuse;
+    radiance.punctual += indirect.punctual * diffuse;
+    return clampOutgoingTransportRadiance(radiance);
 }
 
 
@@ -294,17 +314,30 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
     float4 receiver = splitRasterMetadata(full);
     float depth = depthTexture.Load(int3(full, 0));
     if (depth <= 0 || receiverHistoryLength(receiver) == 0) {
+        backgroundOutput.Store(pixel, 0);
         irradiance.Store(pixel, 0); historyMetadata.Store(pixel, 0); receiverHistory.Store(pixel,0);
         recordTemporalDiagnostics(rawForDiagnostics, float4(0.0), 0.0);
         return;
     }
     bool currentFinite = isfinite(center.w) && all(isfinite(center.xyz));
+    float4 backgroundSample = currentBackground.Load(int3(pixel, 0));
+    bool backgroundSupported = backgroundSample.w > 0.0
+        && all(isfinite(backgroundSample));
+    float backgroundFreshness = backgroundSupported
+        ? saturate(frac(backgroundSample.w) * 4.0) : 0.0;
     uint currentSupportMask = currentFinite && center.w > 0.0
         ? uint(floor(center.w)) & 1u : 0u;
     bool currentSupported = currentSupportMask != 0u && currentFinite;
-    // The integer alpha bit marks supported diffuse GI; the fractional part
-    // carries refreshed angular coverage independently from valid black.
-    float currentFreshness = currentFinite ? saturate(frac(center.w) * 4.0) : 0.0;
+    // A complete raw sample requires every active source. For display only,
+    // preserve independently supported background while a moving source is
+    // still being sampled; the raw support marker remains unchanged.
+    float currentFreshness = currentFinite && currentSupported
+        ? saturate(frac(center.w) * 4.0) : 0.0;
+    if (!currentSupported && currentFinite && center.w < 0.0 && backgroundSupported) {
+        currentSupported = true;
+        currentSupportMask = 1u;
+        currentFreshness = backgroundFreshness;
+    }
     if (!currentSupported) center.xyz = 0.0;
     // Sparse reconstruction can leave a receiver without a current lighting
     // sample. Raster depth still identifies the surface for history validation.
@@ -347,6 +380,8 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
     float3 variance = max(0.0, square - mean * mean);
     float3 deviation = sqrt(variance);
     float4 history = 0, metadata = 0; float total = 0;
+    float4 backgroundHistory = 0.0;
+    float backgroundWeight = 0.0;
     uint historySupportMask = 0u;
     float2 previousFull = 0; bool projected = false;
     // Static world points reproject exactly without relying on raster motion history.
@@ -364,8 +399,15 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
         projected = clip.w > 0 && all(isfinite(uv));
     }
     // Unmatched raster samples are isolated; never borrow old history if their per-frame IDs collide.
-    // Screen history has no ray dependencies to prove a lighting change harmless.
-    if (projected && params.stability.x > 0 && params.transport.w <= 0.5 &&
+    // Gradual sun motion reuses validated coverage as a bounded temporal
+    // estimate; abrupt changes and other source groups remain hard invalidations.
+    bool gradualSun = (params.sourceHistory.z & 1u) != 0u;
+    uint hardSourceChanges = params.sourceHistory.y
+        & ~(gradualSun ? BACKGROUND_SOURCE : 0u);
+    bool motionHistoryExpired = (params.sourceHistory.z & 2u) != 0u
+        && params.frame.x - params.sourceHistory.w > 120u;
+    if (projected && params.stability.x > 0
+        && (hardSourceChanges & BACKGROUND_SOURCE) == 0u &&
         !dirtyContains(position, params) &&
         params.history.x > 0 && params.history.w > 0 &&
         all(previousFull >= float2(params.viewport.xy)) &&
@@ -418,11 +460,51 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
                 if (weight <= 0.0) continue;
                 uint oldSupportMask = receiverScreenHistorySupportMask(oldReceiver);
                 if (oldSupportMask == 0u) continue;
+                float4 oldBackground = previousBackground.Load(int3(oldPixel, 0));
+                if (params.dirtyMin.w <= 0.0 && oldBackground.w > 0.0
+                    && !(motionHistoryExpired && backgroundFreshness <= 0.00001)
+                    && all(isfinite(oldBackground))) {
+                    backgroundHistory += oldBackground * weight;
+                    backgroundWeight += weight;
+                }
+                if (hardSourceChanges != 0u
+                    || (motionHistoryExpired && currentFreshness <= 0.00001)) continue;
                 historySupportMask = 1u;
                 history += old * weight; metadata += meta * weight; total += weight;
             }
     }
     float historyCapacity = max(params.history.w, 0.0);
+    float3 stableBackground = backgroundSupported ? backgroundSample.xyz : 0.0;
+    float backgroundLength = backgroundSupported
+        ? (persistentWorldIntervals(params) ? backgroundFreshness : 1.0) : 0.0;
+    if (backgroundWeight > 0.00001) {
+        backgroundHistory /= backgroundWeight;
+        float oldLength = min(backgroundHistory.w, historyCapacity);
+        if (backgroundSupported && backgroundFreshness > 0.00001) {
+            float weight = min(gradualSun ? min(params.history.x, 0.9) : params.history.x,
+                               oldLength / (oldLength + 1.0));
+            if (persistentWorldIntervals(params))
+                weight = weight / max(weight + backgroundFreshness * (1.0 - weight), 1e-8);
+            stableBackground = lerp(stableBackground, backgroundHistory.xyz, weight);
+            backgroundLength = min(historyCapacity, oldLength + backgroundFreshness);
+        } else {
+            // Do not fade energy, but bound unsupported history during a
+            // continuously moving sun so it cannot persist indefinitely.
+            backgroundLength = gradualSun
+                ? max(0.0, oldLength - max(historyCapacity, 1.0) / 120.0) : oldLength;
+            stableBackground = backgroundLength > 0.0 ? backgroundHistory.xyz : 0.0;
+        }
+    }
+    backgroundOutput.Store(pixel, float4(stableBackground, backgroundLength));
+    if (hardSourceChanges != 0u && backgroundLength > 0.0) {
+        center.xyz += stableBackground - (backgroundSupported ? backgroundSample.xyz : 0.0);
+        if (!currentSupported && currentFinite) {
+            currentSupported = true;
+            currentSupportMask = 1u;
+            outputSupportMask = 1u;
+            currentFreshness = min(backgroundLength, 1.0);
+        }
+    }
     // Length zero marks missing lighting support for downstream spatial passes.
     // A supported current sample remains valid even with temporal history disabled.
     float retainedLength = currentSupported
@@ -432,6 +514,16 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
         history /= total; metadata /= total;
         outputSupportMask = historySupportMask;
         float oldLength = min(metadata.z, historyCapacity);
+        if (gradualSun && currentFreshness <= 0.00001) {
+            oldLength = max(0.0, oldLength - max(historyCapacity, 1.0) / 120.0);
+            if (oldLength <= 0.0) {
+                irradiance.Store(pixel, 0.0);
+                historyMetadata.Store(pixel, 0.0);
+                receiverHistory.Store(pixel, receiverWithScreenHistorySupportMask(receiver, 0u));
+                recordTemporalDiagnostics(rawForDiagnostics, 0.0, 0.0);
+                return;
+            }
+        }
         if (currentSupported) {
             if (currentFreshness <= 0.00001) {
                 // A retained candidate with negligible support is not a new
@@ -463,7 +555,7 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
             float delta = historyLuminance - currentLuminance;
             float change = abs(luminance(clipped) - currentLuminance)
                            / max(max(luminance(clipped), luminance(center.xyz)), 0.001);
-            float reactiveWeight = params.stability.y > 0 && completeObservation
+            float reactiveWeight = !gradualSun && params.stability.y > 0 && completeObservation
                 ? 1.0 - change * change : 1.0;
             float referenceLuminance = max(max(historyLuminance, currentLuminance), 0.001);
             float relativeHistoryNoise = sqrt(max(metadata.w, 0.0)) / referenceLuminance;
@@ -475,13 +567,14 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
             float radiometricThreshold = clamp(3.0 * relativeHistoryNoise, 0.05, 0.25);
             bool radiometricStep = currentFreshness > 0.0
                 && completeObservation
-                && params.stability.y > 0.5
+                && !gradualSun && params.stability.y > 0.5
                 && change > radiometricThreshold;
             // A radiometric step changes the target distribution. Let the
             // refreshed estimate drive every transport path instead of
             // blending the pre-change screen estimate a second time.
             if (radiometricStep) oldLength = 0.0;
-            float weight = min(params.history.x, oldLength / (oldLength + 1.0));
+            float weight = min(gradualSun ? min(params.history.x, 0.9) : params.history.x,
+                               oldLength / (oldLength + 1.0));
             if (persistentWorldIntervals(params)) {
                 // Convert the full-observation blend to equivalent prior mass.
                 // q=1 preserves the original blend; partial coverage has only

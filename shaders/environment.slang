@@ -29,12 +29,15 @@ float3 environmentTexel(int2 pixel) {
     pixel.x = (pixel.x%width+width)%width; pixel.y = clamp(pixel.y,0,height-1);
     return environmentTexture.Load(int3(pixel,0)).xyz;
 }
-float3 environmentRadiance(float3 direction) {
-    if (params.environmentInfo.w == 0) return params.environment.xyz;
-    float2 pixel = environmentUv(direction)*float2(params.environmentInfo.yz)-0.5;
+float3 environmentRadianceUv(float2 uv) {
+    float2 pixel = uv*float2(params.environmentInfo.yz)-0.5;
     int2 base = int2(floor(pixel)); float2 f = frac(pixel);
     return lerp(lerp(environmentTexel(base),environmentTexel(base+int2(1,0)),f.x),
                 lerp(environmentTexel(base+int2(0,1)),environmentTexel(base+int2(1,1)),f.x),f.y)*params.environmentScale.x;
+}
+float3 environmentRadiance(float3 direction) {
+    if (params.environmentInfo.w == 0) return params.environment.xyz;
+    return environmentRadianceUv(environmentUv(direction));
 }
 float environmentTexelSolidAngle(uint y) {
     float height = float(params.environmentInfo.z);
@@ -43,19 +46,23 @@ float environmentTexelSolidAngle(uint y) {
     // Cosine difference in product form remains stable for narrow polar rows.
     return (4.0 * PI / float(params.environmentInfo.y)) * sin(thetaMid) * sin(thetaHalf);
 }
-float environmentPdf(float3 direction) {
-    if (params.environmentInfo.w == 0) return 1.0 / (4.0 * PI);
-    float2 uv = environmentUv(direction);
+float environmentPdfUv(float2 uv) {
     uint x = min(uint(uv.x * float(params.environmentInfo.y)), params.environmentInfo.y - 1);
     uint y = min(uint(uv.y * float(params.environmentInfo.z)), params.environmentInfo.z - 1);
     uint index = x + y * params.environmentInfo.y;
     float mass = asfloat(environmentAlias(index).z);
     return max(mass, 0.0) / max(environmentTexelSolidAngle(y), 1e-20);
 }
+float environmentPdf(float3 direction) {
+    if (params.environmentInfo.w == 0) return 1.0 / (4.0 * PI);
+    return environmentPdfUv(environmentUv(direction));
+}
 
 // Sample the HDR alias distribution in exact solid angle within the selected
 // lat-long texel. The four random values choose the alias branch and texel UV.
-bool sampleEnvironment(float4 random, out float3 direction, out float pdf, out float3 radiance) {
+bool sampleEnvironment(float4 random, out float3 direction, out float pdf, out float3 radiance,
+                       out float2 uv) {
+    uv = 0.0;
     if (params.environmentInfo.w == 0) {
         float y = 1.0 - 2.0 * saturate(random.x);
         float phi = 2.0 * PI * frac(random.y);
@@ -97,9 +104,16 @@ bool sampleEnvironment(float4 random, out float3 direction, out float pdf, out f
     float3 localDirection = float3(sinTheta * cos(phi), cosTheta, sinTheta * sin(phi));
     float4 inverseRotation = float4(-params.environmentRotation.xyz, params.environmentRotation.w);
     direction = normalize(environmentRotate(localDirection, inverseRotation));
-    pdf = asfloat(environmentAlias(index).z) / max(environmentTexelSolidAngle(y), 1e-20);
-    radiance = environmentRadiance(direction);
+    uint4 selectedRecord = index == column ? columnRecord : environmentAlias(index);
+    pdf = asfloat(selectedRecord.z) / max(environmentTexelSolidAngle(y), 1e-20);
+    uv = environmentUv(direction);
+    radiance = environmentRadianceUv(uv);
     return pdf > 0.0 && isfinite(pdf) && all(isfinite(direction)) && all(isfinite(radiance));
+}
+
+bool sampleEnvironment(float4 random, out float3 direction, out float pdf, out float3 radiance) {
+    float2 uv;
+    return sampleEnvironment(random, direction, pdf, radiance, uv);
 }
 
 // A cosine-weighted incident sample's contribution after a visibility query.
@@ -124,11 +138,17 @@ float3 environmentNeeSampleContribution(float3 radiance,
 // Escaped Split rays are excluded from the indirect field. Direct environment
 // lighting at visible receivers belongs to Bevy's native ambient/environment
 // lighting; ray-hit surfaces use visibility-tested NEE in the outgoing source.
+// With cached hit sky, secondary-cache escapes instead carry the environment
+// so primary and secondary hits can read sky light from that cache.
 // Keep support separate so denied traversal is not confused with a measured
 // zero-radiance escape.
-float3 outgoingEnvironmentEscape(bool traversalSupported, out bool querySupported) {
+float3 outgoingEnvironmentEscape(float3 direction, bool traversalSupported,
+                                 out bool querySupported) {
     querySupported = traversalSupported;
-    return 0.0;
+    if (!traversalSupported || params.environmentScale.z <= 0.5 || !cachedHitSky(params))
+        return 0.0;
+    float3 radiance = environmentRadiance(direction);
+    return all(isfinite(radiance)) ? max(radiance, 0.0) : float3(0.0);
 }
 
 float3 environmentResponseTracked(float3 position, float3 normal, float3 geometricNormal,
@@ -153,9 +173,11 @@ float3 environmentResponseTracked(float3 position, float3 normal, float3 geometr
         float4 random = float4(transportRandom(sampleSeed, 0), transportRandom(sampleSeed, 1),
                                transportRandom(sampleSeed, 2), transportRandom(sampleSeed, 3));
         float3 lightDirection, radiance;
-        if (sample < aliasCount) {
+        float2 environmentSampleUv = 0.0;
+        bool aliasSample = sample < aliasCount;
+        if (aliasSample) {
             float aliasPdf;
-            if (!sampleEnvironment(random, lightDirection, aliasPdf, radiance) || aliasPdf <= 0.0)
+            if (!sampleEnvironment(random, lightDirection, aliasPdf, radiance, environmentSampleUv) || aliasPdf <= 0.0)
                 continue;
         } else {
             // Constant environments use cosine proposals; the Disney BSDF
@@ -165,12 +187,20 @@ float3 environmentResponseTracked(float3 position, float3 normal, float3 geometr
                 lightDirection = bsdfSampleVisibleGgx(random.xy, material, normal, view, proposalPdf);
                 if (proposalPdf <= 0.0) continue;
             } else lightDirection = cosineDirection(normal, random.xy);
-            radiance = environmentRadiance(lightDirection);
+            // Radiance is needed only for directions above both surfaces.
         }
 
         float cosine = max(0.0, dot(normal, lightDirection));
         if (cosine <= 0.0 || dot(geometricNormal, lightDirection) <= 0.0) continue;
-        float aliasPdf = environmentPdf(lightDirection);
+        if (!aliasSample) {
+            if (params.environmentInfo.w == 0) radiance = params.environment.xyz;
+            else {
+                environmentSampleUv = environmentUv(lightDirection);
+                radiance = environmentRadianceUv(environmentSampleUv);
+            }
+        }
+        float aliasPdf = params.environmentInfo.w == 0 ? 1.0 / (4.0 * PI)
+            : environmentPdfUv(environmentSampleUv);
         float cosinePdf = cosine / PI;
         float materialPdf = fullBsdf ? 0.5 * (cosinePdf
             + bsdfVisibleGgxPdf(material, normal, view, lightDirection)) : cosinePdf;

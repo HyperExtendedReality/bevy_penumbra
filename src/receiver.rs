@@ -277,24 +277,42 @@ fn extract(
     materials: Extract<Res<Assets<StandardMaterial>>>,
     cameras: Extract<Query<(Entity, &Camera, &RadianceCascades)>>,
     mut phases: ResMut<ViewSortedRenderPhases<ReceiverPhase>>,
-    mut live: Local<HashSet<bevy::render::view::RetainedViewEntity>>,
+    (identities, mut live, mut was_active): (
+        Query<Entity, With<ReceiverIdentity>>,
+        Local<HashSet<bevy::render::view::RetainedViewEntity>>,
+        Local<bool>,
+    ),
 ) {
     let active = cameras
         .iter()
         .any(|(_, camera, settings)| camera.is_active && settings.sanitized().intensity > 0.0);
+    if !active {
+        if *was_active {
+            // Clean up once on the transition, including identities whose
+            // meshes were removed while GI was active.
+            for entity in &identities {
+                commands.entity(entity).remove::<ReceiverIdentity>();
+            }
+            phases.retain(|_, _| false);
+        }
+        *was_active = false;
+        return;
+    }
+    *was_active = true;
     for (entity, render_entity, material, geometry, lightmap) in &meshes {
+        let scene_instance = scene.data.instance_indices.get(&entity).copied();
         // This pass reuses StandardMaterial's alpha-discard bindings. Other
         // material implementations keep the cleared, excluded identity.
         let identity = identity(
             entity,
             geometry
                 && scene.data.instance_residency.contains_key(&entity)
-                && scene.data.instance_indices.contains_key(&entity),
+                && scene_instance.is_some(),
             lightmap,
             material.and_then(|m| materials.get(&m.0)),
-            scene.data.instance_indices.get(&entity).copied(),
+            scene_instance,
         );
-        if !active || identity.value.z == 0 {
+        if identity.value.z == 0 {
             commands.entity(render_entity).remove::<ReceiverIdentity>();
             continue;
         }
@@ -323,15 +341,14 @@ fn queue(
     identities: Query<(Entity, &MainEntity), With<ReceiverIdentity>>,
     draws: Res<DrawFunctions<ReceiverPhase>>,
     mut phases: ResMut<ViewSortedRenderPhases<ReceiverPhase>>,
+    mut identity_entities: Local<HashMap<MainEntity, Entity>>,
 ) {
     let draw = draws.read().id::<DrawReceiver>();
     pipelines.incomplete_views.clear();
     // Native mesh visibility uses PLACEHOLDER render entities. Resolve the
     // synced entity that owns the dynamic identity uniform from MainEntity.
-    let identities: HashMap<_, _> = identities
-        .iter()
-        .map(|(entity, main)| (*main, entity))
-        .collect();
+    identity_entities.clear();
+    identity_entities.extend(identities.iter().map(|(entity, main)| (*main, entity)));
     for (view, visible) in &views {
         let (Some(phase), Some(native)) = (
             phases.get_mut(&view.retained_view_entity),
@@ -343,7 +360,7 @@ fn queue(
             continue;
         };
         for (_, main) in visible.iter_visible() {
-            let Some(&entity) = identities.get(main) else {
+            let Some(&entity) = identity_entities.get(main) else {
                 continue;
             };
             let Some((_, source, _)) = native.get(main) else {

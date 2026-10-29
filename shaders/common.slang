@@ -1,5 +1,12 @@
+// Slang's WGSL vector isfinite overloads use dynamically indexed loops.
+// Test IEEE-754 exponent bits directly to avoid those loops (and FXC forcing
+// enclosing shader loops to unroll). Scalars keep the Slang builtin.
+[ForceInline] bool2 isfinite(float2 value) { return (asuint(value) & 0x7f800000u) != 0x7f800000u; }
+[ForceInline] bool3 isfinite(float3 value) { return (asuint(value) & 0x7f800000u) != 0x7f800000u; }
+[ForceInline] bool4 isfinite(float4 value) { return (asuint(value) & 0x7f800000u) != 0x7f800000u; }
+
 // Equal-area direction mapping: Split RC Algorithm 2. +Y is the polar axis.
-static const float PI = 3.141592653589793;
+static const float PI = 3.14159265358979323846;
 static const uint CASCADES = 4;
 static const uint BASE_THETA = 4;
 static const uint EMPTY = 0xffffffff;
@@ -8,6 +15,14 @@ static const uint TOMBSTONE = 0xfffffffe;
 // Cap scaling at 2^24 (largest interval exponent 30), with five key bits.
 static const uint MAX_PROBE_LOD = 24u;
 static const uint PROBE_LOD = 31u << 18;
+static const uint BACKGROUND_SOURCE = 1u;
+static const uint EMISSIVE_SOURCE = 2u;
+static const uint PUNCTUAL_SOURCE = 4u;
+struct TransportRadiance {
+    float3 background;
+    float3 emissive;
+    float3 punctual;
+};
 
 struct Parameters {
     float4x4 worldFromClip;
@@ -22,26 +37,39 @@ struct Parameters {
     float4 history;      // temporal blend, reserved, valid, retention frames
     float4 intervalHistory; // transmittance decay, Split flag, diffuse debug .25, early query cap
     uint4 frame;         // frame index, merge cascade, instance count, light count
-    uint4 lightCounts;   // conventional count, emissive count, hit-lighting sample budget, reserved
+    uint4 lightCounts;   // conventional count, emissive count, hit-lighting sample budget, cached hit sky
     float4 stability;    // screen history valid, scene changed, motion vectors, exact Disney diffuse
     uint4 layers;        // light-buffer mask tail, word count, occlusion flags, reserved
     uint4 environmentInfo; // alias-record offset, width, height, enabled
     float4 environmentRotation; // world-to-environment quaternion
-    float4 environmentScale; // HDR intensity, reserved, reserved, reserved
+    float4 environmentScale; // HDR intensity, secondary enabled, secondary pass, reserved
     uint4 geometryPages; // geometry mode (0 buffer, 1 pages, 2 pages + deformed overlay), side
     uint4 scenePages; // paged scene texture enable, layer width, prefix words, animated ranges
     uint4 sceneOverlay; // instance base/words, immutable BLAS words, mutable BLAS words
     float4 dirtyMin; // changed scene union bounds.xyz; w > 0 means bounds are valid
     float4 dirtyMax; // w > 0 means the host proved bounded geometry-history reuse safe
-    float4 transport; // reserved transport values, lighting-only invalidation
+    uint4 sourceHistory; // active radiance sources, then source changes; z/w reserved
     uint4 sampling; // selected updates, traversal-query budget, retained cache cap, resolve scale
     uint4 ownerSequence; // LOD target pixels, clear-pass flag, fair ray quota, cursor/disabled flag
     uint4 cacheTime; // elapsed milliseconds; wraps after 49.7 days
-    uint4 worldReceivers; // reserved
-    uint4 worldReceiverState; // reserved
+    float4 emissiveDirtyMin; // changed emitter source AABB.xyz; w > 0 means safe bounded removal
+    float4 emissiveDirtyMax; // changed emitter source AABB maximum.xyz
     float4 lightDirtyMin; // finite punctual-light influence union; w > 0 marks local change
     float4 lightDirtyMax;
 };
+
+[ForceInline]
+bool transportSourceActive(Parameters p, uint source) {
+    return source == BACKGROUND_SOURCE || (p.sourceHistory.x & source) != 0u;
+}
+
+// Paper-style hit lighting: ray-hit surfaces take sky light from the
+// multi-bounce cache, whose escaped rays carry the environment, instead of
+// tracing environment visibility rays. Set only while the secondary cache runs.
+[ForceInline]
+bool cachedHitSky(Parameters p) {
+    return p.lightCounts.w != 0u;
+}
 
 [ForceInline]
 uint cacheHistoryQuota(Parameters p) {
@@ -52,14 +80,6 @@ uint cacheHistoryQuota(Parameters p) {
 }
 bool persistentWorldIntervals(Parameters p) {
     return p.intervalHistory.y > 0.5;
-}
-bool worldGeometryHistoryUnchanged(Parameters p) {
-    bool acceptedBoundedGeometry = persistentWorldIntervals(p)
-        && p.dirtyMax.w > 0.5;
-    return p.stability.y <= 0.5 || acceptedBoundedGeometry;
-}
-bool worldRadianceUnchanged(Parameters p) {
-    return p.transport.w <= 0.5 && worldGeometryHistoryUnchanged(p);
 }
 bool intervalHistoryAlive(uint lastSample, Parameters p) {
     // Camera discovery must not expire unchanged world lighting with screen history.
@@ -108,6 +128,10 @@ struct Entry {
     float4 dependencyMax; // xyz: union maximum, w: 1 when the measured union is nonempty
     float4 mergedDependencyMin; // Full I includes child/visibility dependencies.
     float4 mergedDependencyMax;
+    float4 emissiveInterval; // J.rgb, independent radiance mass.w
+    float4 punctualInterval; // J.rgb, independent radiance mass.w
+    float4 emissiveMerged; // conditional I.rgb, independent support.w
+    float4 punctualMerged; // conditional I.rgb, independent support.w
 };
 
 // A dependency is the union of world-space segments that established a value.
@@ -220,9 +244,13 @@ void storeEntryMergedDependency(inout Entry entry, DependencyContext context) {
 // conditional diffuse irradiance in rgb and angular coverage in w; aggregate
 // dependencies preserve conservative invalidation of packed history.
 struct DirectionalProbe {
-    float4 irradiance[36];
-    float4 dependencyMin; // aggregate dependency for supported raw directional bins
+    float4 irradiance[36]; // BACKGROUND conditional diffuse irradiance and angular support
+    float4 emissiveIrradiance[36]; // EMISSIVE conditional irradiance and angular support
+    float4 punctualIrradiance[36]; // PUNCTUAL conditional irradiance and angular support
+    float4 dependencyMin; // aggregate dependency for supported directional bins
     float4 dependencyMax;
+    int4 cacheKey; // canonical position and LOD of a secondary-cache probe
+    uint4 cacheGeneration; // frame index, occupied, reserved, reserved
 };
 
 [ForceInline]
@@ -397,6 +425,62 @@ uint hashKey(int4 key, uint bucketCount) {
     uint h = k.x * 0x8da6b343u ^ k.y * 0xd8163841u ^ k.z * 0xcb1ab31fu ^ k.w * 0x165667b1u;
     h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
     return h & (bucketCount - 1);
+}
+
+void splitLodBlendForParameters(float3 position, Parameters p,
+                                out uint lowLod, out uint highLod, out float blend) {
+    float3 perspectiveProjection = float3(p.clipFromWorld[3][0],
+        p.clipFromWorld[3][1], p.clipFromWorld[3][2]);
+    bool perspective = all(isfinite(perspectiveProjection))
+        && dot(perspectiveProjection, perspectiveProjection) > 1e-12;
+    float3 verticalProjection = float3(p.clipFromWorld[1][0],
+        p.clipFromWorld[1][1], p.clipFromWorld[1][2]);
+    float focalPixels = 0.5 * float(p.viewport.w) * length(verticalProjection);
+    uint targetPixels = max(p.ownerSequence.x, 1u);
+    float lodScale;
+    if (perspective) {
+        float3 offset = abs(position - p.cameraPosition.xyz);
+        float radius = max(offset.x, max(offset.y, offset.z));
+        float baseDistance = max(focalPixels * p.tuning.x / float(targetPixels), p.tuning.x);
+        lodScale = radius / baseDistance;
+    } else {
+        lodScale = float(targetPixels) / max(focalPixels * p.tuning.x, 1e-20);
+    }
+    lowLod = uint(clamp(floor(log2(max(lodScale, 1.0))), 0.0, float(MAX_PROBE_LOD)));
+    highLod = lowLod;
+    blend = 0.0;
+    if (lowLod < MAX_PROBE_LOD) {
+        float nextStart = exp2(float(lowLod + 1u));
+        float overlapStart = 0.9 * nextStart;
+        if (lodScale >= overlapStart && lodScale < nextStart) {
+            highLod = lowLod + 1u;
+            blend = saturate((lodScale - overlapStart) / (nextStart - overlapStart));
+        }
+    }
+}
+
+uint probeDirectoryCapacity(Parameters p) {
+    // Four slots per visible pixel bound occupancy of each level to one half.
+    uint value = max(1u, p.size.z * 4u) - 1u;
+    value |= value >> 1u;
+    value |= value >> 2u;
+    value |= value >> 4u;
+    value |= value >> 8u;
+    value |= value >> 16u;
+    return value + 1u;
+}
+uint probeDirectoryBase(uint level, Parameters p) {
+    return 2u * p.size.w + 36u + level * probeDirectoryCapacity(p);
+}
+uint rootRayOffsetHead(Parameters p) {
+    return probeDirectoryBase(0u, p) + 8u * probeDirectoryCapacity(p);
+}
+uint probeDirectoryHead(uint level, uint slot, Parameters p) {
+    return probeDirectoryBase(level, p) + slot;
+}
+uint probeDirectoryBucket(int4 key, Parameters p) {
+    key.w = int(uint(key.w) & (PROBE_LOD | (3u << 12u)));
+    return hashKey(key, probeDirectoryCapacity(p));
 }
 [ForceInline]
 float3 worldPosition(float2 pixel, float depth, Parameters p) {

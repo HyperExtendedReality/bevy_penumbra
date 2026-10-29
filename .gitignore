@@ -1,16 +1,7 @@
-/target/
-/tmp/
-/screenshots/
 /assets
-/.build/
-/.out/
-/captures
-/scripts/__pycache__
-/ref
+/.out
 /scripts
-/docs
-/bevy_penumbra
-37904
-39148
-49408
-8044
+<<<<<<< Updated upstream
+=======
+/target
+>>>>>>> Stashed changes

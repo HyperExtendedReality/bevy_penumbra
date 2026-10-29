@@ -40,8 +40,11 @@ fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials
 GI uses deferred rendering so the renderer can read receiver material and
 surface data. Receiver inputs are depth, packed G-buffer base color, metallic,
 roughness and shading normal, plus a separate raster attachment for receiver
-identity and geometric normal. Opaque and alpha-mask materials are supported;
-forward rendering, transparent blending and MSAA are unsupported.
+identity and geometric normal. Opaque and alpha-mask surfaces receive GI.
+Alpha-blended and premultiplied meshes can participate as shadow casters and
+emitters using stochastic texture-alpha coverage; they do not receive the
+deferred GI composite. This is not refractive or volumetric transmission.
+Forward-only receivers and MSAA remain unsupported.
 The examples show setup, controls, raw output, and scene registration patterns.
 
 ## Tune a view
@@ -72,12 +75,15 @@ Use `..Default::default()` in struct literals to inherit shared settings.
 | `resolution_divisor`, `max_rays` | Set the sparse receiver grid and trace budget; geometry-aware reconstruction fills the full viewport. |
 | `normal_bias` | Offset surface samples to reduce self-intersection. |
 | `intensity`, `environment` | Set GI strength and the diffuse environment contribution. |
-| `history_frames`, `temporal_blend` | Control validated screen and world-space history. Zero disables history. |
+| `multi_bounce` | Enable an additional off-screen cache for diffuse multi-bounce lighting; disabled by default. |
+| `cached_hit_sky` | With `multi_bounce`, shade ray-hit sky light from the secondary cache instead of environment visibility rays; disabled by default. |
+| `hardware_ray_queries` | Trace the primary closest-hit and visibility passes with hardware ray queries; falls back to the software BVH when unavailable. Disabled by default. |
+| `history_frames`, `temporal_blend` | Control validated screen and world-space history. Zero disables primary history; the optional secondary cache still retains history for temporal feedback. |
 | `split_transmittance_blend` | Set per-observation retention for interval transmittance while lighting radiance refreshes. |
 | `spatial_filter_steps` | Control geometry-aware a-trous filtering for screen history; zero disables the screen-space filter. |
 | `emissive_samples` | Tune emitter sampling. |
 | Diffuse transport | Split evaluates diffuse illumination, including emissive first hits. Bevy retains native punctual/environment lighting, their shadows, and visible-surface specular shading. Screen history checks receiver identity and surface compatibility. |
-| Split transport | The cascade cache supplies directional incident radiance for the paper's Lambertian cosine convolution. Penumbra adds no glossy receiver transport. |
+| Split transport | Each world probe stores separate 6×6 octahedral Lambertian irradiance and support fields for background, emissive, and finite punctual sources. Resolve normalizes each field independently; Penumbra adds no glossy receiver transport. |
 | `artistic_occlusion` | Enable the optional occlusion adjustment. |
 
 Call `reset_history()` after discontinuous camera or lighting changes. Bevy
@@ -90,21 +96,81 @@ persistent world-space intervals with temporal reconstruction. Surfaces without
 a compatible traced receiver can still have missing GI; reconstruction cannot
 recover untraced lighting.
 
+When no active camera has positive GI intensity, scene updates and receiver
+identity extraction are suspended. Previously allocated resources can remain
+resident. On re-enabling GI, referenced assets are revalidated and scene
+preparation may take time before GI resumes.
+
+When `multi_bounce` is enabled, prior primary ray hits seed a separate cache
+whose probes are two LOD levels coarser. Its completed irradiance feeds later
+primary and secondary hits. The configured receiver-update, traversal and cache
+entry limits are shared between the caches, and the extra allocations count
+toward the view budget. The secondary pass waits when the update budget is one,
+or when a nonzero traversal-query or cache-entry limit is one. A zero query or
+entry limit retains its existing unrestricted meaning. Secondary feedback uses
+the nearest coarse probe and blends supported adjacent LODs across their
+overlap. Secondary history is required for temporal multi-bounce feedback even
+when primary screen history is disabled.
+
+With `cached_hit_sky`, secondary rays that escape carry the environment, and
+ray hits covered by the secondary cache take their sky light from it, as in the
+paper, instead of tracing environment visibility rays. Uncovered hits keep the
+visibility-tested sample. The cached sky is diffuse-only and one frame late; in
+Sponza it lowered GI GPU time by about 1.3 ms (6.6%) with matched captures
+within run-to-run variation (see validation notes).
+
+With `hardware_ray_queries`, the primary closest-hit and visibility passes walk
+a hardware TLAS/BLAS with wgpu ray queries instead of the software BVH. The
+hardware only proposes candidate triangles. Every BLAS is non-opaque, and each
+candidate is re-tested with the software triangle, culling, layer and
+alpha-coverage tests. Accepted hits therefore keep the software distance and
+barycentrics, and toggling the setting keeps all GI history. Hit shading,
+query recording and replay, the overflow trace and the secondary cache stay on
+the software traversal. This requires Vulkan with the SPIR-V passthrough path,
+wgpu's experimental ray-query feature (Bevy requests adapter features by
+default), and unpaged scene geometry. BLASes are built from the scene geometry
+buffer when a view first requests hardware traversal; deformed meshes rebuild
+theirs every frame. This acceleration-structure memory is outside the scene and
+view budgets. While the structures or pipelines are not ready, the software
+traversal runs. `RadianceCascadesStatus::hardware_ray_queries` reports which
+traversal the latest dispatch used.
+
 The Sponza demo and library use Split Radiance Cascades. In the interactive
+<<<<<<< Updated upstream
 Sponza demo, `F12` toggles cursor grab.
-Sponza defaults to 512 receiver updates per frame, resolve scale 4, and two
-direct-light samples, while the library's low-end preset remains at 1,024
-updates. The demo keeps those requested values fixed while running; explicit
-`--max-rays` and `--resolution-divisor` arguments change the requested profile.
-Split's Sponza profile uses 0.15 m probe spacing and a 0.24 m first interval;
-it permits 32,768 receiver cells and 262,144 cached intervals within a 544 MiB
-view budget, subject to device allocation limits. Run
-`scripts/benchmark_sponza.ps1` for the release 1920×1080 windowed, VSync-off
-acceptance run. It records a GI-disabled baseline and requires 120 warmup plus
-240 measured CPU/GPU samples; the offscreen benchmark remains available for
-drained deterministic measurements. Startup logs record the first GI dispatch
-and the first existing raw readback to reach 95% eligible-pixel support;
-neither event waits for warmup. `scripts/validate_sponza_gi.ps1 -Release`
+Sponza defaults to 8,192 receiver updates and 131,072 traversal queries per
+frame, resolve scale 4, and two direct-light samples. The library's low-end
+preset remains at 1,024 updates and 16,384 queries. The demo keeps its requested
+profile fixed while running; `--max-rays`, `--max-traversal-queries`, and
+`--resolution-divisor` adjust it; `--multi-bounce` enables the secondary cache.
+=======
+Sponza demo, `F12` toggles cursor grab and `H` toggles hardware ray queries,
+which Sponza requests by default; the window title shows the traversal in use.
+`--software-traversal` starts with the software traversal.
+Sponza defaults to 2,048 receiver updates and 131,072 traversal queries per
+frame, requested grid divisor 4, resolve scale 4, and two direct-light samples.
+The library's low-end preset remains at 1,024 updates and 16,384 queries. The demo keeps its requested
+profile fixed while running; `--max-rays`, `--max-traversal-queries`, and
+`--resolution-divisor` adjust it; `--multi-bounce` enables the secondary cache,
+and `--cached-hit-sky` adds cached hit sky lighting.
+Interactive mode requests VSync by default; `--no-vsync` requests AutoNoVsync
+instead and may produce tearing. The platform can choose a fallback present mode.
+>>>>>>> Stashed changes
+Split's Sponza profile uses 1 m probe spacing
+and a 1.6 m first interval; it permits 32,768 receiver cells and 262,144 cached
+intervals within a 1 GiB view budget, subject to device allocation limits. Run
+`scripts/benchmark_sponza.ps1` for the release 1920×1080 windowed benchmark
+with VSync-off requested. It records a GI-disabled baseline and requires 120
+warmup plus 240 measured CPU/GPU samples. The offscreen benchmark remains
+available for drained measurements; use `--benchmark-offscreen-no-gi` for an
+offscreen GI-disabled baseline. Queue-envelope timings can include GPU idle
+time and are not measurements of active GPU execution. Schedule CPU diagnostics
+measure elapsed time, including waits, not active CPU time. The JSON report
+includes `samples.trace_gpu_ms`, a distribution of Split trace pass GPU
+timestamps observed within the measurement window; it is empty when GI is
+disabled. Startup logs record the first GI dispatch and the first raw readback
+reaching 95% eligible-pixel support; neither event waits for warmup.
+`scripts/validate_sponza_gi.ps1 -Release`
 checks Split with static captures, a moving blocker, and a moving point
 light. Dark camera directions use matched GI-on/off controls instead of
 requiring courtyard brightness in a shadowed arcade. These scripts enforce the

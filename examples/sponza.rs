@@ -30,7 +30,7 @@ use bevy::{
 use bevy_penumbra::{
     FrameTimingPlugin, RadianceCascades, RadianceCascadesDispatch, RadianceCascadesGeometry,
     RadianceCascadesPlugin, RadianceCascadesRawOutput, RadianceCascadesRevisions,
-    RadianceCascadesStatus,
+    RadianceCascadesStatus, HardwareRayQueries,
 };
 use bevy_texture_cache::{TextureCachePlugin, TextureCacheStats};
 use std::{
@@ -43,11 +43,11 @@ const COURTYARD: &str = "NewSponza_Main_glTF_003.gltf";
 const CURTAINS: &str = "NewSponza_Curtains_glTF.gltf";
 const IVY: &str = "NewSponza_IvyGrowth_glTF.gltf";
 const TEXTURE_SIZE: u32 = 512;
-// Two receiver NEE samples and one per path vertex keep sky visibility within
-// the frame budget; refinement remains stochastic and radiometrically unbiased.
+// Secondary mesh/environment NEE each use one sample per ray-hit surface.
 const SPONZA_LIGHT_SAMPLES: u32 = 2;
 // Keep the requested Sponza quality profile fixed while measuring its cost.
-const SPONZA_UPDATE_BUDGET: u32 = 512;
+const SPONZA_UPDATE_BUDGET: u32 = 8_192;
+const SPONZA_TRAVERSAL_QUERY_BUDGET: u32 = 131_072;
 const SPONZA_RESOLVE_SCALE: u32 = 4;
 const SPONZA_PROBE_SPACING_METERS: f32 = 1.0;
 const SPONZA_INTERVAL_LENGTH_METERS: f32 = 1.6;
@@ -55,13 +55,13 @@ const SPONZA_INTERVAL_LENGTH_METERS: f32 = 1.6;
 const SPONZA_GEOMETRY_UPLOAD_BYTES_PER_FRAME: usize = 32 * 1024 * 1024;
 const SCENE_GPU_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 const ATLAS_GPU_BUDGET: usize = 768 * 1024 * 1024;
-// Native Split at 1080p needs about 512 MiB for the 32K receiver grid, 262K
-// cache, full-resolution receiver, and Sponza's emissive-light records.
-const VIEW_GPU_BUDGET: u64 = 544 * 1024 * 1024;
+// Source-separated intervals and irradiance tables retain the native candidate
+// grid within this view cap; scene and atlas budgets are accounted separately.
+const VIEW_GPU_BUDGET: u64 = 1024 * 1024 * 1024;
 const SPONZA_SPLIT_MAX_RECEIVER_CELLS: u32 = 32_768;
 const SPONZA_SPLIT_MAX_CACHE_ENTRIES: u32 = 262_144;
 const CAMERA_CURSOR_GRAB_TOGGLE_KEY: KeyCode = KeyCode::F12;
-const CONTROLS: &str = "[ / ] time | Space play | 1 dawn 2 noon 3 dusk 4 night | G GI | RMB hold + WASD/QE fly | F12 cursor grab toggle | P screenshot";
+const CONTROLS: &str = "[ / ] time | Space play | 1 dawn 2 noon 3 dusk 4 night | G GI | H hardware rays | RMB hold + WASD/QE fly | F12 cursor grab toggle | P screenshot";
 
 #[derive(Resource)]
 struct Demo {
@@ -89,6 +89,9 @@ struct Demo {
     benchmark_windowed: bool,
     benchmark_vsync: bool,
     benchmark_no_gi: bool,
+    multi_bounce: bool,
+    cached_hit_sky: bool,
+    hardware_ray_queries: bool,
     resolution_divisor: u32,
     max_rays: u32,
     max_traversal_queries: u32,
@@ -102,7 +105,9 @@ struct Demo {
     latest_raw_sample: Option<RawGiSample>,
     motion_light_baseline_raw: Option<RawGiSample>,
     motion_light_response_samples: Vec<RawGiSample>,
-    motion_light_change: Option<(u64, std::time::Instant)>,
+    motion_light_change: Option<MotionLightChange>,
+    motion_reset_settle: MotionSettleObservation,
+    motion_capture_pending: Option<PendingMotionCapture>,
     raw_gi: RawGiDiagnostics,
     stability_capture: bool,
     stability_frame: u32,
@@ -142,6 +147,87 @@ struct RawGiSample {
     eligible: Vec<bool>,
     supported: Vec<bool>,
 }
+const MOTION_SETTLE_DISPATCHES: u64 = 128;
+const MOTION_SETTLE_MIDPOINT_DISPATCHES: u64 = 64;
+
+#[derive(Clone)]
+struct MotionLightChange {
+    revision: u64,
+    encoded_started_at: std::time::Instant,
+    settle: MotionSettleObservation,
+}
+
+#[derive(Clone)]
+struct PendingMotionCapture {
+    frame: u32,
+    camera_transform: Transform,
+    history_epoch: u32,
+    occluder_position: Option<Vec3>,
+    minimum_dispatch_sequence: u64,
+    previous_geometry_revision: Option<u64>,
+    previous_lighting_revision: Option<u64>,
+}
+
+#[derive(Clone, Default)]
+struct MotionSettleObservation {
+    start_sequence: Option<u64>,
+    midpoint_sample: Option<RawGiSample>,
+}
+
+impl MotionSettleObservation {
+    fn begin(&mut self, start_sequence: u64) {
+        self.start_sequence = Some(start_sequence);
+        self.midpoint_sample = None;
+    }
+
+    fn observe(&mut self, sample: &RawGiSample) {
+        let Some(start_sequence) = self.start_sequence else {
+            return;
+        };
+        if self.midpoint_sample.is_none()
+            && sample.dispatch.sequence.saturating_sub(start_sequence)
+                >= MOTION_SETTLE_MIDPOINT_DISPATCHES
+        {
+            self.midpoint_sample = Some(sample.clone());
+        }
+    }
+
+    fn encoded_samples(&self, current_sequence: u64) -> u64 {
+        self.start_sequence
+            .map_or(0, |start| current_sequence.saturating_sub(start))
+    }
+
+    fn midpoint_drift(&self, settled: &RawGiSample) -> Option<f32> {
+        self.midpoint_sample
+            .as_ref()
+            .and_then(|middle| stationary_sample_drift(middle, settled))
+    }
+}
+
+// The raw bytes are retained only for the opt-in moving-sun capture.
+#[derive(Resource, Default)]
+struct SunCaptureRaw(Vec<u8>);
+
+#[derive(Default)]
+struct SunCaptureState {
+    stage: u8,
+    frame: u32,
+    start_hour: f32,
+    baseline: Option<RawGiSample>,
+    immediate: Option<RawGiSample>,
+    midpoint: Option<RawGiSample>,
+    warmup_frame_drift: Option<f32>,
+    motion_previous: Option<RawGiSample>,
+    motion_drift_sum: f64,
+    motion_drift_max: f32,
+    motion_drift_count: u32,
+    final_sequence_floor: u64,
+    final_revision: u64,
+    stable_revision_frames: u32,
+}
+
+const SUN_MOTION_FRAMES: u32 = 64;
+const SUN_HOURS_PER_FRAME: f32 = 0.02;
 
 fn gi_capture_ready(
     scene_loaded: bool,
@@ -195,9 +281,16 @@ fn main() -> AppExit {
     let mut benchmark_windowed = false;
     let mut benchmark_vsync = false;
     let mut benchmark_no_gi = false;
+    let mut multi_bounce = false;
+<<<<<<< Updated upstream
     let mut resolution_divisor = SPONZA_RESOLVE_SCALE;
+=======
+    let mut cached_hit_sky = false;
+    let mut hardware_ray_queries = true;
+    let mut resolution_divisor = SPONZA_GRID_DIVISOR;
+>>>>>>> Stashed changes
     let mut max_rays = SPONZA_UPDATE_BUDGET;
-    let mut max_traversal_queries = RadianceCascades::low_end().sampling.max_traversal_queries;
+    let mut max_traversal_queries = SPONZA_TRAVERSAL_QUERY_BUDGET;
     let mut warmup_frames = 120;
     let mut measured_frames = 240;
     let mut benchmark_output = String::from("tmp/sponza_benchmark.json");
@@ -205,6 +298,7 @@ fn main() -> AppExit {
     let mut camera_motion_capture = false;
     let mut camera_pose_frame = None;
     let mut stability_capture = false;
+    let mut sun_capture = false;
     let mut capture_prefix = None;
     for arg in &args {
         if let Some(value) = arg.strip_prefix("--scene=") {
@@ -223,6 +317,9 @@ fn main() -> AppExit {
             );
         } else if arg == "--capture" {
             capture = true;
+        } else if arg == "--capture-moving-sun" {
+            capture = true;
+            sun_capture = true;
         } else if arg == "--capture-motion" {
             capture = true;
             motion_capture = true;
@@ -250,6 +347,16 @@ fn main() -> AppExit {
             benchmark = true;
             benchmark_windowed = true;
             benchmark_no_gi = true;
+        } else if arg == "--benchmark-offscreen-no-gi" {
+            benchmark = true;
+            benchmark_windowed = false;
+            benchmark_no_gi = true;
+        } else if arg == "--multi-bounce" {
+            multi_bounce = true;
+        } else if arg == "--cached-hit-sky" {
+            cached_hit_sky = true;
+        } else if arg == "--software-traversal" {
+            hardware_ray_queries = false;
         } else if let Some(value) = arg.strip_prefix("--max-rays=") {
             max_rays = value.parse().expect("--max-rays requires an integer");
             assert!(
@@ -288,10 +395,14 @@ fn main() -> AppExit {
             // Parsed below once capture/benchmark mode is known.
         } else {
             panic!(
-                "Unknown argument {arg}; use --scene=path.gltf, --time=10, --max-rays=1024, --max-traversal-queries=131072, --resolution-divisor=8, --width=160, --height=120, --camera-pose-frame=88 with --capture-stability, --capture-prefix=path, --capture, --capture-motion, --capture-camera-motion, --capture-stability, or --benchmark"
+                "Unknown argument {arg}; use --scene=path.gltf, --time=10, --max-rays=1024, --max-traversal-queries=131072, --resolution-divisor=8, --width=160, --height=120, --camera-pose-frame=88 with --capture-stability, --capture-prefix=path, --capture, --capture-motion, --capture-camera-motion, --capture-moving-sun, --capture-stability, --multi-bounce, --benchmark, or --benchmark-offscreen-no-gi"
             );
         }
     }
+    assert!(
+        !sun_capture || (!motion_capture && !stability_capture),
+        "--capture-moving-sun cannot be combined with another capture mode"
+    );
     assert!(
         camera_pose_frame.is_none() || stability_capture,
         "--camera-pose-frame requires --capture-stability"
@@ -384,6 +495,9 @@ fn main() -> AppExit {
             benchmark_windowed,
             benchmark_vsync,
             benchmark_no_gi,
+            multi_bounce,
+            cached_hit_sky,
+            hardware_ray_queries,
             resolution_divisor,
             max_rays,
             max_traversal_queries,
@@ -398,6 +512,8 @@ fn main() -> AppExit {
             motion_light_baseline_raw: None,
             motion_light_response_samples: Vec::new(),
             motion_light_change: None,
+            motion_reset_settle: MotionSettleObservation::default(),
+            motion_capture_pending: None,
             raw_gi: RawGiDiagnostics::default(),
             stability_capture,
             stability_frame: 0,
@@ -432,6 +548,7 @@ fn main() -> AppExit {
                 capture_frame,
                 capture_motion,
                 capture_stability,
+                capture_moving_sun,
                 asset_errors,
                 stop_benchmark_raw_output,
                 performance,
@@ -439,6 +556,9 @@ fn main() -> AppExit {
             )
                 .chain(),
         );
+    if sun_capture {
+        app.insert_resource(SunCaptureRaw::default());
+    }
     if benchmark {
         app.add_plugins(FrameTimingPlugin);
         let shared_metadata = SharedRendererMetadata::default();
@@ -464,6 +584,9 @@ fn dimension_arg(args: &[String], prefix: &str, fallback: u32) -> u32 {
 }
 
 fn apply_sponza_profile(settings: &mut RadianceCascades, demo: &Demo) {
+    settings.multi_bounce = demo.multi_bounce;
+    settings.cached_hit_sky = demo.cached_hit_sky;
+    settings.hardware_ray_queries = demo.hardware_ray_queries;
     settings.probe_spacing = SPONZA_PROBE_SPACING_METERS;
     settings.interval_length = SPONZA_INTERVAL_LENGTH_METERS;
     settings.emissive_samples = SPONZA_LIGHT_SAMPLES;
@@ -620,18 +743,19 @@ fn setup(
         demo.camera_pose_frame
             .map_or_else(|| motion_capture_pose(0), motion_capture_pose),
     ));
+    if (demo.capture || demo.benchmark) && !demo.benchmark_windowed {
+        let (width, height) = demo.capture_size;
+        let target = images.add(Image::new_target_texture(
+            width,
+            height,
+            TextureFormat::Rgba8UnormSrgb,
+            None,
+        ));
+        camera.insert(RenderTarget::Image(target.clone().into()));
+        demo.target = Some(target);
+    }
     if demo.capture || (demo.benchmark && !demo.benchmark_no_gi) {
         let (width, height) = demo.capture_size;
-        if !demo.benchmark_windowed {
-            let target = images.add(Image::new_target_texture(
-                width,
-                height,
-                TextureFormat::Rgba8UnormSrgb,
-                None,
-            ));
-            camera.insert(RenderTarget::Image(target.clone().into()));
-            demo.target = Some(target);
-        }
         let resolve_scale = settings.sampling.resolve_scale.max(1);
         let raw_width = width.div_ceil(resolve_scale).max(1);
         let raw_height = height.div_ceil(resolve_scale).max(1);
@@ -650,6 +774,7 @@ fn setup(
              mut readback_count: Local<u32>,
              diagnostics: Res<DiagnosticsStore>,
              status: Res<RadianceCascadesStatus>,
+             mut sun_raw: Option<ResMut<SunCaptureRaw>>,
              views: Query<&RadianceCascades>| {
                 let raw_frame = status.take_raw_frame().flatten();
                 let diagnostic_value = |name: &str| {
@@ -786,7 +911,7 @@ fn setup(
                         "Sponza first raw GI sample reached 95% eligible-pixel support"
                     );
                 }
-                demo.latest_raw_sample = dispatch.zip(raw_frame).map(|(dispatch, frame)| {
+                let latest_raw_sample = dispatch.zip(raw_frame).map(|(dispatch, frame)| {
                     RawGiSample {
                         frame_id,
                         dispatch,
@@ -796,39 +921,54 @@ fn setup(
                         supported,
                     }
                 });
-                let changed_sample = if demo.motion_capture {
+                if let Some(raw) = sun_raw.as_mut() {
+                    raw.0.clear();
+                    if latest_raw_sample.is_some() {
+                        raw.0.extend_from_slice(&event.data);
+                    }
+                }
+                if let Some(sample) = latest_raw_sample.as_ref() {
+                    demo.motion_reset_settle.observe(sample);
                     let baseline_revision = demo
                         .motion_light_baseline_raw
                         .as_ref()
                         .map(|baseline| baseline.dispatch.revisions.lighting);
-                    demo.latest_raw_sample.as_ref().and_then(|sample| {
-                        (Some(sample.dispatch.revisions.lighting) != baseline_revision).then(|| {
-                            (
-                                sample.dispatch.revisions.lighting,
-                                sample.submitted_at,
-                                sample.clone(),
-                            )
+                    if demo.motion_capture
+                        && baseline_revision.is_some_and(|baseline| {
+                            baseline != sample.dispatch.revisions.lighting
                         })
-                    })
-                } else {
-                    None
-                };
-                if let Some((revision, submitted_at, sample)) = changed_sample {
-                    let started = match demo.motion_light_change {
-                        Some((current_revision, started)) if current_revision == revision => started,
-                        _ => {
-                            demo.motion_light_response_samples.clear();
-                            demo.motion_light_change = Some((revision, submitted_at));
-                            submitted_at
-                        }
-                    };
-                    if submitted_at
-                        .checked_duration_since(started)
-                        .is_some_and(|elapsed| elapsed <= std::time::Duration::from_millis(100))
                     {
-                        demo.motion_light_response_samples.push(sample);
+                        let revision = sample.dispatch.revisions.lighting;
+                        let started = match demo.motion_light_change.as_ref() {
+                            Some(change) if change.revision == revision => change.encoded_started_at,
+                            _ => {
+                                demo.motion_light_response_samples.clear();
+                                let mut settle = MotionSettleObservation::default();
+                                settle.begin(sample.dispatch.sequence.saturating_sub(1));
+                                settle.observe(sample);
+                                demo.motion_light_change = Some(MotionLightChange {
+                                    revision,
+                                    encoded_started_at: sample.submitted_at,
+                                    settle,
+                                });
+                                sample.submitted_at
+                            }
+                        };
+                        if let Some(change) = demo.motion_light_change.as_mut() {
+                            change.settle.observe(sample);
+                        }
+                        if sample
+                            .submitted_at
+                            .checked_duration_since(started)
+                            .is_some_and(|elapsed| {
+                                elapsed <= std::time::Duration::from_millis(100)
+                            })
+                        {
+                            demo.motion_light_response_samples.push(sample.clone());
+                        }
                     }
                 }
+                demo.latest_raw_sample = latest_raw_sample;
                 if (demo.benchmark || demo.capture)
                     && (*readback_count).is_multiple_of(60)
                 {
@@ -883,7 +1023,7 @@ fn setup(
                 );
             },
         );
-    } else {
+    } else if !demo.benchmark || demo.benchmark_windowed {
         camera.insert(FreeCamera {
             walk_speed: 3.0,
             run_speed: 9.0,
@@ -1081,7 +1221,15 @@ fn controls(
     demo.hour = (demo.hour
         + time.delta_secs() * (scrub * 2.0 + if demo.playing { 0.1 } else { 0.0 }))
     .rem_euclid(24.0);
+    // Hardware and software traversal produce the same transport, so the
+    // toggle keeps all GI history.
+    if keys.just_pressed(KeyCode::KeyH) {
+        demo.hardware_ray_queries = !demo.hardware_ray_queries;
+    }
     for mut gi in &mut cameras {
+        if gi.hardware_ray_queries != demo.hardware_ray_queries {
+            gi.hardware_ray_queries = demo.hardware_ray_queries;
+        }
         if keys.just_pressed(KeyCode::KeyG) {
             gi.intensity = if gi.intensity > 0.0 { 0.0 } else { 1.0 };
             jump = true;
@@ -1187,11 +1335,13 @@ fn lighting(
 struct PerformanceSamples {
     title_updated: f64,
     gi: Vec<f64>,
+    trace: Vec<f64>,
     frame: Vec<f64>,
     frame_interval: Vec<f64>,
     main_schedule_cpu: Vec<f64>,
     render_schedule_cpu: Vec<f64>,
     frame_points: Vec<(bevy::platform::time::Instant, f64)>,
+    trace_points: Vec<(bevy::platform::time::Instant, f64)>,
     frame_interval_points: Vec<(bevy::platform::time::Instant, f64)>,
     main_schedule_cpu_points: Vec<(bevy::platform::time::Instant, f64)>,
     render_schedule_cpu_points: Vec<(bevy::platform::time::Instant, f64)>,
@@ -1201,6 +1351,7 @@ struct PerformanceSamples {
     measurement_start_s: Option<f64>,
     measurement_end_s: Option<f64>,
     last_gi: Option<bevy::platform::time::Instant>,
+    last_trace: Option<bevy::platform::time::Instant>,
     last_frame: Option<bevy::platform::time::Instant>,
     last_frame_interval: Option<bevy::platform::time::Instant>,
     last_main_schedule_cpu: Option<bevy::platform::time::Instant>,
@@ -1300,11 +1451,19 @@ fn performance(
             .and_then(|d| d.smoothed());
         for mut window in &mut windows {
             window.title = format!(
-                "Sponza | {:.1} FPS | {:02}:{:02} {} | {CONTROLS}",
+                "Sponza | {:.1} FPS | {:02}:{:02} {} | rays: {} | {CONTROLS}",
                 fps.unwrap_or(0.0),
                 demo.hour as u32,
                 ((demo.hour.fract() * 60.0) as u32).min(59),
-                if demo.playing { "playing" } else { "paused" }
+                if demo.playing { "playing" } else { "paused" },
+                match status.hardware_ray_queries() {
+                    HardwareRayQueries::Active => "hardware",
+                    HardwareRayQueries::Inactive if demo.hardware_ray_queries => {
+                        "software (hardware pending)"
+                    }
+                    HardwareRayQueries::Inactive => "software",
+                    HardwareRayQueries::Unsupported => "software (no hardware support)",
+                }
             );
         }
     }
@@ -1330,21 +1489,30 @@ fn performance(
             && state.last_gi != Some(measurement.time)
         {
             state.last_gi = Some(measurement.time);
-            if state.gi.len() >= demo.warmup_frames {
-                if state.gi.len() < demo.warmup_frames + demo.measured_frames {
-                    if state.measurement_start.is_none() {
-                        state.measurement_start = Some(measurement.time);
-                        state.measurement_start_s = Some(now);
-                    }
-                    state.gi.push(measurement.value);
-                    if state.gi.len() == demo.warmup_frames + demo.measured_frames {
-                        state.measurement_end = Some(measurement.time);
-                        state.measurement_end_s = Some(now);
-                    }
-                }
-            } else {
+            if state.gi.len() < demo.warmup_frames {
                 state.gi.push(measurement.value);
                 state.warmup_seen += 1;
+            } else {
+                if state.measurement_start.is_none() {
+                    state.measurement_start = Some(measurement.time);
+                    state.measurement_start_s = Some(now);
+                }
+                state.gi.push(measurement.value);
+                state.measurement_end = Some(measurement.time);
+                state.measurement_end_s = Some(now);
+            }
+        }
+        if let Some(measurement) = diagnostics
+            .iter()
+            .find(|d| d.path().as_str() == "render/split_rc/trace/elapsed_gpu")
+            .and_then(|d| d.measurement())
+            && state.last_trace != Some(measurement.time)
+        {
+            state.last_trace = Some(measurement.time);
+            if state.measurement_start.is_some() {
+                state
+                    .trace_points
+                    .push((measurement.time, measurement.value));
             }
         }
         if let Some(measurement) = diagnostics
@@ -1357,16 +1525,14 @@ fn performance(
             if demo.benchmark_no_gi {
                 if state.warmup_seen < demo.warmup_frames {
                     state.warmup_seen += 1;
-                } else if state.frame.len() < demo.measured_frames {
+                } else {
                     if state.measurement_start.is_none() {
                         state.measurement_start = Some(measurement.time);
                         state.measurement_start_s = Some(now);
                     }
                     state.frame.push(measurement.value);
-                    if state.frame.len() == demo.measured_frames {
-                        state.measurement_end = Some(measurement.time);
-                        state.measurement_end_s = Some(now);
-                    }
+                    state.measurement_end = Some(measurement.time);
+                    state.measurement_end_s = Some(now);
                 }
             } else if state.measurement_start.is_some() {
                 state
@@ -1421,7 +1587,34 @@ fn performance(
         if measurement_complete {
             let start = state.measurement_start.expect("measured GI window starts");
             let end = state.measurement_end.expect("measured GI window ends");
+            // GPU and CPU diagnostics arrive independently. Extend the same
+            // time window until each stream has the requested sample count.
+            let enough = |points: &[(bevy::platform::time::Instant, f64)]| {
+                points
+                    .iter()
+                    .filter(|(timestamp, _)| *timestamp >= start && *timestamp <= end)
+                    .count()
+                    >= demo.measured_frames
+            };
+            if (!demo.benchmark_no_gi && !enough(&state.frame_points))
+                || !enough(&state.frame_interval_points)
+                || !enough(&state.main_schedule_cpu_points)
+                || !enough(&state.render_schedule_cpu_points)
+            {
+                if now > 600.0 {
+                    error!("Sponza benchmark timed out waiting for aligned timing samples");
+                    exit.write(AppExit::error());
+                }
+                return;
+            }
             if !demo.benchmark_no_gi {
+                state.trace = state
+                    .trace_points
+                    .iter()
+                    .filter_map(|(timestamp, value)| {
+                        (*timestamp >= start && *timestamp <= end).then_some(*value)
+                    })
+                    .collect();
                 state.frame = state
                     .frame_points
                     .iter()
@@ -1452,24 +1645,6 @@ fn performance(
                     (*timestamp >= start && *timestamp <= end).then_some(*value)
                 })
                 .collect();
-            if state.frame.len() < demo.measured_frames
-                || state.frame_interval.len() < demo.measured_frames
-                || state.main_schedule_cpu.len() < demo.measured_frames
-                || state.render_schedule_cpu.len() < demo.measured_frames
-                || (!demo.benchmark_no_gi && state.gi.len() < demo.measured_frames)
-            {
-                error!(
-                    gpu_samples = state.frame.len(),
-                    frame_interval_samples = state.frame_interval.len(),
-                    main_schedule_cpu_samples = state.main_schedule_cpu.len(),
-                    render_schedule_cpu_samples = state.render_schedule_cpu.len(),
-                    gi_samples = state.gi.len(),
-                    required = demo.measured_frames,
-                    "Sponza benchmark completed with missing timing samples"
-                );
-                exit.write(AppExit::error());
-                return;
-            }
             let measured = if demo.benchmark_no_gi {
                 &mut state.frame
             } else {
@@ -1480,7 +1655,11 @@ fn performance(
             let metadata = renderer_metadata
                 .as_deref()
                 .and_then(|shared| shared.0.lock().ok()?.clone());
-            let json = benchmark_json(&demo, &state, &diagnostics, metadata.as_ref());
+            let traversal = match status.hardware_ray_queries() {
+                HardwareRayQueries::Active => "hardware",
+                HardwareRayQueries::Inactive | HardwareRayQueries::Unsupported => "software",
+            };
+            let json = benchmark_json(&demo, &state, &diagnostics, metadata.as_ref(), traversal);
             if let Some(parent) = Path::new(&demo.benchmark_output).parent()
                 && !parent.as_os_str().is_empty()
                 && let Err(error) = std::fs::create_dir_all(parent)
@@ -1600,10 +1779,15 @@ fn benchmark_json(
     samples: &PerformanceSamples,
     diagnostics: &DiagnosticsStore,
     renderer: Option<&RendererMetadata>,
+    traversal: &str,
 ) -> String {
     let backend_requested = std::env::var("WGPU_BACKEND").unwrap_or_default();
     format!(
-        "{{\"schema_version\":13,\"crate_version\":{},\"os\":{},\"architecture\":{},\"requested_backend\":{},\"renderer\":{},\"benchmark_mode\":{},\"present_mode_requested\":{},\"gi_enabled\":{},\"scene\":{{\"name\":\"sponza_courtyard_curtains_ivy\",\"width\":{},\"height\":{},\"shader_path\":{}}},\"transport\":\"Split\",\"settings\":{{\"grid_divisor\":{},\"updates_per_frame\":{},\"max_traversal_queries\":{},\"emissive_samples\":{SPONZA_LIGHT_SAMPLES},\"resolve_scale\":{},\"geometry_upload_bytes_per_frame\":{SPONZA_GEOMETRY_UPLOAD_BYTES_PER_FRAME},\"max_receiver_cells\":{SPONZA_SPLIT_MAX_RECEIVER_CELLS},\"max_cache_entries\":{SPONZA_SPLIT_MAX_CACHE_ENTRIES},\"probe_spacing_m\":{SPONZA_PROBE_SPACING_METERS},\"interval_length_m\":{SPONZA_INTERVAL_LENGTH_METERS},\"history_frames\":64,\"temporal_blend\":0.985,\"scene_gpu_budget_bytes\":{SCENE_GPU_BUDGET},\"atlas_budget_bytes\":{ATLAS_GPU_BUDGET},\"view_gpu_budget_bytes\":{VIEW_GPU_BUDGET}}},\"quality\":{{\"supported_pixels\":{},\"eligible_pixels\":{},\"support_ratio\":{},\"total_pixels\":{},\"frame_id\":{},\"dispatch_sequence\":{},\"scene_revision\":{},\"geometry_revision\":{},\"lighting_revision\":{}}},\"samples\":{{\"warmup_requested\":{},\"warmup_observed\":{},\"measured_gpu_requested\":{},\"measured_interval_s\":{{\"start\":{},\"end\":{}}},\"gi_gpu_ms\":{},\"penumbra_gpu_frame_ms\":{},\"frame_interval_diagnostic_ms\":{},\"main_schedule_cpu_ms\":{},\"render_schedule_cpu_ms\":{}}},\"diagnostics\":{}}}\n",
+<<<<<<< Updated upstream
+        "{{\"schema_version\":13,\"crate_version\":{},\"os\":{},\"architecture\":{},\"requested_backend\":{},\"renderer\":{},\"benchmark_mode\":{},\"present_mode_requested\":{},\"gi_enabled\":{},\"scene\":{{\"name\":\"sponza_courtyard_curtains_ivy\",\"width\":{},\"height\":{},\"shader_path\":{}}},\"transport\":\"Split\",\"settings\":{{\"multi_bounce\":{},\"grid_divisor\":{},\"updates_per_frame\":{},\"max_traversal_queries\":{},\"emissive_samples\":{SPONZA_LIGHT_SAMPLES},\"resolve_scale\":{},\"geometry_upload_bytes_per_frame\":{SPONZA_GEOMETRY_UPLOAD_BYTES_PER_FRAME},\"max_receiver_cells\":{SPONZA_SPLIT_MAX_RECEIVER_CELLS},\"max_cache_entries\":{SPONZA_SPLIT_MAX_CACHE_ENTRIES},\"probe_spacing_m\":{SPONZA_PROBE_SPACING_METERS},\"interval_length_m\":{SPONZA_INTERVAL_LENGTH_METERS},\"history_frames\":64,\"temporal_blend\":0.985,\"scene_gpu_budget_bytes\":{SCENE_GPU_BUDGET},\"atlas_budget_bytes\":{ATLAS_GPU_BUDGET},\"view_gpu_budget_bytes\":{VIEW_GPU_BUDGET}}},\"quality\":{{\"supported_pixels\":{},\"eligible_pixels\":{},\"support_ratio\":{},\"total_pixels\":{},\"frame_id\":{},\"dispatch_sequence\":{},\"scene_revision\":{},\"geometry_revision\":{},\"lighting_revision\":{}}},\"samples\":{{\"warmup_requested\":{},\"warmup_observed\":{},\"measured_gpu_requested\":{},\"measured_interval_s\":{{\"start\":{},\"end\":{}}},\"gi_gpu_ms\":{},\"trace_gpu_ms\":{},\"penumbra_gpu_frame_ms\":{},\"frame_interval_diagnostic_ms\":{},\"main_schedule_cpu_ms\":{},\"render_schedule_cpu_ms\":{}}},\"diagnostics\":{}}}\n",
+=======
+        "{{\"schema_version\":14,\"crate_version\":{},\"os\":{},\"architecture\":{},\"requested_backend\":{},\"renderer\":{},\"benchmark_mode\":{},\"present_mode_requested\":{},\"gi_enabled\":{},\"scene\":{{\"name\":\"sponza_courtyard_curtains_ivy\",\"width\":{},\"height\":{},\"shader_path\":{},\"asset_profile\":{},\"asset_paths\":[{asset_paths}]}},\"transport\":\"Split\",\"settings\":{{\"shadow_profile\":{},\"multi_bounce\":{},\"cached_hit_sky\":{},\"hardware_ray_queries\":{},\"traversal\":{},\"grid_divisor\":{},\"updates_per_frame\":{},\"max_traversal_queries\":{},\"emissive_samples\":{SPONZA_LIGHT_SAMPLES},\"resolve_scale\":{},\"geometry_upload_bytes_per_frame\":{SPONZA_GEOMETRY_UPLOAD_BYTES_PER_FRAME},\"max_receiver_cells\":{SPONZA_SPLIT_MAX_RECEIVER_CELLS},\"max_cache_entries\":{SPONZA_SPLIT_MAX_CACHE_ENTRIES},\"probe_spacing_m\":{SPONZA_PROBE_SPACING_METERS},\"interval_length_m\":{SPONZA_INTERVAL_LENGTH_METERS},\"history_frames\":64,\"temporal_blend\":0.985,\"scene_gpu_budget_bytes\":{SCENE_GPU_BUDGET},\"atlas_budget_bytes\":{ATLAS_GPU_BUDGET},\"view_gpu_budget_bytes\":{VIEW_GPU_BUDGET}}},\"quality\":{{\"supported_pixels\":{},\"eligible_pixels\":{},\"support_ratio\":{},\"total_pixels\":{},\"frame_id\":{},\"dispatch_sequence\":{},\"scene_revision\":{},\"geometry_revision\":{},\"lighting_revision\":{}}},\"samples\":{{\"warmup_requested\":{},\"warmup_observed\":{},\"measured_gpu_requested\":{},\"measured_interval_s\":{{\"start\":{},\"end\":{}}},\"gi_gpu_ms\":{},\"trace_gpu_ms\":{},\"penumbra_gpu_frame_ms\":{},\"frame_interval_diagnostic_ms\":{},\"main_schedule_cpu_ms\":{},\"render_schedule_cpu_ms\":{},\"gpu_passes\":{{{gpu_passes}}}}},\"diagnostics\":{}}}\n",
+>>>>>>> Stashed changes
         json_string(env!("CARGO_PKG_VERSION")),
         json_string(std::env::consts::OS),
         json_string(std::env::consts::ARCH),
@@ -1627,6 +1811,10 @@ fn benchmark_json(
         renderer
             .map(|metadata| json_string(&metadata.shader_path))
             .unwrap_or_else(|| "null".into()),
+        demo.multi_bounce,
+        demo.cached_hit_sky,
+        demo.hardware_ray_queries,
+        json_string(traversal),
         demo.resolution_divisor,
         demo.max_rays,
         demo.max_traversal_queries,
@@ -1646,6 +1834,7 @@ fn benchmark_json(
         samples.measurement_start_s.unwrap_or(0.0),
         samples.measurement_end_s.unwrap_or(0.0),
         timing_json(&samples.gi),
+        timing_json(&samples.trace),
         timing_json(&samples.frame),
         timing_json(&samples.frame_interval),
         timing_json(&samples.main_schedule_cpu),
@@ -1660,9 +1849,10 @@ fn capture_frame(
     time: Res<Time<Real>>,
     diagnostics: Res<DiagnosticsStore>,
     mut demo: ResMut<Demo>,
+    sun_raw: Option<Res<SunCaptureRaw>>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if demo.benchmark || demo.motion_capture || demo.stability_capture {
+    if demo.benchmark || demo.motion_capture || demo.stability_capture || sun_raw.is_some() {
         return;
     }
     if !demo.capture {
@@ -1875,8 +2065,239 @@ fn motion_light_state(frame: u32) -> usize {
     }
 }
 
-fn motion_capture_can_advance(frame: u32, gi_ready: bool) -> bool {
-    frame > 0 || gi_ready
+fn motion_capture_can_advance(
+    frame: u32,
+    gi_ready: bool,
+    camera_only: bool,
+    latest_sample: Option<&RawGiSample>,
+    reset_settle: &MotionSettleObservation,
+    light_change: Option<&MotionLightChange>,
+) -> bool {
+    if frame == 0 {
+        return gi_ready;
+    }
+    if camera_only {
+        return true;
+    }
+    let Some(sample) = latest_sample else {
+        return !matches!(frame, 129 | 161 | 258);
+    };
+    match frame {
+        129 => reset_settle.encoded_samples(sample.dispatch.sequence) >= MOTION_SETTLE_DISPATCHES,
+        161 | 258 => light_change.is_some_and(|change| {
+            change.revision == sample.dispatch.revisions.lighting
+                && change.settle.encoded_samples(sample.dispatch.sequence)
+                    >= MOTION_SETTLE_DISPATCHES
+                && sample
+                    .submitted_at
+                    .checked_duration_since(change.encoded_started_at)
+                    .is_some_and(|elapsed| elapsed >= std::time::Duration::from_millis(250))
+        }),
+        _ => true,
+    }
+}
+
+fn pending_motion_sample_ready(pending: &PendingMotionCapture, sample: &RawGiSample) -> bool {
+    let revisions = sample.dispatch.revisions;
+    sample.dispatch.sequence >= pending.minimum_dispatch_sequence
+        && pending.previous_geometry_revision != Some(revisions.geometry)
+        && pending.previous_lighting_revision != Some(revisions.lighting)
+}
+
+// Motion advances once per rendered app frame, not according to wall-clock time.
+// Readbacks carry the dispatch revisions that produced their raw pixels.
+#[allow(clippy::too_many_arguments)]
+fn capture_moving_sun(
+    mut commands: Commands,
+    mut demo: ResMut<Demo>,
+    raw: Option<Res<SunCaptureRaw>>,
+    status: Res<RadianceCascadesStatus>,
+    diagnostics: Res<DiagnosticsStore>,
+    time: Res<Time<Real>>,
+    mut state: Local<SunCaptureState>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Some(raw) = raw else { return };
+    if time.elapsed_secs_f64() > 600.0 {
+        error!(
+            stage = state.stage,
+            frame = state.frame,
+            "Moving-sun capture timed out"
+        );
+        exit.write(AppExit::error());
+        return;
+    }
+    if demo.requested || demo.loaded != demo.scenes.len() {
+        return;
+    }
+
+    if state.stage == 1 {
+        if let Some(sample) = demo.latest_raw_sample.as_ref()
+            && state
+                .motion_previous
+                .as_ref()
+                .is_none_or(|previous| sample.dispatch.sequence > previous.dispatch.sequence)
+        {
+            if let Some(drift) = state
+                .motion_previous
+                .as_ref()
+                .and_then(|previous| stationary_sample_drift(previous, sample))
+            {
+                state.motion_drift_sum += f64::from(drift);
+                state.motion_drift_max = state.motion_drift_max.max(drift);
+                state.motion_drift_count += 1;
+            }
+            state.motion_previous = Some(sample.clone());
+        }
+        state.frame += 1;
+        demo.hour = (state.start_hour + SUN_HOURS_PER_FRAME * state.frame as f32).rem_euclid(24.0);
+        if state.frame == SUN_MOTION_FRAMES {
+            state.final_sequence_floor = status.last_dispatch().map_or(0, |d| d.sequence);
+            state.stage = 2;
+        }
+        return;
+    }
+
+    let Some(sample) = demo.latest_raw_sample.as_ref() else {
+        return;
+    };
+    if state.stage == 0
+        && state
+            .motion_previous
+            .as_ref()
+            .is_none_or(|previous| sample.dispatch.sequence > previous.dispatch.sequence)
+    {
+        state.warmup_frame_drift = state
+            .motion_previous
+            .as_ref()
+            .filter(|previous| previous.dispatch.revisions == sample.dispatch.revisions)
+            .and_then(|previous| stationary_sample_drift(previous, sample));
+        state.motion_previous = Some(sample.clone());
+    }
+    let stage = match state.stage {
+        0 if demo.gi_ready => {
+            state.start_hour = demo.hour;
+            state.baseline = Some(sample.clone());
+            state.motion_previous = Some(sample.clone());
+            state.stage = 1;
+            "before"
+        }
+        2 => {
+            let Some(dispatch) = status.last_dispatch() else {
+                return;
+            };
+            if dispatch.revisions.lighting != state.final_revision {
+                state.final_revision = dispatch.revisions.lighting;
+                state.stable_revision_frames = 0;
+            } else {
+                state.stable_revision_frames += 1;
+            }
+            let baseline_revision = state
+                .baseline
+                .as_ref()
+                .map(|s| s.dispatch.revisions.lighting);
+            if state.stable_revision_frames < 3
+                || dispatch.sequence < state.final_sequence_floor.saturating_add(3)
+                || Some(dispatch.revisions.lighting) == baseline_revision
+                || sample.dispatch.revisions.lighting != dispatch.revisions.lighting
+                || sample.dispatch.sequence < state.final_sequence_floor.saturating_add(3)
+            {
+                return;
+            }
+            state.immediate = Some(sample.clone());
+            state.stage = 3;
+            "immediate"
+        }
+        3 => {
+            let Some(immediate) = state.immediate.as_ref() else {
+                return;
+            };
+            if sample.dispatch.revisions.lighting != immediate.dispatch.revisions.lighting {
+                error!("Moving-sun final light revision changed while settling");
+                exit.write(AppExit::error());
+                return;
+            }
+            let elapsed = sample
+                .dispatch
+                .sequence
+                .saturating_sub(immediate.dispatch.sequence);
+            if elapsed >= MOTION_SETTLE_MIDPOINT_DISPATCHES && state.midpoint.is_none() {
+                state.midpoint = Some(sample.clone());
+            }
+            if elapsed < MOTION_SETTLE_DISPATCHES {
+                return;
+            }
+            state.stage = 4;
+            "settled"
+        }
+        _ => return,
+    };
+
+    let prefix = demo
+        .capture_prefix
+        .as_deref()
+        .unwrap_or("screenshots/sponza");
+    let path = format!("{prefix}_moving_sun_{stage}");
+    let raw_path = format!("{path}.rgba32f");
+    if let Some(parent) = std::path::Path::new(&raw_path).parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        error!(%error, "Failed to create moving-sun capture directory");
+        exit.write(AppExit::error());
+        return;
+    }
+    if let Err(error) = std::fs::write(&raw_path, &raw.0) {
+        error!(%error, %raw_path, "Failed to write moving-sun raw capture");
+        exit.write(AppExit::error());
+        return;
+    }
+    let (width, height) = demo.capture_size;
+    let raw_width = width.div_ceil(SPONZA_RESOLVE_SCALE).max(1);
+    let raw_height = height.div_ceil(SPONZA_RESOLVE_SCALE).max(1);
+    info!(
+        stage,
+        motion_frames = state.frame,
+        hour = demo.hour,
+        raw_width,
+        raw_height,
+        raw_path,
+        frame_id = sample.frame_id,
+        dispatch_sequence = sample.dispatch.sequence,
+        scene_revision = sample.dispatch.revisions.scene,
+        geometry_revision = sample.dispatch.revisions.geometry,
+        light_revision = sample.dispatch.revisions.lighting,
+        support_ratio = ?motion_sample_support_ratio(sample),
+        mean_luminance = demo.raw_gi.mean_luminance,
+        supported_mean_luminance = demo.raw_gi.supported_mean_luminance,
+        max_luminance = demo.raw_gi.max_luminance,
+        before_to_current_drift = ?state.baseline.as_ref().and_then(|s| stationary_sample_drift(s, sample)),
+        immediate_to_current_drift = ?state.immediate.as_ref().and_then(|s| stationary_sample_drift(s, sample)),
+        midpoint_to_current_drift = ?state.midpoint.as_ref().and_then(|s| stationary_sample_drift(s, sample)),
+        warmup_frame_drift = ?state.warmup_frame_drift,
+        motion_drift_count = state.motion_drift_count,
+        motion_drift_mean = ?(state.motion_drift_count > 0).then(|| state.motion_drift_sum / f64::from(state.motion_drift_count)),
+        motion_drift_max = state.motion_drift_max,
+        diagnostics = %diagnostics_json(&diagnostics),
+        "Sponza moving-sun raw capture"
+    );
+    demo.requested = true;
+    let png_path = format!("{path}.png");
+    commands
+        .spawn(Screenshot::image(
+            demo.target.clone().expect("capture target"),
+        ))
+        .observe(
+            move |event: On<ScreenshotCaptured>,
+                  mut demo: ResMut<Demo>,
+                  mut exit: MessageWriter<AppExit>| {
+                save_to_disk(&png_path)(event);
+                demo.requested = false;
+                if stage == "settled" {
+                    exit.write(AppExit::Success);
+                }
+            },
+        );
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -1884,6 +2305,7 @@ fn capture_motion(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
     time: Res<Time<Real>>,
+    status: Res<RadianceCascadesStatus>,
     mut demo: ResMut<Demo>,
     mut camera: Query<
         (&mut Transform, &GlobalTransform, &mut RadianceCascades),
@@ -1929,105 +2351,176 @@ fn capture_motion(
         exit.write(AppExit::error());
         return;
     }
-    if demo.loaded != demo.scenes.len()
-        || demo.requested
-        || !motion_capture_can_advance(demo.motion_frame, demo.gi_ready)
-    {
+    if demo.loaded != demo.scenes.len() || demo.requested {
         return;
     }
-    let frame = demo.motion_frame;
     let camera_only = demo.camera_motion_capture;
     let cache_revisit = camera_only;
-    let capture_this_frame = if camera_only {
-        matches!(frame, 0 | 16 | 32 | 64)
-            || (cache_revisit && matches!(frame, 80 | 128 | 129 | 160))
-    } else {
-        (frame <= 120 && frame.is_multiple_of(8))
-            || matches!(
-                frame,
-                127 | 128 | 159 | 160 | 166 | 192 | 224 | 256 | 257 | 263 | 289
+    let pending_capture = demo.motion_capture_pending.clone();
+    let (frame, camera_transform, history_epoch, occluder_position, raw_sample) =
+        if let Some(pending) = pending_capture {
+            let Some(raw_sample) = demo
+                .latest_raw_sample
+                .as_ref()
+                .filter(|sample| pending_motion_sample_ready(&pending, sample))
+                .cloned()
+            else {
+                return;
+            };
+            demo.motion_capture_pending = None;
+            (
+                pending.frame,
+                pending.camera_transform,
+                pending.history_epoch,
+                pending.occluder_position,
+                raw_sample,
             )
-    };
-    assert_eq!(
-        demo.raw_gi.finite_pixels, demo.raw_gi.total_pixels,
-        "Camera motion produced non-finite GI at frame {frame}"
-    );
-    let mut camera_transform = Transform::IDENTITY;
-    let mut history_epoch = 0;
-    let mut capture_pose_ready = true;
-    for (mut transform, global_transform, mut gi) in &mut camera {
-        *transform = if camera_only {
-            camera_motion_capture_pose(frame)
         } else {
-            motion_capture_pose(frame)
-        };
-        if !camera_only && frame == 128 {
-            gi.reset_history();
-        }
-        camera_transform = *transform;
-        capture_pose_ready &= global_transform
-            .to_matrix()
-            .abs_diff_eq(transform.to_matrix(), 1e-5);
-        history_epoch = gi.history_epoch;
-    }
-    // Update applies the pose before transform propagation; capture its first propagated frame.
-    if camera_only && capture_this_frame && !capture_pose_ready {
-        return;
-    }
-    let occluder_position = if camera_only {
-        None
-    } else {
-        let positions = motion_capture_positions(frame);
-        for mut transform in &mut occluders {
-            transform.translation = positions.occluder;
-        }
-        let light_state = motion_light_state(frame);
-        if motion_light_state_needs_emissive_update(&mut previous_light_state, light_state) {
-            for material in &emissive_emitters {
-                if let Some(mut material) = materials.get_mut(&material.0) {
-                    material.emissive = [
-                        LinearRgba::new(14.0, 4.0, 0.6, 1.0),
-                        LinearRgba::new(3.0, 10.0, 18.0, 1.0),
-                        LinearRgba::BLACK,
-                        LinearRgba::BLACK,
-                        LinearRgba::new(4.0, 10.0, 20.0, 1.0),
-                    ][light_state];
-                }
+            if !motion_capture_can_advance(
+                demo.motion_frame,
+                demo.gi_ready,
+                camera_only,
+                demo.latest_raw_sample.as_ref(),
+                &demo.motion_reset_settle,
+                demo.motion_light_change.as_ref(),
+            ) {
+                return;
             }
-        }
-        for (mut transform, mut light) in &mut moving_lights {
-            transform.translation = positions.point_light;
-            light.intensity = [18_000.0, 30_000.0, 18_000.0, 0.0, 24_000.0][light_state];
-            light.color = [
-                Color::linear_rgb(1.0, 0.62, 0.34),
-                Color::linear_rgb(0.35, 0.72, 1.0),
-                Color::linear_rgb(1.0, 0.3, 0.12),
-                Color::linear_rgb(1.0, 0.62, 0.34),
-                Color::linear_rgb(0.25, 1.0, 0.72),
-            ][light_state];
-            light.range = [12.0, 20.0, 12.0, 12.0, 24.0][light_state];
-        }
-        for (mut transform, mut light) in &mut moving_spots {
-            transform.translation = positions.spot_light;
-            transform.look_at(positions.occluder, Vec3::Y);
-            light.intensity = [12_000.0, 18_000.0, 0.0, 0.0, 24_000.0][light_state];
-            light.color = [
-                Color::linear_rgb(0.45, 0.68, 1.0),
-                Color::linear_rgb(1.0, 0.8, 0.45),
-                Color::linear_rgb(1.0, 0.8, 0.45),
-                Color::linear_rgb(0.7, 0.4, 1.0),
-                Color::linear_rgb(0.4, 1.0, 0.55),
-            ][light_state];
-            light.range = [14.0, 22.0, 22.0, 8.0, 25.0][light_state];
-            light.inner_angle = [0.35, 0.25, 0.25, 0.4, 0.25][light_state];
-            light.outer_angle = [0.65, 0.8, 0.8, 0.5, 0.75][light_state];
-        }
-        Some(positions.occluder)
-    };
-    demo.motion_frame += 1;
-    if !capture_this_frame {
-        return;
-    }
+            let frame = demo.motion_frame;
+            let capture_this_frame = if camera_only {
+                matches!(frame, 0 | 16 | 32 | 64)
+                    || (cache_revisit && matches!(frame, 80 | 128 | 129 | 160))
+            } else {
+                (frame <= 120 && frame.is_multiple_of(8))
+                    || matches!(
+                        frame,
+                        127 | 128 | 159 | 160 | 166 | 192 | 224 | 256 | 257 | 263 | 289
+                    )
+            };
+            assert_eq!(
+                demo.raw_gi.finite_pixels, demo.raw_gi.total_pixels,
+                "Camera motion produced non-finite GI at frame {frame}"
+            );
+            let mut camera_transform = Transform::IDENTITY;
+            let mut history_epoch = 0;
+            let mut minimum_dispatch_sequence = None;
+            let mut capture_pose_ready = true;
+            for (mut transform, global_transform, mut gi) in &mut camera {
+                *transform = if camera_only {
+                    camera_motion_capture_pose(frame)
+                } else {
+                    motion_capture_pose(frame)
+                };
+                if !camera_only && frame == 128 {
+                    let start_sequence = status
+                        .last_dispatch()
+                        .map(|dispatch| dispatch.sequence)
+                        .or_else(|| {
+                            demo.latest_raw_sample
+                                .as_ref()
+                                .map(|sample| sample.dispatch.sequence)
+                        })
+                        .unwrap_or(0);
+                    minimum_dispatch_sequence = Some(start_sequence.wrapping_add(1).max(1));
+                    demo.motion_reset_settle.begin(start_sequence);
+                    gi.reset_history();
+                }
+                camera_transform = *transform;
+                capture_pose_ready &= global_transform
+                    .to_matrix()
+                    .abs_diff_eq(transform.to_matrix(), 1e-5);
+                history_epoch = gi.history_epoch;
+            }
+            // Update applies the pose before transform propagation; capture its first propagated frame.
+            if camera_only && capture_this_frame && !capture_pose_ready {
+                return;
+            }
+            let mut geometry_changed = false;
+            let mut lighting_state_changed = false;
+            let occluder_position = if camera_only {
+                None
+            } else {
+                let positions = motion_capture_positions(frame);
+                for mut transform in &mut occluders {
+                    geometry_changed |= transform.translation != positions.occluder;
+                    transform.translation = positions.occluder;
+                }
+                let light_state = motion_light_state(frame);
+                lighting_state_changed = frame > 0 && motion_light_state(frame - 1) != light_state;
+                if motion_light_state_needs_emissive_update(&mut previous_light_state, light_state)
+                {
+                    for material in &emissive_emitters {
+                        if let Some(mut material) = materials.get_mut(&material.0) {
+                            material.emissive = [
+                                LinearRgba::new(14.0, 4.0, 0.6, 1.0),
+                                LinearRgba::new(3.0, 10.0, 18.0, 1.0),
+                                LinearRgba::BLACK,
+                                LinearRgba::BLACK,
+                                LinearRgba::new(4.0, 10.0, 20.0, 1.0),
+                            ][light_state];
+                        }
+                    }
+                }
+                for (mut transform, mut light) in &mut moving_lights {
+                    transform.translation = positions.point_light;
+                    light.intensity = [18_000.0, 30_000.0, 18_000.0, 0.0, 24_000.0][light_state];
+                    light.color = [
+                        Color::linear_rgb(1.0, 0.62, 0.34),
+                        Color::linear_rgb(0.35, 0.72, 1.0),
+                        Color::linear_rgb(1.0, 0.3, 0.12),
+                        Color::linear_rgb(1.0, 0.62, 0.34),
+                        Color::linear_rgb(0.25, 1.0, 0.72),
+                    ][light_state];
+                    light.range = [12.0, 20.0, 12.0, 12.0, 24.0][light_state];
+                }
+                for (mut transform, mut light) in &mut moving_spots {
+                    transform.translation = positions.spot_light;
+                    transform.look_at(positions.occluder, Vec3::Y);
+                    light.intensity = [12_000.0, 18_000.0, 0.0, 0.0, 24_000.0][light_state];
+                    light.color = [
+                        Color::linear_rgb(0.45, 0.68, 1.0),
+                        Color::linear_rgb(1.0, 0.8, 0.45),
+                        Color::linear_rgb(1.0, 0.8, 0.45),
+                        Color::linear_rgb(0.7, 0.4, 1.0),
+                        Color::linear_rgb(0.4, 1.0, 0.55),
+                    ][light_state];
+                    light.range = [14.0, 22.0, 22.0, 8.0, 25.0][light_state];
+                    light.inner_angle = [0.35, 0.25, 0.25, 0.4, 0.25][light_state];
+                    light.outer_angle = [0.65, 0.8, 0.8, 0.5, 0.75][light_state];
+                }
+                Some(positions.occluder)
+            };
+            demo.motion_frame += 1;
+            if !capture_this_frame {
+                return;
+            }
+            let previous_revisions = demo
+                .latest_raw_sample
+                .as_ref()
+                .map(|sample| sample.dispatch.revisions);
+            demo.motion_capture_pending = Some(PendingMotionCapture {
+                frame,
+                camera_transform,
+                history_epoch,
+                occluder_position,
+                minimum_dispatch_sequence: minimum_dispatch_sequence.unwrap_or_else(|| {
+                    status
+                        .last_dispatch()
+                        .map_or(1, |dispatch| dispatch.sequence.wrapping_add(1).max(1))
+                }),
+                previous_geometry_revision: if geometry_changed {
+                    previous_revisions.map(|revisions| revisions.geometry)
+                } else {
+                    None
+                },
+                previous_lighting_revision: if lighting_state_changed {
+                    previous_revisions.map(|revisions| revisions.lighting)
+                } else {
+                    None
+                },
+            });
+            return;
+        };
     demo.requested = true;
     let path = demo.capture_prefix.as_ref().map_or_else(
         || {
@@ -2056,10 +2549,6 @@ fn capture_motion(
                   mut exit: MessageWriter<AppExit>| {
                 let pixels = event.image.data.as_ref().unwrap().clone();
                 save_to_disk(&path)(event);
-                let raw_sample = demo
-                    .latest_raw_sample
-                    .clone()
-                    .expect("captured raw GI frame metadata must be available");
                 let revisions = raw_sample.dispatch.revisions;
                 assert!(revisions.scene > 0 && revisions.geometry > 0);
                 assert!(raw_sample.radiance.iter().flatten().all(|value| value.is_finite()),
@@ -2080,6 +2569,7 @@ fn capture_motion(
                     light_state,
                     raw_frame_id = raw_sample.frame_id,
                     dispatch_sequence = raw_sample.dispatch.sequence,
+                    encoded_submitted_at = ?raw_sample.submitted_at,
                     scene_revision = revisions.scene,
                     geometry_revision = revisions.geometry,
                     light_revision = revisions.lighting,
@@ -2160,10 +2650,24 @@ fn capture_motion(
                         _ => {}
                     }
                 } else {
-                    if frame == 32 || frame == 127 {
+                    if matches!(frame, 32 | 127) {
                         demo.day_pixels = pixels.clone();
                     }
                     if frame == 159 {
+                        let encoded_samples = demo
+                            .motion_reset_settle
+                            .encoded_samples(raw_sample.dispatch.sequence);
+                        assert!(
+                            encoded_samples >= MOTION_SETTLE_DISPATCHES,
+                            "pre-change baseline contains only {encoded_samples} encoded GI dispatches after reset"
+                        );
+                        let scene_linear_drift =
+                            demo.motion_reset_settle.midpoint_drift(&raw_sample);
+                        info!(
+                            encoded_samples_after_reset = encoded_samples,
+                            midpoint_to_baseline_scene_linear_drift = ?scene_linear_drift,
+                            "Sponza pre-change baseline convergence observation"
+                        );
                         demo.motion_light_baseline_raw = Some(raw_sample.clone());
                         demo.motion_light_change = None;
                         demo.motion_light_response_samples.clear();
@@ -2171,10 +2675,23 @@ fn capture_motion(
                         let baseline = demo
                             .motion_light_baseline_raw
                             .as_ref()
-                            .expect("stable scene-linear baseline must precede extinction");
-                        let (revision, started) = demo
-                            .motion_light_change
-                            .expect("the changed light revision must be submitted");
+                            .expect("scene-linear baseline must precede extinction");
+                        let (revision, started, encoded_samples, scene_linear_drift) = {
+                            let change = demo
+                                .motion_light_change
+                                .as_ref()
+                                .expect("the changed light revision must be encoded");
+                            (
+                                change.revision,
+                                change.encoded_started_at,
+                                change.settle.encoded_samples(raw_sample.dispatch.sequence),
+                                change.settle.midpoint_drift(&raw_sample),
+                            )
+                        };
+                        assert!(
+                            encoded_samples >= MOTION_SETTLE_DISPATCHES,
+                            "extinction baseline contains only {encoded_samples} encoded GI dispatches after the light step"
+                        );
                         let response = latest_response_sample(
                             &demo.motion_light_response_samples,
                             started,
@@ -2182,26 +2699,43 @@ fn capture_motion(
                         .expect("extinction response must be sampled within 100 ms");
                         assert_eq!(response.dispatch.revisions.lighting, revision);
                         assert_eq!(raw_sample.dispatch.revisions.lighting, revision);
-                        assert!(motion_response_timing_valid(response, &raw_sample, started),
-                            "extinction response must arrive within 100 ms and the settled sample after 250 ms");
+                        assert!(
+                            motion_response_timing_valid(response, &raw_sample, started),
+                            "encoded extinction response sample must be within 100 ms; settled encoded sample must be at least 250 ms after the light revision"
+                        );
                         let residual = extinguished_light_residual_ratio(
                             baseline,
                             response,
                             &raw_sample,
                         )
                         .expect("extinguished-light response must have measurable contribution");
+                        info!(
+                            residual_ratio = residual,
+                            light_revision = revision,
+                            frame_id = raw_sample.frame_id,
+                            response_encoded_elapsed_ms = response
+                                .submitted_at
+                                .saturating_duration_since(started)
+                                .as_secs_f64()
+                                * 1_000.0,
+                            settled_encoded_elapsed_ms = raw_sample
+                                .submitted_at
+                                .saturating_duration_since(started)
+                                .as_secs_f64()
+                                * 1_000.0,
+                            encoded_samples_after_light_step = encoded_samples,
+                            midpoint_to_settled_scene_linear_drift = ?scene_linear_drift,
+                            baseline_to_response_drift = ?stationary_sample_drift(baseline, response),
+                            response_to_settled_drift = ?stationary_sample_drift(response, &raw_sample),
+                            response_geometry_revision = response.dispatch.revisions.geometry,
+                            settled_geometry_revision = raw_sample.dispatch.revisions.geometry,
+                            "Sponza extinguished-light response and convergence observation"
+                        );
                         assert!(
                             residual <= 0.05,
                             "extinguished-light residual is {:.1}% of its preceding contribution",
                             residual * 100.0
                         );
-                        info!(
-                            residual_ratio = residual,
-                            light_revision = revision,
-                            frame_id = raw_sample.frame_id,
-                            "Sponza extinguished-light residual passed"
-                        );
-                        // Keep the late stable image as the motion-reset reference.
                         demo.day_pixels = pixels.clone();
                     }
                     if frame == 256 {
@@ -2220,9 +2754,22 @@ fn capture_motion(
                             .motion_light_baseline_raw
                             .as_ref()
                             .expect("scene-linear off baseline must precede the light change");
-                        let (revision, started) = demo
-                            .motion_light_change
-                            .expect("new light revision must be submitted");
+                        let (revision, started, encoded_samples, scene_linear_drift) = {
+                            let change = demo
+                                .motion_light_change
+                                .as_ref()
+                                .expect("new light revision must be encoded");
+                            (
+                                change.revision,
+                                change.encoded_started_at,
+                                change.settle.encoded_samples(raw_sample.dispatch.sequence),
+                                change.settle.midpoint_drift(&raw_sample),
+                            )
+                        };
+                        assert!(
+                            encoded_samples >= MOTION_SETTLE_DISPATCHES,
+                            "new-light baseline contains only {encoded_samples} encoded GI dispatches after the light step"
+                        );
                         let response = latest_response_sample(
                             &demo.motion_light_response_samples,
                             started,
@@ -2230,20 +2777,38 @@ fn capture_motion(
                         .expect("new-light response must be sampled within 100 ms");
                         assert_eq!(response.dispatch.revisions.lighting, revision);
                         assert_eq!(raw_sample.dispatch.revisions.lighting, revision);
-                        assert!(motion_response_timing_valid(response, &raw_sample, started),
-                            "new-light response must arrive within 100 ms and the settled sample after 250 ms");
+                        assert!(
+                            motion_response_timing_valid(response, &raw_sample, started),
+                            "encoded new-light response sample must be within 100 ms; settled encoded sample must be at least 250 ms after the light revision"
+                        );
                         let error = lighting_response_error(baseline, response, &raw_sample)
                             .expect("new-light response must affect previously supported receivers");
-                        assert!(
-                            error <= 0.1,
-                            "new-light scene-linear response error is {:.1}%",
-                            error * 100.0
-                        );
                         info!(
                             response_error = error,
                             light_revision = revision,
                             frame_id = raw_sample.frame_id,
-                            "Sponza new-light response passed"
+                            response_encoded_elapsed_ms = response
+                                .submitted_at
+                                .saturating_duration_since(started)
+                                .as_secs_f64()
+                                * 1_000.0,
+                            settled_encoded_elapsed_ms = raw_sample
+                                .submitted_at
+                                .saturating_duration_since(started)
+                                .as_secs_f64()
+                                * 1_000.0,
+                            encoded_samples_after_light_step = encoded_samples,
+                            midpoint_to_settled_scene_linear_drift = ?scene_linear_drift,
+                            baseline_to_response_drift = ?stationary_sample_drift(baseline, response),
+                            response_to_settled_drift = ?stationary_sample_drift(response, &raw_sample),
+                            response_geometry_revision = response.dispatch.revisions.geometry,
+                            settled_geometry_revision = raw_sample.dispatch.revisions.geometry,
+                            "Sponza new-light response and convergence observation"
+                        );
+                        assert!(
+                            error <= 0.1,
+                            "new-light scene-linear response error is {:.1}%",
+                            error * 100.0
                         );
                         exit.write(AppExit::Success);
                     }
@@ -2472,6 +3037,57 @@ fn motion_sample_support_ratio(sample: &RawGiSample) -> Option<f32> {
     (eligible > 0).then_some(supported as f32 / eligible as f32)
 }
 
+fn stationary_sample_drift(reference: &RawGiSample, settled: &RawGiSample) -> Option<f32> {
+    let pixels = reference.radiance.len();
+    if pixels < 16
+        || settled.radiance.len() != pixels
+        || reference.eligible.len() != pixels
+        || settled.eligible.len() != pixels
+        || reference.supported.len() != pixels
+        || settled.supported.len() != pixels
+        || !motion_sample_support_ratio(reference).is_some_and(|ratio| ratio >= 0.95)
+        || !motion_sample_support_ratio(settled).is_some_and(|ratio| ratio >= 0.95)
+    {
+        return None;
+    }
+
+    let baseline_supported = reference
+        .eligible
+        .iter()
+        .zip(&reference.supported)
+        .filter(|(eligible, supported)| **eligible && **supported)
+        .count();
+    let mut difference_energy = 0.0f64;
+    let mut reference_energy = 0.0f64;
+    let mut comparable = 0usize;
+    for index in 0..pixels {
+        if !reference.eligible[index]
+            || !reference.supported[index]
+            || !settled.eligible[index]
+            || !settled.supported[index]
+        {
+            continue;
+        }
+        comparable += 1;
+        for channel in 0..3 {
+            let before = reference.radiance[index][channel];
+            let after = settled.radiance[index][channel];
+            if !before.is_finite() || !after.is_finite() {
+                return None;
+            }
+            difference_energy += f64::from(after - before).powi(2);
+            reference_energy += f64::from(before).powi(2);
+        }
+    }
+    if (comparable as u128) * 100 < (baseline_supported as u128) * 95
+        || comparable < 16
+        || reference_energy <= 1e-8
+    {
+        return None;
+    }
+    Some((difference_energy / reference_energy).sqrt() as f32)
+}
+
 fn lighting_response_error(
     before: &RawGiSample,
     response: &RawGiSample,
@@ -2491,8 +3107,25 @@ fn lighting_response_error(
         return None;
     }
 
+    // Individual Split samples are stochastic: a few pixels can be unsupported
+    // in one frame and supported in the next. Keep the capture's 95% support
+    // gate for every sample, then measure only their common supported receivers.
+    if [before, response, settled]
+        .iter()
+        .any(|sample| !motion_sample_support_ratio(sample).is_some_and(|ratio| ratio >= 0.95))
+    {
+        return None;
+    }
+    let baseline_supported = before
+        .eligible
+        .iter()
+        .zip(&before.supported)
+        .filter(|(eligible, supported)| **eligible && **supported)
+        .count();
+
     let mut error_energy = 0.0f64;
     let mut target_energy = 0.0f64;
+    let mut comparable = 0usize;
     let mut affected = 0usize;
     for index in 0..pixels {
         if !before.eligible[index] || !before.supported[index] {
@@ -2503,11 +3136,16 @@ fn lighting_response_error(
             || !settled.eligible[index]
             || !settled.supported[index]
         {
-            return None;
+            continue;
         }
+        comparable += 1;
+
         let target = std::array::from_fn::<_, 3, _>(|channel| {
             settled.radiance[index][channel] - before.radiance[index][channel]
         });
+        if !target.iter().all(|value| value.is_finite()) {
+            return None;
+        }
         let target_norm = target
             .iter()
             .map(|value| f64::from(*value).powi(2))
@@ -2518,12 +3156,18 @@ fn lighting_response_error(
         let residual = std::array::from_fn::<_, 3, _>(|channel| {
             settled.radiance[index][channel] - response.radiance[index][channel]
         });
+        if !residual.iter().all(|value| value.is_finite()) {
+            return None;
+        }
         error_energy += residual
             .iter()
             .map(|value| f64::from(*value).powi(2))
             .sum::<f64>();
         target_energy += target_norm;
         affected += 1;
+    }
+    if (comparable as u128) * 100 < (baseline_supported as u128) * 95 {
+        return None;
     }
     (affected >= 16 && target_energy > 1e-8).then(|| (error_energy / target_energy).sqrt() as f32)
 }
@@ -2825,10 +3469,237 @@ mod tests {
     }
 
     #[test]
-    fn motion_capture_requires_warmup_only_before_the_sequence_starts() {
-        assert!(!motion_capture_can_advance(0, false));
-        assert!(motion_capture_can_advance(0, true));
-        assert!(motion_capture_can_advance(1, false));
+    fn light_response_compares_common_support_without_relaxing_coverage_or_residual_gates() {
+        let make_sample = |radiance: Vec<[f32; 3]>, supported: Vec<bool>| RawGiSample {
+            frame_id: 1,
+            dispatch: RadianceCascadesDispatch {
+                sequence: 1,
+                revisions: RadianceCascadesRevisions {
+                    scene: 1,
+                    geometry: 1,
+                    lighting: 1,
+                },
+            },
+            submitted_at: std::time::Instant::now(),
+            eligible: vec![true; radiance.len()],
+            supported,
+            radiance,
+        };
+        let baseline = make_sample(vec![[0.0, 0.0, 0.0]; 100], vec![true; 100]);
+        let mut settled_values = vec![[0.0, 0.0, 0.0]; 100];
+        settled_values[..32].fill([20.0, 0.0, 0.0]);
+        let settled = make_sample(settled_values, vec![true; 100]);
+        let mut response_values = vec![[0.0, 0.0, 0.0]; 100];
+        response_values[..32].fill([19.0, 0.0, 0.0]);
+        let mut response = make_sample(response_values, vec![true; 100]);
+
+        // Independent sparse observations may miss different pixels. The
+        // common receiver set still meets the same 95% comparison-coverage gate.
+        response.supported[..3].fill(false);
+        let mut settled_partial = settled.clone();
+        settled_partial.supported[3..5].fill(false);
+        let error = lighting_response_error(&baseline, &response, &settled_partial).unwrap();
+        assert!((error - 0.05).abs() < 1e-6);
+
+        // Each sample individually still has >=95% support, but the common
+        // comparison set is only 94% of the baseline and cannot pass.
+        response.supported[5] = false;
+        assert!(motion_sample_support_ratio(&response).unwrap() >= 0.95);
+        assert!(lighting_response_error(&baseline, &response, &settled_partial).is_none());
+
+        // Exactly 95% per-sample support remains admissible; falling below it
+        // cannot be hidden by the common-pixel intersection.
+        response.supported.fill(true);
+        response.supported[..5].fill(false);
+        assert_eq!(motion_sample_support_ratio(&response), Some(0.95));
+        assert!(lighting_response_error(&baseline, &response, &settled).is_some());
+        response.supported[5] = false;
+        assert!(motion_sample_support_ratio(&response).unwrap() < 0.95);
+        assert!(lighting_response_error(&baseline, &response, &settled).is_none());
+
+        // A response outside the unchanged 5% residual limit still fails.
+        response.supported.fill(true);
+        response.radiance[..32].fill([18.9, 0.0, 0.0]);
+        assert!(lighting_response_error(&baseline, &response, &settled).unwrap() > 0.05);
+
+        // Supported output without an actual measured lighting delta is not a pass.
+        assert!(lighting_response_error(&baseline, &baseline, &baseline).is_none());
+    }
+
+    #[test]
+    fn motion_capture_waits_for_encoded_samples_after_each_history_change() {
+        let make_sample = |sequence: u64, lighting: u64, value: f32| RawGiSample {
+            frame_id: sequence,
+            dispatch: RadianceCascadesDispatch {
+                sequence,
+                revisions: RadianceCascadesRevisions {
+                    scene: 1,
+                    geometry: 2,
+                    lighting,
+                },
+            },
+            submitted_at: std::time::Instant::now(),
+            radiance: vec![[value, value, value]; 32],
+            eligible: vec![true; 32],
+            supported: vec![true; 32],
+        };
+        assert!(!motion_capture_can_advance(
+            0,
+            false,
+            false,
+            None,
+            &MotionSettleObservation::default(),
+            None
+        ));
+        assert!(motion_capture_can_advance(
+            0,
+            true,
+            false,
+            None,
+            &MotionSettleObservation::default(),
+            None
+        ));
+
+        let mut reset_settle = MotionSettleObservation::default();
+        reset_settle.begin(100);
+        let immediate = make_sample(101, 3, 1.0);
+        reset_settle.observe(&immediate);
+        assert!(motion_capture_can_advance(
+            128,
+            true,
+            false,
+            Some(&immediate),
+            &reset_settle,
+            None
+        ));
+        let before_reset_settle = make_sample(227, 3, 1.0);
+        assert!(!motion_capture_can_advance(
+            129,
+            true,
+            false,
+            Some(&before_reset_settle),
+            &reset_settle,
+            None
+        ));
+        let reset_settled = make_sample(228, 3, 1.0);
+        assert!(motion_capture_can_advance(
+            129,
+            true,
+            false,
+            Some(&reset_settled),
+            &reset_settle,
+            None
+        ));
+
+        let mut light_settle = MotionSettleObservation::default();
+        light_settle.begin(500);
+        let change = MotionLightChange {
+            revision: 7,
+            encoded_started_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(300))
+                .unwrap(),
+            settle: light_settle,
+        };
+        let before_light_settle = make_sample(627, 7, 1.0);
+        assert!(!motion_capture_can_advance(
+            161,
+            true,
+            false,
+            Some(&before_light_settle),
+            &reset_settle,
+            Some(&change)
+        ));
+        let light_settled = make_sample(628, 7, 1.1);
+        assert!(motion_capture_can_advance(
+            161,
+            true,
+            false,
+            Some(&light_settled),
+            &reset_settle,
+            Some(&change)
+        ));
+        let fast_change = MotionLightChange {
+            revision: 7,
+            encoded_started_at: light_settled.submitted_at,
+            settle: change.settle.clone(),
+        };
+        assert!(!motion_capture_can_advance(
+            161,
+            true,
+            false,
+            Some(&light_settled),
+            &reset_settle,
+            Some(&fast_change)
+        ));
+        assert!(motion_capture_can_advance(
+            258,
+            true,
+            false,
+            Some(&light_settled),
+            &reset_settle,
+            Some(&change)
+        ));
+        let wrong_revision = make_sample(700, 8, 1.1);
+        assert!(!motion_capture_can_advance(
+            161,
+            true,
+            false,
+            Some(&wrong_revision),
+            &reset_settle,
+            Some(&change)
+        ));
+        assert!(motion_capture_can_advance(
+            129,
+            false,
+            true,
+            Some(&immediate),
+            &reset_settle,
+            None
+        ));
+
+        let mut convergence = MotionSettleObservation::default();
+        convergence.begin(100);
+        let midpoint = make_sample(164, 3, 1.0);
+        convergence.observe(&midpoint);
+        let late = make_sample(228, 3, 1.1);
+        assert_eq!(convergence.encoded_samples(late.dispatch.sequence), 128);
+        assert!(
+            convergence
+                .midpoint_drift(&late)
+                .is_some_and(|drift| drift > 0.09)
+        );
+    }
+
+    #[test]
+    fn pending_motion_capture_uses_the_encoded_pose_revisions() {
+        let sample = |sequence, geometry, lighting| RawGiSample {
+            frame_id: sequence,
+            dispatch: RadianceCascadesDispatch {
+                sequence,
+                revisions: RadianceCascadesRevisions {
+                    scene: 1,
+                    geometry,
+                    lighting,
+                },
+            },
+            submitted_at: std::time::Instant::now(),
+            radiance: Vec::new(),
+            eligible: Vec::new(),
+            supported: Vec::new(),
+        };
+        let pending = PendingMotionCapture {
+            frame: 160,
+            camera_transform: Transform::IDENTITY,
+            history_epoch: 1,
+            occluder_position: Some(Vec3::ZERO),
+            minimum_dispatch_sequence: 10,
+            previous_geometry_revision: Some(4),
+            previous_lighting_revision: Some(8),
+        };
+        assert!(!pending_motion_sample_ready(&pending, &sample(9, 5, 9)));
+        assert!(!pending_motion_sample_ready(&pending, &sample(10, 4, 9)));
+        assert!(!pending_motion_sample_ready(&pending, &sample(11, 5, 8)));
+        assert!(pending_motion_sample_ready(&pending, &sample(11, 5, 9)));
     }
 
     #[test]
@@ -3025,6 +3896,9 @@ mod tests {
             benchmark_windowed: false,
             benchmark_vsync: false,
             benchmark_no_gi: false,
+            multi_bounce: true,
+            cached_hit_sky: false,
+            hardware_ray_queries: false,
             resolution_divisor: RadianceCascades::low_end().sampling.grid_divisor,
             max_rays: 32_768,
             max_traversal_queries: 16_384,
@@ -3039,12 +3913,15 @@ mod tests {
             motion_light_baseline_raw: None,
             motion_light_response_samples: Vec::new(),
             motion_light_change: None,
+            motion_reset_settle: MotionSettleObservation::default(),
+            motion_capture_pending: None,
             raw_gi: RawGiDiagnostics::default(),
             stability_capture: false,
             stability_frame: 0,
             stability_pixels: Vec::new(),
             stability_differences: Vec::new(),
         })
+        .insert_resource(RadianceCascadesStatus::default())
         .init_resource::<ButtonInput<KeyCode>>()
         .init_resource::<Time>()
         .init_resource::<Time<Real>>()
@@ -3053,6 +3930,7 @@ mod tests {
         .add_systems(Update, (controls, capture_motion));
         let mut profile = RadianceCascades::low_end();
         apply_sponza_profile(&mut profile, app.world().resource::<Demo>());
+        assert!(profile.multi_bounce);
         assert_eq!(
             (profile.probe_spacing, profile.interval_length),
             (SPONZA_PROBE_SPACING_METERS, SPONZA_INTERVAL_LENGTH_METERS)
@@ -3064,6 +3942,7 @@ mod tests {
             None,
         );
         assert!(profile_json.contains("\"probe_spacing_m\":1,\"interval_length_m\":1.6"));
+        assert!(profile_json.contains("\"multi_bounce\":true"));
         assert_eq!(
             profile.sampling.max_receiver_cells,
             SPONZA_SPLIT_MAX_RECEIVER_CELLS
@@ -3099,5 +3978,47 @@ mod tests {
         let gi = app.world().get::<RadianceCascades>(camera).unwrap();
         assert_eq!(gi.intensity, 0.0);
         assert_eq!(gi.history_epoch, 1);
+<<<<<<< Updated upstream
+=======
+        // H switches traversal without resetting GI history.
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.reset_all();
+        keys.press(KeyCode::KeyH);
+        app.update();
+        assert!(app.world().resource::<Demo>().hardware_ray_queries);
+        let gi = app.world().get::<RadianceCascades>(camera).unwrap();
+        assert!(gi.hardware_ray_queries);
+        assert_eq!(gi.history_epoch, 1);
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.reset_all();
+        keys.press(KeyCode::KeyH);
+        app.update();
+        assert!(!app.world().get::<RadianceCascades>(camera).unwrap().hardware_ray_queries);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .reset_all();
+        app.world_mut().resource_mut::<Demo>().playing = false;
+        app.insert_resource(ClearColor::default());
+        let sun = app
+            .world_mut()
+            .spawn((Sun, DirectionalLight::default(), Transform::default()))
+            .id();
+        app.add_systems(Update, lighting);
+        for (hour, shadows) in [
+            (12.0, true),
+            (0.0, false),
+            (12.0, true),
+            (5.99, false),
+            (6.01, true),
+            (17.99, true),
+            (18.01, false),
+        ] {
+            app.world_mut().resource_mut::<Demo>().hour = hour;
+            app.update();
+            let light = app.world().get::<DirectionalLight>(sun).unwrap();
+            assert_eq!(light.shadow_maps_enabled, shadows, "hour {hour}");
+            assert_eq!(light.illuminance > 0.0, shadows, "hour {hour}");
+        }
+>>>>>>> Stashed changes
     }
 }

@@ -13,10 +13,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-/// Measures the GPU queue envelope from before asset preparation through render
-/// submission, including uploads and GI deformation/refit. Excludes extraction,
-/// CPU presentation wait and work submitted outside the render schedule.
-/// This adds two submissions and async readback; enable only for profiling.
+/// Measures elapsed GPU-clock time between queue timestamps submitted before
+/// asset preparation and after rendering, including uploads and GI refits.
+/// The interval may include GPU idle time while the CPU prepares or waits for
+/// presentation; it is not a measurement of active GPU execution. Extraction
+/// and work submitted outside the bracket are excluded. This adds two queue
+/// submissions and asynchronous readback; enable only for profiling.
 pub struct FrameTimingPlugin;
 
 #[derive(Resource, Clone, Default)]

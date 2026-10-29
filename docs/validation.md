@@ -1,5 +1,666 @@
 # Validation
 
+<<<<<<< Updated upstream
+=======
+## Hardware ray-query traversal — October 29
+
+Same device, driver, scene and settings as the section below. With
+`hardware_ray_queries`, `traceDeferredHardware` and `traceVisibilityHardware`
+walk a hardware TLAS/BLAS; every candidate triangle is re-tested by the
+software triangle, culling, layer and alpha-coverage code.
+
+| Traversal | GI p50 / p95 | Penumbra GPU frame p50 / p95 | Frame interval p50 / p95 | Trace / visibility |
+| --- | ---: | ---: | ---: | ---: |
+| Software (inlined, fused merge), fast mode | 9.61 / 12.18 ms | 17.64 / 20.26 ms | 17.91 / 20.85 ms | 0.83 / 0.62 ms |
+| Hardware | 8.15 / 8.36 ms | 16.03 / 16.31 ms | 16.07 / 17.31 ms | 0.15 / 0.08 ms |
+
+The hardware run supported all 129,542 eligible raw pixels and showed no slow
+mode. It meets the 16.7 ms GPU-frame p95 in this run; the frame-interval p95
+(17.31 ms) does not. Cold pipeline creation took 10 s and 46 s for the two
+hardware kernels; later starts load the driver pipeline cache.
+
+At pose 127, 2,048 updates and 512 warmup frames, matched raw stability
+captures compare as follows. Hardware differs from software by no more than
+two software runs differ from each other:
+
+| Pair | Raw relative L2 | PNG mean | Coverage |
+| --- | ---: | ---: | ---: |
+| Software vs software repeat | 0.0833 | 0.56/255 | 100% |
+| Software A vs hardware | 0.0842 | 0.62/255 | 100% |
+| Software B vs hardware | 0.0801 | 0.59/255 | 100% |
+
+Records: `tmp/perf2/hw1.json`, `tmp/rq/q_*.json`.
+
+## Traversal inlining and fused child merge — October 29
+
+RTX 4070 Laptop GPU, driver 621.01, Vulkan, 1920×1080, balanced assets and
+shadows, 2,048 updates, divisor 4, 120 warmup and 240 measured samples.
+
+Vulkan SPIR-V previously marked every helper `DontInline`. In the
+traversal-only kernels (`traceDeferred` and `traceVisibility`), that kept the
+traversal state in call frames on every step. Those two kernels now leave
+inlining to the driver. Kernels with hit shading keep helper calls, because
+inlining that call graph takes the NVIDIA compiler minutes. With
+per-dispatch timestamps, closest-hit trace fell from 4.47 to 0.83–0.86 ms and
+visibility from 3.66 to 0.55–0.68 ms.
+
+Merge interpolated each of its four child directions once per transport
+source, repeating the same eight hash-chain lookups three times. One walk now
+feeds every active source. Per-source support, weights and light-hit bounds
+keep their original accumulation order; dependency boxes are order-independent
+unions. Merge levels 0–2 fell from about 2.3 ms to about 1.6 ms.
+
+| Build | GI p50 | Penumbra GPU frame p50 |
+| --- | ---: | ---: |
+| Before | 16.59 ms | 24.66 ms |
+| Inlined traversal, fast mode | 9.98–10.69 ms | 17.98–18.80 ms |
+| Plus fused merge, fast mode | 9.61 ms | 17.64 ms |
+| Either build, slow mode | 12.24–12.54 ms | 20.29–20.49 ms |
+
+Runs alternate between two stable modes with identical workload counters
+(2,048 receivers, about 6,100 admitted queries). In the slow mode only the two
+traversal kernels lengthen (trace about 3.1 ms, visibility about 1.3 ms), while
+SM and memory clocks stay at 2,625 / 8,001 MHz. The cause is not established;
+buffer residency or placement is a hypothesis. The 16.7 ms frame target is
+still not met. Records are under `tmp/perf2/`.
+
+## Converted daytime assets and presentation pacing
+
+The current local cook uses indexed float-attribute glTF and 512-pixel PNGs;
+it contains 6,276,355 triangles and 34,369,063 PNG bytes versus 10,809,942
+triangles and 2,180,411,830 PNG bytes in the source. These are disk counts,
+not GPU-residency measurements. The source and generated bundles remain
+separate; `--asset-profile=balanced` selects the generated files.
+
+On the RTX 4070 Laptop GPU, NVIDIA driver 621.01, Vulkan, 1080p, 2,048 updates
+and balanced shadows, the second pair of 120-warmup/240-sample screens measured:
+
+| Asset profile | GI | Frame p50 / p95 |
+| --- | --- | --- |
+| source | off | 8.662 / 9.325 ms |
+| converted | off | 6.246 / 6.880 ms |
+| source | on | 33.708 / 37.073 ms |
+| converted | on | 30.196 / 33.881 ms |
+
+These are independent screens, not 60 FPS certification. With converted
+assets, Split GI itself measured 21.695 ms p50 and 25.418 ms p95, including
+13.792 / 17.571 ms of tracing. `--no-vsync` requests AutoNoVsync for interactive
+windows; actual platform fallback and presentation behavior are not recorded.
+The active display adapter reported 60 Hz via Windows. A separate 600-sample
+converted GI-off screen requested AutoVsync and measured 16.649 ms median;
+the AutoNoVsync-requested screen above measured 6.246 ms. This is consistent
+with display pacing, not proof of a particular compositor or swapchain mode.
+One interactive AutoNoVsync-requested launch showed 33.3 FPS with GI on and
+156.9 FPS after toggling GI off; these are snapshots, not distributions.
+
+Five converted-versus-source daytime views passed the static image bounds at
+8,192 updates and reference shadows, with raw relative L2 from 0.028 to 0.070.
+The same five poses also passed with converted assets, balanced shadows and
+2,048 updates: raw relative L2 ranged from 0.038 to 0.102. Reference captures
+used driver 617.42 and converted captures used 621.01. These views do not
+establish moving-camera or all-lighting fidelity. Records:
+`tmp/format-converted-quality-pose*.json`, `tmp/format-combined-quality-pose*.json`,
+`tmp/format-source-driver621-repeat/`, `tmp/format-converted-driver621-repeat/`
+and `tmp/format-converted-vsync-no-gi.json`.
+
+The raster textures remain RGBA8 in GPU memory; PNG compression reduces disk
+size, not resident texel cost. BC7/BC5 KTX2 could reduce raster residency but
+is not a drop-in here: the GI CPU atlas currently rejects block-compressed
+images and Bevy 0.20 does not support the `KHR_texture_basisu` extension syntax.
+
+## Daytime interactive workload
+
+On the RTX 4070 Laptop GPU at 1920×1080, Vulkan and requested AutoNoVsync,
+the original 8,192-update compact workload measured 49.284 / 52.034 ms
+frame-interval p50 / p95. The current source-asset, balanced-shadow default
+uses 2,048 updates and requested grid divisor 4. A 120-warmup, 240-sample
+screen measured 31.997 / 35.034 ms frame p50 / p95 (31.3 / 28.5 FPS);
+the GI-off control and complete distributions are in
+`tmp/daytime-grid-4-2048/`. These are windowed screens, not interactive
+AutoVsync measurements or 60 FPS certification. A separate default interactive
+launch displayed 34.1 FPS in its window title at one observed moment; this is
+not a frame-time distribution.
+
+The 2,048-update setting uses the same trace estimator on an 8×8 receiver
+grid; larger requested update budgets retain compact indirect dispatch.
+At 1,024 updates and divisor 12, the grid screen measured 24.655 / 27.875 ms
+versus 34.801 / 46.648 ms with compact dispatch in a separate screen. The
+dispatch cutoff is based on requested updates, not an exact GPU selection count.
+At higher settings compact remains available with `--max-rays=8192`.
+
+Five daytime source/reference-shadow captures at 2,048 updates, divisor 4,
+and 512 warmup frames passed the static image bounds. Raw relative L2 ranged
+from 0.047 to 0.091, with at least 99.94% common eligible coverage. They do
+not prove motion quality at this lower update rate. Divisor 12 was not selected:
+its 2,048-update screen reached 28.992 / 33.296 ms, but pose 127 had raw
+relative L2 0.159 versus the 0.15 limit. A same-settings reference repeat
+at pose 127 scored 0.046. Records are under `tmp/day-grid-*`.
+
+An earlier reduced asset cook lowered the early deferred prepass median from
+about 2.55 ms to 1.88 ms and the receiver-identity median from 1.40 ms to
+0.95 ms in those screens. Full-frame p95 did not improve in those two cooked
+runs, so the default remained source assets. Those independent runs do not isolate
+the cause of the full-frame difference.
+
+## 1080p balanced-profile screening
+
+Windows, RTX 4070 Laptop GPU, driver 617.42, Vulkan, native 1920×1080,
+AutoNoVsync requested, 120 warmup and 240 measured samples. These are screening
+runs, not 1,800-sample certification. The source asset profile was retained:
+the candidate cook and its preservation fallbacks failed the midnight
+scene-linear fidelity bound. The default sun uses two 2048-pixel cascades over
+40 m; five fixed GI-off day/night views met the image bounds. At 1024 pixels,
+the first daytime view visibly lost architectural shadows.
+
+The following workload screen used the original, non-compact trace dispatch:
+
+| Requested grid divisor | Receiver updates | GI-on frame p50 / p95 | GI-off frame p95 |
+| ---: | ---: | ---: | ---: |
+| 4 | 8,192 | 52.851 / 58.765 ms | 16.917 ms |
+| 4 | 4,096 | 37.251 / 41.664 ms | 16.951 ms |
+| 4 | 2,048 | 30.583 / 34.094 ms | 16.982 ms |
+| 4 | 1,024 | 26.738 / 29.385 ms | 16.973 ms |
+| 12 | 8,192 | 56.023 / 62.281 ms | 16.947 ms |
+| 12 | 4,096 | 34.572 / 38.205 ms | 16.943 ms |
+| 12 | 2,048 | 28.274 / 32.224 ms | 16.981 ms |
+| 12 | 1,024 | 24.792 / 27.854 ms | 16.931 ms |
+
+None met the 16.667 ms frame gate. At the time the demo retained 8,192 updates,
+requested divisor 4 and resolve scale 4. At 1080p the receiver cap produces
+32,400 candidates (240×135); the raw resolve was 480×270. The lowest-budget
+divisor-12 run reported 14,400 candidates, 1,024 selected updates, 3,085
+admitted queries, 99.915% eligible support, 475,010,056 live view bytes and
+1,632,938,912 live scene bytes. Query counts and memory are endpoint diagnostics,
+not distributions. A requested cap of 131,072 is not an executed-ray count.
+
+Compact trace dispatch remains enabled for larger workloads, following explicit
+acceptance of its unresolved quality risk. It reduced median direction-generation, trace and argument-copy
+mean cost by 14.4% across three source/reference runs. Its midnight raw
+relative-L2 error was 0.659 against the 0.15 bound; an unchanged-reference
+repeat scored 1.457, demonstrating baseline variability but not equivalence.
+With balanced shadows, a later compact 8,192-update run recorded 49.284 ms
+frame p50 and 52.034 ms p95; GI-off frame p95 was 17.018 ms. These do not
+meet the 60 FPS gate.
+
+The initial reduced asset cook had 6,887,437 triangles versus
+10,809,942 source triangles and 34,369,063 bytes of PNGs versus 2,180,411,830
+source bytes, but its midnight relative L2 was 1.754. The ivy, curtains,
+full-geometry and source-texture fallbacks also failed that bound. The
+near-black midnight baseline itself failed the visible-contribution assertion,
+so these failures do not identify a specific asset or renderer defect.
+
+The PNG texture loader caches complete color-space-specific mip chains, using
+older base-level entries to build the new cache on first use. One warm 512-pixel
+run loaded 80 textures from cache with no PNG decodes in 1.457 seconds; an
+earlier warm base-level-cache run took 1.590 seconds, so the separate runs do
+not establish a reliable startup speedup. The resident 256-pixel screen had
+15.905 ms queue p95, equal at displayed precision to the final 512-pixel run;
+the demo retains 512 pixels. This cache change does not reduce GPU texture
+residency or demonstrate a steady-state frame-time improvement.
+
+The source/reference moving-blocker baseline stopped at an extinguished-light
+residual of 33.6% versus the 5% limit. This measures encoded submissions, not
+GPU completion or displayed latency. No 60 FPS or complete quality
+certification is claimed. Records are under `tmp/rendering-before-*`,
+`tmp/rendering-compact-*`, `tmp/assets-*-quality-0-0.json`,
+`tmp/shadow-balanced-benchmark/` and `tmp/workload-*/`.
+
+>>>>>>> Stashed changes
+## Active CPU and Split trace profiling
+
+The Sponza benchmark now records the Split trace pass distribution in
+`samples.trace_gpu_ms`. It uses independently delivered GPU diagnostic samples
+within the benchmark window; its sample count can differ from the GI total.
+The trace pass includes traversal, hit shading, visibility and cache deposits;
+the timestamp does not separate those costs.
+
+On Windows, RTX 4070 Laptop GPU, Vulkan driver 617.42, release Sponza at
+1920×1080, 8,192 updates and a 131,072-query cap, these separate windowed runs
+requested AutoNoVsync, discarded 120 warmup samples and measured 240 GI samples.
+The original trace run included CPU thread sampling; the changed run did not.
+Conditions and scene readiness can vary.
+
+| Run | Trace GPU p50 / p95 | Total GI GPU p50 / p95 | Frame interval p50 / p95 |
+| --- | --- | --- | --- |
+| Before shader change | 34.470 / 39.143 ms | 42.879 / 47.268 ms | 58.192 / 63.188 ms |
+| After shader change | 34.811 / 39.475 ms | 42.929 / 47.308 ms | 58.358 / 63.815 ms |
+
+The trace pass is the largest measured GI component. Both runs supported all
+129,542 eligible raw pixels at readiness. The change removes UV and color
+interpolation from the hit-attribute structure where the results were unused;
+material sampling still interpolates them where needed. Receiver queueing also
+reuses its entity lookup allocation and extraction avoids a duplicate lookup.
+These runs do not demonstrate a speedup, and the 60 FPS target is not met.
+Records: `tmp/cpu-sampled-baseline-gi.json` and `tmp/cpu-perf-optimized-gi.json`.
+
+Process CPU clocks, sampled separately during warmed measurement windows,
+showed 15.375 CPU seconds over 10.399 wall seconds with GI and 7.906 CPU
+seconds over 6.516 wall seconds without GI: approximately 1.48 and 1.21
+logical cores respectively. CPU time is summed across threads and may overlap
+GPU work. The GI-on run's busiest thread accumulated 8.203 CPU seconds during
+the 10.399-second interval. These are separate runs and do not isolate the
+cost of a particular Bevy system.
+
+An additional run sampled user-mode instruction pointers of the four most
+active threads approximately every 45 ms, weighting snapshots by intervening
+thread CPU cycles. The busiest thread was often sampled in
+`RtlQueryPerformanceCounter` and NVIDIA's `nvoglv64.dll`; this is consistent
+with polling, but snapshots do not provide call stacks or identify the caller,
+and interval weighting can attribute earlier work to the sampled endpoint.
+The sampling itself can perturb timings. WPR CPU tracing was also attempted but
+Windows rejected the profiling policy with `0xc5585011`, so no stack-based
+attribution is available. The CPU samples are in
+`tmp/cpu-samples-baseline-gi.json`; process-clock runs are
+`tmp/cpu-profile-named-gi.json` and `tmp/cpu-profile-nogi-extended.json`.
+
+A 320×180 multi-bounce capture completed day, GI-off and night stages with
+visible GI contribution (`tmp/cpu-perf-smoke_{day,no_gi,night}.png`); this is
+not a proof of radiometric equivalence across scenes or backends.
+The workspace all-target suite passed 124 tests, all 26 ignored Vulkan
+shader/GPU regressions passed, and strict all-target Clippy passed.
+
+## Base rendering with inactive GI
+
+When no active camera has positive GI intensity, scene synchronization and
+receiver-identity extraction stop doing per-frame mesh work. Re-enabling GI
+revalidates referenced assets and pending BLAS work, including assets that
+were absent when the scene resumed. Existing allocations may remain resident
+after a toggle; a scene started with GI disabled does not build the GI scene.
+Rasterization, GI-on sampling and Bevy's deferred prepass are unchanged.
+
+Release Sponza measurements at 1920×1080 on an RTX 4070 Laptop GPU used Vulkan,
+windowed rendering with `AutoNoVsync` requested, 120 warmup samples and at
+least 240 measurements. These are separate runs; scene readiness and scheduling
+can vary. The baseline predates this optimization.
+
+| Run | Frame interval p50 / p95 | Main schedule p50 / p95 |
+| --- | --- | --- |
+| GI disabled, before | 16.664 / 16.964 ms | 1.955 / 2.475 ms |
+| GI disabled, after | 16.663 / 17.435 ms | 1.702 / 2.417 ms |
+| GI enabled, after | 58.725 / 64.962 ms | See benchmark record |
+
+The inactive path removes work but these runs do not demonstrate a reliable
+frame-rate improvement, and the GI-on 60 FPS target remains unmet. The
+GI-disabled run did not construct or upload a GI scene. Records:
+`tmp/60fps-no-gi-1080.json`, `tmp/base-final-no-gi.json`, and
+`tmp/base-final-gi.json`.
+
+The earlier 16.6 ms GI-disabled GPU figure is a **queue-time envelope**, not
+proof of 16.6 ms of active GPU work: timestamps are submitted separately and
+can span CPU preparation or presentation waits. Requested `AutoNoVsync` does
+not establish the backend's selected present mode. A new
+`--benchmark-offscreen-no-gi` diagnostic mode removes the window but explicitly
+drains the GPU; its 17.868 ms median queue envelope
+(`tmp/base-final-offscreen-no-gi.json`) is not directly comparable to
+windowed throughput or active GPU execution. Bevy 0.20's built-in occlusion
+culling documents unspecified behavior with the required deferred prepass, so
+it was not enabled for GI cameras.
+
+The final workspace suite passed 100 tests, all 26 ignored Vulkan GPU
+regressions and 14 Sponza example tests passed, and Clippy passed. A 320×180
+Sponza multi-bounce capture passed its GI-on, GI-off and resumed night stages.
+These checks do not establish
+visual equivalence for every scene or backend.
+
+## 1080p traversal and environment optimization
+
+Closest-hit and shadow traversal now reuse each instance's inverse-transform
+rows for both origin and direction. HDR environment sampling reuses its mapped
+UV for radiance and PDF evaluation, reuses an alias record when possible, and
+defers non-alias texture reads for directions rejected by the surface. Ray
+selection, budgets, intersection tests, and lighting estimators are unchanged.
+
+The table records separate release, windowed, VSync-off Sponza runs on an RTX
+4070 Laptop GPU with Vulkan, 120 warmup samples and at least 240 measured
+samples. GI-on runs use the same 1 m probes, 8,192 updates, and 131,072-query
+cap. The pre-change row retains the environment optimization but uses the
+original traversal transforms; the final row includes both optimizations.
+Timings vary with scheduling and GPU conditions.
+
+| 1920×1080 run | GI GPU p50 / p95 | Frame interval p50 / p95 |
+| --- | --- | --- |
+| GI disabled | — | 16.664 / 16.964 ms |
+| Original traversal | 42.346 / 46.775 ms | 57.506 / 62.682 ms |
+| Final traversal | 42.549 / 46.103 ms | 57.983 / 62.093 ms |
+
+The 60 FPS target is not met and these runs do not establish a 1080p speedup.
+The final run supported all 129,542 eligible raw pixels at readiness. At
+640×360 offscreen with 1,024 updates and a 16,384-query cap, GI p50 was
+12.872 ms before the transform change and 12.669 ms after; this small
+difference is not sufficient to establish a robust speedup. Records are
+`tmp/60fps-{no-gi-1080,paired-before-1080,final-1080,paired-before-low,final-low}.json`.
+
+The Vulkan GPU suite passed all 26 regressions, including brute-force traversal
+comparisons and rotated HDR environment PDF and radiance checks. The workspace
+suite passed 97 tests; Clippy passed. A 320×180 Sponza multi-bounce day/GI-off/
+night capture passed. Neither that capture nor support counts establish
+radiometric equivalence across all scenes or backends.
+
+## Paper-style cached hit sky
+
+`cached_hit_sky` (Sponza `--cached-hit-sky`, requires `--multi-bounce`) follows
+the paper's multibounce shading: secondary-cache rays that escape carry the
+environment radiance, and primary and secondary ray hits covered by that cache
+take sky light from it instead of tracing environment visibility rays. Hits
+without secondary coverage, including the cold cache, keep visibility-tested
+environment sampling. The cache's sky term is diffuse-only and one frame late;
+GGX sky reflection at hit points is dropped.
+
+Release Sponza, Vulkan, RTX 4070 Laptop GPU, 1920×1080 windowed AutoNoVsync,
+balanced asset and shadow profiles, divisor 4, 2,048 updates, 131,072 queries,
+`--multi-bounce`, 120 warmup and 600 measured samples, alternating runs from
+one binary:
+
+| Run | GI GPU p50 / p95 | Penumbra frame p50 | Admitted queries |
+| --- | --- | --- | --- |
+| Sky NEE, run 1 | 20.310 / 21.316 ms | 28.300 ms | 3,011 |
+| Sky NEE, run 2 | 20.335 / 21.445 ms | 28.361 ms | 3,024 |
+| Cached sky, run 1 | 19.005 / 19.876 ms | 27.014 ms | 2,102 |
+| Cached sky, run 2 | 18.962 / 20.409 ms | 27.008 ms | 2,108 |
+
+GI GPU p50 fell by about 1.34 ms (6.6%); the secondary trace pass and the
+primary visibility pass account for most of it. Matched 160×90 raw stability
+captures (16 frames) against sky NEE gave relative L2 0.133 and a −1% to −3%
+per-channel mean bias; two sky-NEE runs differed by relative L2 0.171 and
++1.8% to +2.3% bias, so the difference is within run-to-run variation at this
+sample count. Tone-mapped PNGs differed by 1.49/255 mean absolute error. This
+is not a reference comparison. Records are `tmp/perf-pass/sky_mb_*.json` and
+`tmp/sky-cache/`.
+
+## Optional secondary cache and traversal pass
+
+The optional `multi_bounce` path seeds a separate, two-LOD-coarser cache
+from previous primary ray hits. Both primary and secondary hit shading read
+the previous completed secondary field. Adjacent secondary LODs now blend
+their independently supported source values over the LOD overlap, instead of
+switching abruptly. The lookup retains the reference implementation's nearest
+coarse probe; unsupported or invalidated observations remain excluded.
+
+Traversal compares complete layer-mask words together, avoids reading an
+immutable geometry page when an animated overlay supplies the word, and defers
+the geometry header until the root bounds are hit. These preserve the selected
+words and intersections. The Vulkan GPU regressions, including traversal,
+secondary generation/invalidation, seed/clear, and LOD-overlap cases, passed
+(26 ignored GPU tests). The ordinary workspace suite passed (97 tests), as
+did Clippy.
+
+An isolated release Sponza run at 640×360, divisor 8, 1,024 updates and
+16,384 traversal queries used Vulkan on an RTX 4070 Laptop GPU, 120 warmup
+samples and 240 measured samples. The earlier baseline below is from the
+preceding vector-finiteness pass; it was not collected in the same session.
+
+| Run | GI GPU p50 / p95 | Supported / eligible at readiness |
+| --- | --- | --- |
+| Earlier baseline | 12.770 / 13.868 ms | 14,335 / 14,396 |
+| This pass | 12.763 / 13.915 ms | 14,335 / 14,396 |
+
+This comparison does not demonstrate an end-to-end speedup; its difference is
+small relative to run-to-run variation. Records are
+`tmp/perf-final-low.json` and `tmp/current-traversal-isolated.json`.
+At 320×180, separate Sponza day/GI-off/night captures passed both with
+multi-bounce enabled (1,024 total updates, 16,384 total queries) and disabled
+(512 updates, 8,192 queries), matching the primary quota. The daytime RGB
+means were 32.543 and 29.636 respectively. The multi-bounce run dispatched
+the secondary trace and both captures reached 3,501/3,599 supported pixels.
+These independently accumulated, tone-mapped captures are consistent with
+visible feedback, but do not isolate it from sampling differences or establish
+radiometric accuracy or convergence against a reference.
+
+The remaining dated sections describe the state at their stated revisions;
+statements that multi-bounce was absent are historical.
+
+## Vector finiteness and sparse-cache performance
+
+Slang lowered vector `isfinite` checks into dynamically indexed component
+loops. Branchless IEEE-754 exponent tests preserve the classification of
+finite values, infinities, and NaNs without those loops. Resolve computes its
+octahedral lookup once per receiver, while merging, retention, probe packing,
+material sampling, and scene repacking avoid redundant work. Independent source
+support, history dependencies, and traversal limits remain in force.
+
+The following release Sponza runs used Vulkan on the RTX 4070 Laptop GPU
+with Slang → WGSL → Naga SPIR-V, 120 warmup samples, and at least 240
+measured GI GPU samples. The before runs use the saved
+`tmp/perf-autotune-stack.exe`; the after runs use the updated source.
+Per-frame scheduling and scene readiness can vary between runs.
+
+| View / receiver updates / traversal cap | Before GI p50 / p95 | After GI p50 / p95 | Supported / eligible at readiness |
+| --- | --- | --- | --- |
+| 640×360 offscreen, 1,024 / 16,384, divisor 8 | 24.671 / 26.153 ms | 12.770 / 13.868 ms | 14,335 / 14,396 in both |
+| 640×360 offscreen, 8,192 / 131,072, divisor 4 | 62.466 / 64.742 ms | 46.837 / 48.894 ms | 14,396 / 14,396 in both |
+| 1280×720 windowed, 8,192 / 131,072, divisor 4 | 48.856 / 60.359 ms | 34.457 / 42.045 ms | 57,570 / 57,580 in both |
+
+The two offscreen GPU queue-envelope p95 values after the changes were 35.195 ms
+and 70.065 ms. The windowed run requested VSync off and measured a 56.691 ms
+p95 frame interval after the changes, above the 33.3 ms target. These results
+do not certify target GPUs or radiometric equivalence. The measurements and
+settings are in `tmp/perf-current-baseline{,-full,-window}.json` and
+`tmp/perf-final-{low,full,window}.json`.
+
+The 94 ordinary library tests and all 24 ignored GPU/compiler regressions
+passed on Vulkan, including fractional support, octahedral seams, scene edits,
+and traversal. The DirectX 12 composite and transport-helper regressions passed,
+and the retention pipeline compiled; its pre-change shader failed FXC loop
+unrolling. The full DirectX 12 suite was not completed: FXC trace-pipeline
+compilation exceeded 180 seconds and the merge regression exceeded 120 seconds.
+Selecting the installed SDK's dynamic DXC failed while requesting a device
+(`Device(Lost)`). These checks do not certify the DX12 path.
+
+## Deferred BVH branch timing
+
+Closest-hit traversal now retains the entry distance of each deferred BVH
+branch. When a nearer hit shortens the ray, that distance decides whether the
+branch is still eligible, without loading and testing its box again. Both the
+top-level and instance walks retain their existing stack depth and overflow
+fallback. Shadow traversal already avoids the repeated box test.
+
+Two separate release, windowed Vulkan Sponza runs per version used an RTX
+4070 Laptop GPU, 1280×720, VSync off, 8,192 receiver updates, a 131,072-query
+cap, 120 warmup samples and 240 measured GI GPU samples. The same
+57,570/57,580 eligible raw pixels were supported at readiness in all runs.
+
+| Run | Before GI p50 / p95 | After GI p50 / p95 | Before / after GPU queue envelope p50 |
+| --- | --- | --- | --- |
+| 1 | 53.623 / 64.625 ms | 51.994 / 62.902 ms | 68.414 / 66.843 ms |
+| 2 | 62.610 / 65.659 ms | 61.643 / 65.246 ms | 77.468 / 76.405 ms |
+
+The approximately 1–1.6 ms median GI improvement is small relative to the
+run-to-run variation. A separate 640×360 offscreen test with 1,024 updates and
+a 16,384-query cap measured 25.743 / 27.329 ms before and 25.818 / 27.089 ms
+after (GI p50 / p95), with 14,335/14,396 eligible pixels supported in both.
+The records are `tmp/perf-autotune-window-{baseline,baseline-repeat,stack,stack-repeat}.json`
+and `tmp/perf-autotune-low-{baseline,stack}.json`.
+
+These runs do not establish the 30 FPS target or performance on the low-end
+target GPUs. The deferred-node stack now uses two words per entry instead of
+one, so register or local-memory pressure may differ on other devices. The
+paper's OptiX tracing measurements are not directly comparable to this crate's
+software BVH.
+
+## Paper-guided performance pass
+
+The paper's Section 6 uses workgroup-level reuse to preintegrate the 6×6
+irradiance field. The probe-packing pass now shares its canonical-directory
+lookup and the 32 direction vectors within each workgroup. It still keeps
+background, emissive, and punctual support separate and preserves the
+dependency bounds. The trace pass rejects unselected receivers before loading
+the G-buffer, reuses per-ray triangle setup and traversal bounds, and avoids
+repeating atlas metadata reads. Animation pose snapshots are moved into the
+previous-frame state instead of cloned.
+
+A prototype that cached the four child-direction lookups across lighting
+sources was not retained: it did not improve the measured Sponza or Cornell
+runs. Directly pre-averaging children as in the paper would also need to
+preserve this implementation's independent fractional support, missing samples,
+and conservative history dependencies; averaging conditional radiance alone
+is not equivalent.
+
+The following are separate release, offscreen-drained Vulkan runs on an RTX
+4070 Laptop GPU with the Slang → WGSL → Naga SPIR-V path, 120 warmup samples,
+and at least 240 measured GI GPU samples. Both versions used the same Sponza
+scene, 640×360 viewport, and requested budgets. Asynchronous scene readiness
+and temporal sampling can differ between runs.
+
+| Receiver updates / traversal cap | Before GI p50 / p95 | After GI p50 / p95 |
+| --- | --- | --- |
+| 1,024 / 16,384, grid divisor 8 | 24.575 / 25.865 ms | 24.916 / 26.274 ms |
+| 8,192 / 131,072, grid divisor 4 | 58.629 / 62.010 ms | 59.827 / 63.325 ms |
+
+These runs did **not** establish an end-to-end GPU speedup. At readiness,
+both versions supported 14,335/14,396 eligible receivers in the first setting
+and 14,396/14,396 in the second. The daylight, GI-disabled, and night capture
+gates passed after the changes. These are not matched scene-linear reference
+comparisons, native-resolution frame-time certification, or evidence that the
+previously documented dynamic-light extinction failure is fixed. The paper
+uses OptiX for tracing and excludes G-buffer and direct-shadow costs from its
+reported breakdown, so its timings are not directly comparable.
+
+The final offline all-target Vulkan suite passed 142 tests, including the
+ignored shader and GPU checks. Strict all-target Clippy and the six transport
+metric-tool tests also passed.
+
+Benchmark records are `tmp/perf-before.json`, `tmp/perf-before-default.json`,
+`tmp/perf-atlas.json`, and `tmp/perf-atlas-default.json`; final captures use the
+`tmp/perf-atlas_` prefix.
+
+## Vulkan dynamic lighting, alpha coverage, and sub-grid receivers
+
+On the RTX 4070 Laptop GPU, a 640×360 Sponza windowed, pipelined debug-profile
+benchmark with 8,192 updates and a 131,072-query cap recorded 240 GI samples:
+55.951 ms median and 64.505 ms p95 for GI, and 78.209 ms p95 frame interval.
+All 14,396 eligible raw receiver samples were supported at readiness. This is
+not a controlled before/after comparison and exceeds the existing frame-time
+target. See `tmp/terra-improved-benchmark.json`.
+
+The final moving-camera, moving-blocker, and dynamic-light capture retained
+14,313/14,313 eligible raw samples at the light-off pose, but failed the
+unchanged extinction gate: 41.7% residual versus 5% allowed. The logged
+83.8 ms response is an encoded-submission interval, not GPU completion or
+display latency. The failure occurs before the relight gate, so relight is
+not verified. See `tmp/terra-final-motion.log` and `tmp/terra_final_motion_*.png`.
+
+Vulkan GPU fixtures exercise masked and blended closest-hit/shadow traversal,
+including fully transparent, fully opaque, and fractional texture alpha;
+independent background retention on punctual changes; and a small receiver
+without any compatible reduced-resolution screen sample. These checks do not
+establish the outstanding Sponza response or performance targets.
+The complete offline all-target Vulkan run passed 118 library and 24 example
+tests, including ignored GPU fixtures; strict all-target Clippy and example
+builds passed.
+
+## Earlier source-separated response investigation
+
+The current implementation retains directional/environment, emissive, and
+finite-punctual radiance independently through interval merging, angular
+prefiltering, and spatial/LOD reconstruction. These groups share the same
+transmittance estimator. The Sponza profile requests 8,192 receiver updates,
+131,072 traversal queries, and a 1 GiB view budget; the library low-end
+profile is unchanged.
+
+The probe directory now compares canonical keys without their ray-direction
+bits. Before this fix, a traced nonzero direction could win the directory slot
+but fail the subsequent packing lookup. The Vulkan GPU regression reproduced
+the missing irradiance before the fix and passes afterward. In a stationary
+Sponza capture, recorded packed probe count stabilized at 781 instead of
+varying around 366–401.
+
+On the RTX 4070 Laptop GPU with Vulkan, the 640×360 motion capture supported
+14,313/14,313 eligible receivers after reset and at light-off. It still failed
+the unchanged extinction gate: residual was 46.2%, versus the required 5%.
+Pre-change midpoint-to-baseline scene-linear drift was 9.5%; the settled
+midpoint-to-final drift was 3.8%. A longer-retention experiment measured 20.7%
+residual after more than 1,000 dispatches per state; it was not adopted as the
+default. These figures do not establish convergence or a 100 ms visible
+response. Submission timestamps do not measure GPU completion or display
+latency. See `tmp/terra-fixed-probe.log` and `tmp/terra-stable-beta.log`.
+
+The Vulkan suite passed 119 library and 24 example tests, including the ignored
+GPU fixtures, and strict all-target Clippy passed. Vulkan is the target backend
+for this crate; DirectX 12 compatibility is outside the current scope.
+
+Vulkan Cornell and Sponza static captures passed after the probe lookup fix.
+Cornell had 38,398/38,400 sampled image pixels lit. Sponza's day, GI-off, and
+night display means were 29.180, 7.545, and 0.720; the matched GI-on/off
+difference was 21.654/255. The recorded day sample had 14,396/14,396 eligible
+receivers supported. The Sponza static log reported a 57.42 ms Split GPU sample
+at 640×360; this is not a native-resolution performance benchmark. Images were
+inspected in `tmp/terra-probe-cornell.png` and `tmp/terra_probe_static_*.png`.
+The camera-only motion and cache-revisit capture also passed: immediate return
+and the final revisit differed from the initial image by 0.569/255 and
+0.570/255 respectively, below the 8/255 gates; eligible support was 100% at
+the captured return. See `tmp/terra-probe-camera.log`.
+
+The following October 26 results describe an earlier implementation, not this
+source-separated revision.
+
+## Reference completion and runtime gates — October 26
+
+The implementation was reviewed against the supplied PDF, parsed paper, and
+Chandra source. This remains the strict diffuse base, not the optional
+multi-bounce, glossy, or c−1 extensions.
+
+Cold initialization now weights probe admission by projected receiver
+population instead of treating every visible probe equally. Three bounded
+rank phases build a logarithmic population histogram, admit denser probes,
+then fill unused capacity from the existing fair window. The histogram reuses
+parent-count scratch; no cache allocation, ray-budget increase, directional
+sampling change, or fabricated support is involved. The GPU regression checks
+density precedence, phase separation, budget limits, and unchanged warm/no-history
+scheduling. A separate resolve case preserves partially supported black.
+
+In the Vulkan 640×360 Sponza moving-blocker/light capture, with 512 receiver
+updates, 16,384 traversal queries, and 120 warmup frames, the full reset at frame
+128 previously supported 13,018/14,313 eligible receivers (90.95%). The weighted
+admission run supported 14,306/14,313 (99.951%) at that reset and reached frame
+192 with 14,313/14,313 supported. These are recorded samples, not a guarantee
+of first-frame coverage in arbitrary scenes. The log is
+`tmp/sol-weighted-motion.log`; captures use `tmp/sol_weighted_motion_motion_*.png`.
+
+The lighting-response comparison now excludes unsupported observations rather
+than rejecting an entire sample when a single receiver is missing. Each sample
+must still have 95% support, and at least 95% of baseline-supported receivers
+must remain comparable. The 100 ms response window, 5% extinction residual,
+minimum 16 affected receivers, and measurable-contribution checks are unchanged.
+This exposes a real unresolved acceptance failure: the recorded extinction
+comparison at frame 192 reports 128.8% residual. No timed extinction or relight
+acceptance is claimed from this run.
+
+Immutable scene light and layer arrays are now shared by history snapshots,
+removing per-view per-frame vector copies while preserving last-encoded
+snapshot comparisons. `scripts/benchmark_sponza.ps1` consumes the current
+schema-13 report and its `updates_per_frame` field instead of rejecting it
+against the obsolete schema-11 names.
+
+Verification passes all 139 Rust tests (116 library and 23 example tests),
+including every ignored Slang/GPU fixture, plus the six Python transport-metric
+tests. Strict all-target Clippy and formatting checks pass:
+
+```sh
+cargo test --offline --all --workspace --all-targets -- --include-ignored --test-threads=1
+cargo clippy --offline --all --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+python -m unittest discover -s scripts -p test_measure_transport.py -v
+```
+
+The weighted-admission build also passed the 640×360 Sponza daylight/GI-off/night
+capture, with display RGB means 28.210, 7.545, and 0.720 and GI-on/off difference
+20.686/255. All 14,400 raw values were finite; the recorded daylight sample
+supported 14,396/14,396 eligible receivers. The camera-return/cache-revisit
+sequence passed: immediate-return RGB difference was 1.279/255 and the final
+revisit was 1.851/255, below the unchanged 8/255 gates. Cornell at 640×480
+reported 38,398/38,400 sampled image pixels lit. Images were inspected;
+these are smoke and temporal-reuse checks, not radiometric accuracy. Logs are
+`tmp/sol-final-{static,camera,cornell}.log`; images use
+`tmp/sol_final_{static,camera,cornell}*`.
+
+A release, windowed, VSync-off 1920×1080 benchmark on the RTX 4070 Laptop GPU
+recorded 120 warmup and 240 measured GI samples. GI median/p95 was
+15.554/17.837 ms; the GPU queue envelope p95 was 32.903 ms and the observed
+frame-interval p95 was 34.211 ms. The JSON is `tmp/sol_native_1080.json`.
+This benchmark includes the snapshot-sharing change but predates weighted cold
+admission. It does not pass the script's unchanged 16.7 ms complete-frame gate
+and does not certify low-end target hardware.
+
 ### Split-only strict-base status — October 24
 
 This change set reduces the crate to the Split Radiance Cascades strict base
@@ -15,7 +676,7 @@ least 95% support over eligible pixels. The support report is independent of
 the capture warmup and does not add a GPU readback. Captures still require their
 configured warmup and the unchanged 95% support gate.
 
-The active Sponza profile uses 0.15 m probe spacing, a 0.24 m first interval,
+At this October 24 snapshot, the Sponza profile used 0.15 m probe spacing, a 0.24 m first interval,
 32,768 receiver cells, 262,144 retained interval records, a 544 MiB view budget,
 64 history frames, and 0.985 temporal blend. Sponza uses a 32 MiB/frame geometry
 upload cap to shorten initial scene staging; the library default is unchanged.
@@ -39,6 +700,71 @@ continues to provide native PBR lighting; Split supplies the paper's diffuse
 indirect transport. Method selection, Hybrid estimators, custom near-field
 continuation, secondary bounce feedback, and their settings were removed from
 the active API.
+
+## Bounded-support reference completion — October 25
+
+The bundled paper and Chandra implementation were reviewed against the
+existing strict diffuse base. This pass preserves native Bevy light ownership
+and secondary-hit Disney/GGX material evaluation; it adds no optional glossy
+receiver or multi-bounce transport.
+
+Sparse interval interpolation, irradiance packing, angular lookup, spatial
+lookup, and LOD blending now preserve finite positive support below the former
+epsilon cutoffs. Per-axis weight selection also avoids cancellation from
+arithmetic `lerp` at tiny positive fractions. GPU fixtures exercise conditional
+radiance and positive support down to approximately `2.43e-14`; at that coverage,
+the raw alpha retains its supported bit but cannot represent the fractional
+confidence.
+
+Cold initialization nominates receivers with one atomic exchange rather than
+retrying weak compare-exchange. Its remaining updates now require membership
+in the current fair window. The cold-rank fixture preserves nominated
+descriptor IDs separately from the count storage that replaces them, and the
+R₂ fixture includes the current production rank helper and its dependencies.
+The previously missing fixture word serialization is complete.
+
+Bounded traversal no longer publishes exhausted or clipped misses as supported
+lighting observations. Closest-hit traversal must be complete; a real accepted
+blocker still proves any-hit occlusion even after another branch was incomplete.
+The GPU regression failed with the original exhaustion branch reporting an
+exhausted clear ray as blocked, and passes with explicit unsupported propagation.
+
+Final verification passes 138 tests: 116 library tests, including every ignored
+Slang/GPU fixture, plus 22 example tests. No tests are skipped. The default-only
+control-value assertion was removed rather than pinning incidental tuning.
+All examples build; strict Clippy and formatting checks pass:
+
+```sh
+cargo test --offline --all --workspace --all-targets -- --include-ignored --test-threads=1
+cargo clippy --offline --all --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo build --offline --examples
+```
+
+Debug-profile Vulkan smoke captures on the RTX 4070 Laptop GPU completed with
+120 warmup frames. Cornell at 640×480 lit 38,398/38,400 sampled pixels and saved
+`tmp/luna_complete_cornell.png`. Sponza at 640×360 completed day, GI-off, and
+night stages with all 14,400 raw values finite and 14,396/14,396 eligible
+receivers supported in the recorded daylight samples. The display RGB means
+were 28.758, 7.545, and 0.720 respectively; the GI-on/off difference was
+21.234/255. Captures are `tmp/luna_complete_sponza_{day,no_gi,night}.png`.
+The images were inspected; these are smoke results, not radiometric accuracy.
+
+The camera-only run also completed its pan, immediate return, 64-frame
+look-away, and cache-revisit stages at the same workload. Immediate-return
+display RGB difference was 1.055/255; the first look-away return was
+1.740/255 and the final revisit was 1.702/255, below the unchanged 8/255 gates.
+The return captures had 14,396/14,396 eligible receivers supported. Images are
+`tmp/luna_complete_camera_camera_motion_*.png`.
+
+The matching moving-blocker/light run passed its captured support gates through
+frame 192, whose raw output supported 14,313/14,313 eligible receivers with
+14,400 finite values. It then exited 101 because the extinction-response
+comparison returned no measurable ratio. The metric also rejects missing
+support in a comparison sample, so that message alone does not establish that
+the changed lights contributed no energy. Captures through frame 192 are
+`tmp/luna_complete_motion_motion_*.png`. No 100 ms response, 5% residual, or
+native-1080p performance acceptance is claimed.
 
 ## Reference-completion follow-up — October 25
 
@@ -267,7 +993,11 @@ deadlines were applied to the same sample, making acceptance impossible. The
 requirements remain. CPU regressions pass; this does not yet certify moving
 scene quality.
 
-Persistent Split resolution now falls back to another matching probe page when
+The following exact-bin fallback and convolution details describe the
+pre-integration resolver revision and are superseded by the current 6×6 resolve
+snapshot below.
+
+Persistent Split resolution at that revision fell back to another matching probe page when
 the selected page lacks a directional bin or that bin's physical anchor is
 incompatible. Directory headers remain a search hint; packed-bin support,
 instance ownership, normal/plane compatibility, and finite geometry determine
@@ -276,7 +1006,7 @@ incompatible while their packed directional anchors are valid. The fallback is
 lazy, bounded by the existing directory-search limit, and adds no BVH queries.
 Ordinary methods retain their existing visibility path.
 
-The 32-bin convolution passes its known bin index directly to interpolation,
+That revision's 32-bin convolution passes its known bin index directly to interpolation,
 avoiding direction encoding and zero-weight angular taps at exact bin centers.
 A truly empty low/high-LOD neighborhood returns before environment sampling.
 Resident Split tracing uses eight-thread groups to distribute a small update
@@ -319,6 +1049,46 @@ eight. The final active sample reports 34.80 ms for Split and 14.69 ms for world
 resolve, with a 49.85 ms frame queue envelope. These progress samples are not a
 completed benchmark window. No `target/gi_continue_resolve_1080.json` was
 produced. Logs are `target/gi_continue_resolve_1080.stderr.log` and `.stdout.log`.
+
+### October 25 preintegrated resolve and timing snapshot
+
+The current Split resolve follows the paper's Lambertian preintegration
+description: each probe carries a 6×6 octahedral irradiance field. Its 36
+RGBA32F cells store radiance with observed angular coverage, followed by the
+two aggregate dependency vectors, for a 608-byte probe record. Resolve uses
+four-tap bilinear sampling with explicit octahedral seam folding; no copied
+border is allocated. It visits positive-weight spatial neighbors at the active
+low/high LODs and skips missing probes or angular samples. Coverage stays
+separate from conditional radiance, so unsupported directions are not treated
+as black. Angular lookup is limited to those active spatial neighbors.
+
+The host schedules cold-priority rank phases only when persistent world
+intervals are enabled, `history_frames > 0`, and world history is invalid. The
+two extra phases precede parent and prefix construction; this cold-priority
+frame does not consume the ordinary fair cursor. With history disabled, those
+phases remain off and the circular fair schedule continues to advance. Update
+windows wrap across uneven candidate-list tails while preserving the requested
+per-frame budget.
+
+The active Sponza profile is 1 m probe spacing, 1.6 m first interval, 512
+updates/frame, grid divisor 4, 32,768 receiver cells, resolve scale 4, 16,384
+traversal queries, 262,144 cache entries, and 64 history frames. A matched
+1920×1080 Vulkan snapshot on an NVIDIA RTX 4070 Laptop GPU, using those settings
+and 120 warmup plus 240 measured samples, reports GI p50 30.54 ms to 15.37 ms
+and observed frame-interval p50 59.12 ms to 41.32 ms. The before and after JSON
+files are [`tmp/perf-before-1080.json`](../tmp/perf-before-1080.json) and
+[`tmp/perf-cooperative-1080.json`](../tmp/perf-cooperative-1080.json). Both
+measured windows report full support, but the after window's GI p95 is 17.52 ms
+and frame-interval p95 is 44.20 ms, above the 16.7 ms target. This is a measured
+snapshot, not a frame-budget, cold-history, moving-scene, or lighting-response
+acceptance result.
+
+A separate cold/reset readback at raw frame 286 measured 93.88668% eligible-
+pixel support (`tmp/cold-classifier-sponza.log`). The temporary classifier found
+no missing directory descriptors; 724 unsupported pixels had no covered cell
+in their neighboring tables, and 151 had table coverage away from the target
+normal. This diagnostic does not pass the unchanged 95% cold-support gate, and
+full-response checks remain unestablished.
 
 ### October 22 Split corrections
 

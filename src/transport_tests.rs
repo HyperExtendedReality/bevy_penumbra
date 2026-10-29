@@ -1,7 +1,7 @@
 //! Ignored GPU checks for the production transport helpers.
 use bevy::{
     asset::RenderAssetUsages,
-    math::{Mat4, UVec2, UVec4, Vec2, Vec3, Vec4},
+    math::{Mat4, Quat, UVec2, UVec4, Vec2, Vec3, Vec4},
     prelude::{Image, default},
     render::{
         render_resource::*,
@@ -48,12 +48,12 @@ struct TransportParameters {
     scene_overlay: UVec4,
     dirty_min: Vec4,
     dirty_max: Vec4,
-    transport: Vec4,
+    source_history: UVec4,
     sampling: UVec4,
     owner_sequence: UVec4,
     cache_time: UVec4,
-    world_receivers: UVec4,
-    world_receiver_state: UVec4,
+    emissive_dirty_min: Vec4,
+    emissive_dirty_max: Vec4,
     light_dirty_min: Vec4,
     light_dirty_max: Vec4,
 }
@@ -122,6 +122,36 @@ void checkTransport(uint3 id : SV_DispatchThreadID) {
     uint north = directionIndex(float3(0, 1, 0), 3u);
     uint south = directionIndex(float3(0, -1, 0), 3u);
     results[25] = float4(float(north), float(south), 2048.0, 0.0);
+    // Classify finite f32 boundaries and every non-finite component at runtime.
+    uint payload = params.frame.x & 1u;
+    float4 finiteValues = asfloat(uint4(0u, 0x80000000u, 1u, 0x7f7fffffu - payload));
+    float4 nonFinite = asfloat(uint4(0x7f800000u, 0xff800000u,
+                                     0x7fc00000u | payload, 0xffc00000u | payload));
+    results[26] = float4(all(isfinite(finiteValues.xy)) ? 1.0 : 0.0,
+                          all(isfinite(finiteValues.xyz)) ? 1.0 : 0.0,
+                          all(isfinite(finiteValues)) ? 1.0 : 0.0,
+                          any(isfinite(nonFinite)) ? 1.0 : 0.0);
+    results[27] = float4(any(isfinite(nonFinite.xy)) ? 1.0 : 0.0,
+                          any(isfinite(nonFinite.xyz)) ? 1.0 : 0.0,
+                          isfinite(nonFinite.zxyw).w ? 1.0 : 0.0,
+                          isfinite(nonFinite.wzyx).w ? 1.0 : 0.0);
+    // Exercise both UV-reuse paths against independent CPU PDF/radiance
+    // expectations with a rotated, non-uniform HDR texture.
+    for (uint index = 0; index < 8; ++index) {
+        float4 random = float4((float(index) + 0.25) / 8.0, 0, 0.5, 0.5);
+        float3 direction, radiance;
+        float pdf;
+        float2 uv;
+        bool valid = sampleEnvironment(random, direction, pdf, radiance, uv);
+        results[28 + index * 2] = float4(direction, environmentPdfUv(uv));
+        results[29 + index * 2] = float4(environmentRadianceUv(uv), valid ? pdf : -1.0);
+
+        direction = cosineDirection(float3(0, 1, 0),
+            float2((float(index) + 0.3) / 8.0, (float(index) + 0.37) / 8.0));
+        uv = environmentUv(direction);
+        results[44 + index * 2] = float4(direction, environmentPdfUv(uv));
+        results[45 + index * 2] = float4(environmentRadianceUv(uv), 1.0);
+    }
 }
 
 [shader("compute")]
@@ -244,6 +274,33 @@ fn expected_environment_pdf(table: &crate::environment::EnvironmentTable, direct
     let solid_angle =
         (std::f64::consts::TAU / f64::from(table.width)) * (theta0.cos() - theta1.cos());
     pmf / solid_angle
+}
+
+fn expected_hdr_test_radiance(direction: Vec3) -> Vec3 {
+    let direction = direction.normalize();
+    let u = (direction.z.atan2(direction.x) / std::f32::consts::TAU + 0.5).rem_euclid(1.0);
+    let v = direction.x.hypot(direction.z).atan2(direction.y) / std::f32::consts::PI;
+    let x = u * 2.0 - 0.5;
+    let y = v * 4.0 - 0.5;
+    let low_x = x.floor() as i32;
+    let low_y = y.floor() as i32;
+    let fx = x - x.floor();
+    let fy = y - y.floor();
+    let x_weight = if low_x.rem_euclid(2) == 0 {
+        1.0 - fx
+    } else {
+        fx
+    };
+    let y_weight = if low_y.clamp(0, 3) == 0 {
+        1.0 - fy
+    } else {
+        0.0
+    } + if (low_y + 1).clamp(0, 3) == 0 {
+        fy
+    } else {
+        0.0
+    };
+    Vec3::new(100.0, 60.0, 20.0) * (x_weight * y_weight)
 }
 
 fn output_vec4(bytes: &[u8], index: usize) -> [f32; 4] {
@@ -383,12 +440,15 @@ struct TemporalTestTextures {
     previous: Texture,
     previous_metadata: Texture,
     previous_receiver: Texture,
+    current_background: Texture,
+    previous_background: Texture,
     motion: Texture,
     raster_receiver: Texture,
     gbuffer: Texture,
     irradiance_output: Texture,
     metadata_output: Texture,
     receiver_output: Texture,
+    background_output: Texture,
 }
 
 impl TemporalTestTextures {
@@ -437,6 +497,20 @@ impl TemporalTestTextures {
             sampled_float,
             size,
         );
+        let current_background = temporal_test_texture_sized(
+            device,
+            "temporal_test_current_background",
+            TextureFormat::Rgba32Float,
+            sampled_float,
+            size,
+        );
+        let previous_background = temporal_test_texture_sized(
+            device,
+            "temporal_test_previous_background",
+            TextureFormat::Rgba32Float,
+            sampled_float,
+            size,
+        );
         let motion = temporal_test_texture_sized(
             device,
             "temporal_test_motion",
@@ -476,6 +550,13 @@ impl TemporalTestTextures {
         let receiver_output = temporal_test_texture_sized(
             device,
             "temporal_test_receiver_output",
+            TextureFormat::Rgba32Float,
+            output,
+            size,
+        );
+        let background_output = temporal_test_texture_sized(
+            device,
+            "temporal_test_background_output",
             TextureFormat::Rgba32Float,
             output,
             size,
@@ -528,12 +609,15 @@ impl TemporalTestTextures {
             previous,
             previous_metadata,
             previous_receiver,
+            current_background,
+            previous_background,
             motion,
             raster_receiver,
             gbuffer,
             irradiance_output,
             metadata_output,
             receiver_output,
+            background_output,
         }
     }
 }
@@ -576,6 +660,9 @@ fn temporal_test_result_full(
     let irradiance_output = view(&textures.irradiance_output);
     let metadata_output = view(&textures.metadata_output);
     let receiver_output = view(&textures.receiver_output);
+    let current_background = view(&textures.current_background);
+    let previous_background = view(&textures.previous_background);
+    let background_output = view(&textures.background_output);
     let group = device.create_bind_group(
         "temporal_test",
         &pipeline.get_bind_group_layout(0).into(),
@@ -632,6 +719,18 @@ fn temporal_test_result_full(
                 binding: 27,
                 resource: BindingResource::TextureView(&gbuffer),
             },
+            BindGroupEntry {
+                binding: 38,
+                resource: BindingResource::TextureView(&background_output),
+            },
+            BindGroupEntry {
+                binding: 39,
+                resource: BindingResource::TextureView(&current_background),
+            },
+            BindGroupEntry {
+                binding: 40,
+                resource: BindingResource::TextureView(&previous_background),
+            },
         ],
     );
     let row_pitch = (textures.size.x * 16).div_ceil(256) * 256;
@@ -664,6 +763,7 @@ fn temporal_test_result_full(
             (&textures.irradiance_output, &textures.previous),
             (&textures.metadata_output, &textures.previous_metadata),
             (&textures.receiver_output, &textures.previous_receiver),
+            (&textures.background_output, &textures.previous_background),
         ] {
             encoder.copy_texture_to_texture(
                 TexelCopyTextureInfo {
@@ -1007,15 +1107,121 @@ fn temporal_test_parameters(history_frames: u32) -> TransportParameters {
         scene_overlay: UVec4::ZERO,
         dirty_min: Vec4::ZERO,
         dirty_max: Vec4::ZERO,
-        transport: Vec4::ZERO,
+        source_history: UVec4::ZERO,
         sampling: UVec4::ZERO,
         owner_sequence: UVec4::ZERO,
         cache_time: UVec4::ZERO,
-        world_receivers: UVec4::ZERO,
-        world_receiver_state: UVec4::ZERO,
+        emissive_dirty_min: Vec4::ZERO,
+        emissive_dirty_max: Vec4::ZERO,
         light_dirty_min: Vec4::ZERO,
         light_dirty_max: Vec4::ZERO,
     }
+}
+
+fn reference_candidate_permute(mut value: u32, mask: u32, seed: u32) -> u32 {
+    value = (value ^ seed) & mask;
+    value = (value ^ (value >> 16)) & mask;
+    value = value.wrapping_mul(0x7feb_352d) & mask;
+    value = (value ^ (value >> 15)) & mask;
+    value = value.wrapping_mul(0x846c_a68b) & mask;
+    (value ^ (value >> 16)) & mask
+}
+
+fn reference_inverse_xor_shift_right(value: u32, shift: u32) -> u32 {
+    let mut result = value;
+    let mut offset = shift;
+    while offset < 32 {
+        result ^= value >> offset;
+        offset += shift;
+    }
+    result
+}
+
+fn reference_candidate_inverse_permute(value: u32, mask: u32, seed: u32) -> u32 {
+    let value = reference_inverse_xor_shift_right(value, 16) & mask;
+    let value = value.wrapping_mul(0x4302_1123) & mask;
+    let value = reference_inverse_xor_shift_right(value, 15) & mask;
+    let value = value.wrapping_mul(0x1d69_e2a5) & mask;
+    (reference_inverse_xor_shift_right(value, 16) ^ seed) & mask
+}
+
+fn reference_candidate_rank(sample: u32, width: u32, height: u32, count: u32) -> u32 {
+    if count <= 1 {
+        return 0;
+    }
+    let mut mask = 0;
+    while mask < count - 1 {
+        mask = (mask << 1) | 1;
+    }
+    let seed = (width.wrapping_mul(0x9e37_79b9) ^ height.wrapping_mul(0x85eb_ca6b) ^ count) & mask;
+    let mut rank = reference_candidate_permute(sample, mask, seed);
+    while rank >= count {
+        rank = reference_candidate_permute(rank, mask, seed);
+    }
+    rank
+}
+
+fn reference_cold_candidate_rank(
+    sample: u32,
+    width: u32,
+    height: u32,
+    count: u32,
+    frame: u32,
+) -> u32 {
+    if count <= 1 {
+        return 0;
+    }
+    let mut mask = 0;
+    while mask < count - 1 {
+        mask = (mask << 1) | 1;
+    }
+    let seed = (width.wrapping_mul(0x9e37_79b9)
+        ^ height.wrapping_mul(0x85eb_ca6b)
+        ^ count
+        ^ frame.wrapping_mul(0x9e37_79b9))
+        & mask;
+    let mut rank = reference_candidate_permute(sample, mask, seed);
+    while rank >= count {
+        rank = reference_candidate_permute(rank, mask, seed);
+    }
+    rank
+}
+
+fn reference_candidate_from_rank(rank: u32, width: u32, height: u32, count: u32) -> u32 {
+    if count <= 1 {
+        return 0;
+    }
+    let mut mask = 0;
+    while mask < count - 1 {
+        mask = (mask << 1) | 1;
+    }
+    let seed = (width.wrapping_mul(0x9e37_79b9) ^ height.wrapping_mul(0x85eb_ca6b) ^ count) & mask;
+    let mut sample = reference_candidate_inverse_permute(rank, mask, seed);
+    while sample >= count {
+        sample = reference_candidate_inverse_permute(sample, mask, seed);
+    }
+    sample
+}
+
+fn reference_candidate_selected(
+    sample: u32,
+    width: u32,
+    height: u32,
+    count: u32,
+    cursor: u32,
+    quota: u32,
+) -> bool {
+    if count == 0 || quota == 0 {
+        return false;
+    }
+    let rank = reference_candidate_rank(sample, width, height, count);
+    let cursor = cursor % count;
+    let distance = if rank >= cursor {
+        rank - cursor
+    } else {
+        count - cursor + rank
+    };
+    distance < quota
 }
 
 #[test]
@@ -1115,7 +1321,7 @@ fn gpu_temporal_resolve_preserves_unobserved_history_and_valid_black() {
     let mut parameters = temporal_test_parameters(30);
     parameters.interval_history.y = 1.0;
     parameters.stability.y = 1.0;
-    parameters.transport.w = 1.0;
+    parameters.source_history.y = 7;
     let observed_black = temporal_test_result(device, queue, &pipeline, &black, parameters);
     assert!(
         observed_black[0][..3]
@@ -1172,7 +1378,7 @@ fn gpu_temporal_resolve_preserves_unobserved_history_and_valid_black() {
         let mut parameters = temporal_test_parameters(30);
         parameters.interval_history.y = 1.0;
         parameters.stability.y = 1.0;
-        parameters.transport.w = 1.0;
+        parameters.source_history.y = 7;
         let result =
             temporal_test_result_full(device, queue, &pipeline, &changed, parameters, true)[0];
         assert!(
@@ -1182,7 +1388,7 @@ fn gpu_temporal_resolve_preserves_unobserved_history_and_valid_black() {
         assert!((result[1][2] - expected_length).abs() < 1e-5);
         assert_eq!(support_mask(result[2]), expected_support);
         parameters.stability.y = 0.0;
-        parameters.transport.w = 0.0;
+        parameters.source_history.y = 0;
         write_rgba32f_pixel(queue, &changed.current, [0.0, 0.0, 0.0, -1.0]);
         let next = temporal_test_result(device, queue, &pipeline, &changed, parameters);
         assert!(
@@ -1190,6 +1396,92 @@ fn gpu_temporal_resolve_preserves_unobserved_history_and_valid_black() {
             "invalidated lighting returned on the next frame: {next:?}"
         );
         assert_eq!(support_mask(next[2]), expected_support);
+    }
+    // Repeated small sun rotations keep validated support and blend current
+    // observations instead of restarting. Once motion stops, fresh black
+    // observations converge; an abrupt extinction still invalidates at once.
+    let sun = TemporalTestTextures::new(device, queue);
+    write_rgba32f_pixel(queue, &sun.current, [0.0, 0.0, 0.0, 1.25]);
+    write_rgba32f_pixel(queue, &sun.current_background, [0.0, 0.0, 0.0, 1.25]);
+    let mut sun_params = temporal_test_parameters(30);
+    sun_params.interval_history.y = 1.0;
+    sun_params.source_history.y = 1;
+    sun_params.source_history.z = 3;
+    let mut last = 1.0;
+    for frame in 30..50 {
+        sun_params.frame.x = frame;
+        sun_params.source_history.w = frame;
+        let result = temporal_test_result_full(device, queue, &pipeline, &sun, sun_params, true)[0];
+        assert_eq!(support_mask(result[2]), 1);
+        assert!(result[0][0] < last && result[0][0] > 0.0, "{result:?}");
+        last = result[0][0];
+    }
+    sun_params.source_history.y = 0;
+    sun_params.source_history.z = 2;
+    for frame in 50..90 {
+        sun_params.frame.x = frame;
+        let result = temporal_test_result_full(device, queue, &pipeline, &sun, sun_params, true)[0];
+        last = result[0][0];
+    }
+    assert!(last < 0.05, "stopped sun did not converge: {last}");
+    let extinct = TemporalTestTextures::new(device, queue);
+    write_rgba32f_pixel(queue, &extinct.current, [0.0, 0.0, 0.0, 1.25]);
+    sun_params.source_history.y = 1;
+    sun_params.source_history.z = 2;
+    let result = temporal_test_result(device, queue, &pipeline, &extinct, sun_params);
+    assert!(result[0][..3].iter().all(|value| value.abs() < 1e-6));
+    let unsampled = TemporalTestTextures::new(device, queue);
+    write_rgba32f_pixel(queue, &unsampled.current, [0.0, 0.0, 0.0, -1.0]);
+    sun_params.source_history.y = 0;
+    sun_params.source_history.z = 2;
+    sun_params.source_history.w = 49;
+    sun_params.frame.x = 170;
+    let expired = temporal_test_result(device, queue, &pipeline, &unsampled, sun_params);
+    assert_eq!(
+        support_mask(expired[2]),
+        0,
+        "unsampled old sun survived: {expired:?}"
+    );
+    assert_eq!(expired[0][3], 0.0);
+
+    // Moving punctual lights invalidate their old radiance, not the separate
+    // background. Incomplete punctual coverage may display the valid background
+    // while raw support remains incomplete.
+    for (alpha, current, expected) in [(1.25, 12.0, 21.0), (-1.0, 10.0, 19.0)] {
+        let moving = TemporalTestTextures::new(device, queue);
+        write_rgba32f_pixel(queue, &moving.current, [current, current, current, alpha]);
+        write_rgba32f_pixel(queue, &moving.current_background, [10.0, 10.0, 10.0, 1.25]);
+        write_rgba32f_pixel(queue, &moving.previous_background, [20.0, 20.0, 20.0, 16.0]);
+        let mut parameters = temporal_test_parameters(30);
+        parameters.interval_history.y = 1.0;
+        parameters.source_history.y = 4;
+        let result = temporal_test_result(device, queue, &pipeline, &moving, parameters);
+        assert!(
+            result[0][..3]
+                .iter()
+                .all(|value| (*value - expected).abs() < 1e-4),
+            "unchanged background was not retained independently: {result:?}"
+        );
+        assert_eq!(support_mask(result[2]), 1);
+
+        parameters.source_history.y = 5;
+        let changed = temporal_test_result(device, queue, &pipeline, &moving, parameters);
+        assert!(
+            changed[0][..3]
+                .iter()
+                .all(|value| (*value - current).abs() < 1e-4),
+            "changed background must not retain old light: {changed:?}"
+        );
+        parameters.source_history.y = 4;
+        parameters.dirty_min = Vec4::new(10.0, 10.0, 10.0, 1.0);
+        parameters.dirty_max = Vec4::new(11.0, 11.0, 11.0, 1.0);
+        let geometry = temporal_test_result(device, queue, &pipeline, &moving, parameters);
+        assert!(
+            geometry[0][..3]
+                .iter()
+                .all(|value| (*value - current).abs() < 1e-4),
+            "dirty geometry must not retain untracked background paths: {geometry:?}"
+        );
     }
 
     // The final partial resolve tile is clamped to the viewport edge. Static
@@ -1294,8 +1586,9 @@ fn gpu_transport_helpers_preserve_reciprocity_hue_and_environment_pdf() {
     base_parameters.size = UVec4::new(2, 4, 8, 0);
     base_parameters.environment = Vec4::new(0.0, 0.0, 0.0, 2.0);
     base_parameters.environment_info = UVec4::new(alias_offset, table.width, table.height, 1);
-    base_parameters.environment_rotation = Vec4::new(0.0, 0.0, 0.0, 1.0);
-    base_parameters.environment_scale = Vec4::ONE;
+    let environment_rotation = Quat::from_rotation_y(0.73);
+    base_parameters.environment_rotation = Vec4::from_array(environment_rotation.to_array());
+    base_parameters.environment_scale = Vec4::new(1.0, 0.0, 0.0, 0.0);
     let mut parameters = UniformBuffer::from(base_parameters);
     parameters.write_buffer(device, queue);
     let mut lights = StorageBuffer::from(packed_lights);
@@ -1336,7 +1629,7 @@ fn gpu_transport_helpers_preserve_reciprocity_hue_and_environment_pdf() {
         },
     );
     let texture_view = texture.create_view(&TextureViewDescriptor::default());
-    let output_bytes = 26 * 16;
+    let output_bytes = 60 * 16;
     let output = device.create_buffer(&BufferDescriptor {
         label: Some("transport_helper_output"),
         size: output_bytes,
@@ -1397,7 +1690,8 @@ fn gpu_transport_helpers_preserve_reciprocity_hue_and_environment_pdf() {
                 .all(|component| component.is_finite() && *component >= 0.0)
         );
         assert!((direction_pdf[3] - radiance_lookup_pdf[3]).abs() < 1e-4);
-        let expected_pdf = expected_environment_pdf(&table, direction) as f32;
+        let expected_pdf =
+            expected_environment_pdf(&table, environment_rotation * direction) as f32;
         assert!((direction_pdf[3] - expected_pdf).abs() <= expected_pdf * 2e-4);
     }
     assert_eq!(
@@ -1414,10 +1708,33 @@ fn gpu_transport_helpers_preserve_reciprocity_hue_and_environment_pdf() {
     assert!(poles[0] >= 0.0 && poles[0] < poles[2]);
     assert!(poles[1] >= 0.0 && poles[1] < poles[2]);
     assert_eq!(poles[2], 2048.0);
+    assert_eq!(output_vec4(&bytes, 26), [1.0, 1.0, 1.0, 0.0]);
+    assert_eq!(output_vec4(&bytes, 27), [0.0; 4]);
     let polar_radiance = output_vec4(&bytes, 7);
     assert!(polar_radiance[0] > 20.0);
     assert!((polar_radiance[1] / polar_radiance[0] - 0.6).abs() < 1e-3);
 
+    for index in 0..8 {
+        for start in [28, 44] {
+            let direction_pdf = output_vec4(&bytes, start + index * 2);
+            let radiance = output_vec4(&bytes, start + index * 2 + 1);
+            let direction = Vec3::new(direction_pdf[0], direction_pdf[1], direction_pdf[2]);
+            let local_direction = environment_rotation * direction;
+            let expected_pdf = expected_environment_pdf(&table, local_direction) as f32;
+            let expected_radiance = expected_hdr_test_radiance(local_direction);
+            assert!((direction_pdf[3] - expected_pdf).abs() <= expected_pdf * 2e-4 + 1e-6);
+            for (actual, expected) in radiance[..3].iter().zip(expected_radiance.to_array()) {
+                assert!((*actual - expected).abs() <= 2e-4 * expected.max(1.0));
+            }
+            if start == 28 {
+                let original = output_vec4(&bytes, 7 + index * 2);
+                assert!((radiance[3] - direction_pdf[3]).abs() < 1e-4);
+                for component in 0..3 {
+                    assert!((radiance[component] - original[component]).abs() < 1e-4);
+                }
+            }
+        }
+    }
     let sky = [4.0f32, 2.0, 1.0];
     let uniform_pixels = [[sky[0], sky[1], sky[2], 1.0]; 8];
     let uniform_image = Image::new(
@@ -1512,7 +1829,7 @@ fn gpu_transport_helpers_preserve_reciprocity_hue_and_environment_pdf() {
             u32::from(is_hdr),
         );
         case_parameters.environment_rotation = Vec4::new(0.0, 0.0, 0.0, 1.0);
-        case_parameters.environment_scale = Vec4::ONE;
+        case_parameters.environment_scale = Vec4::new(1.0, 0.0, 0.0, 0.0);
         case_parameters.tuning = Vec4::new(1.0, 0.4f32.sqrt(), 0.001, 0.0);
         case_parameters.sampling = UVec4::new(sample_count, 0, 0, 0);
         case_parameters.owner_sequence = UVec4::new(0, 0, visibility_mode, 0);
@@ -1574,7 +1891,7 @@ fn gpu_split_r2_prefix_uses_selected_rays_and_world_grid_keys() {
     const CANDIDATES: u32 = 64;
     const CACHE_BUCKETS: u32 = 16;
     const SELECTED_BUDGET: u32 = 48;
-    const ENTRY_WORDS: usize = 208 / 4;
+    const ENTRY_WORDS: usize = 272 / 4;
     let directory_capacity = (CANDIDATES * 4).next_power_of_two();
     let probe_bucket = |cell: i32, lod: u32, level: u32| {
         let mut hash = (cell as u32).wrapping_mul(0x8da6_b343)
@@ -1678,25 +1995,22 @@ fn gpu_split_r2_prefix_uses_selected_rays_and_world_grid_keys() {
 [[vk::binding(6, 0)]] RWStructuredBuffer<Atomic<uint>> heads;
 [[vk::binding(7, 0)]] RWStructuredBuffer<Entry> entries;
 [[vk::binding(13, 0)]] RWStructuredBuffer<uint4> testResults;
-[[vk::binding(32, 0)]] RWStructuredBuffer<Atomic<uint>> rootRayOffset;
 "#,
     );
     let split = include_str!("../shaders/split.slang");
     for source in [
-        section(
-            split,
-            "float splitIntervalEnd(",
-            "uint probeDirectoryCapacity(",
-        ),
-        section(
-            split,
-            "uint probeDirectoryCapacity(",
-            "uint probeDescriptorIndex(",
-        ),
+        section(split, "float splitIntervalEnd(", "uint probeCountHead("),
+        section(split, "uint probeCountHead(", "uint probeDescriptorIndex("),
         section(split, "uint probeDescriptorIndex(", "uint findProbeNode("),
         section(split, "uint findProbeNode(", "uint insertProbeDescriptor("),
         section(split, "uint insertProbeDescriptor(", "uint findEntry("),
-        section(split, "void rank(", "// Every visible point seeds"),
+        section(
+            split,
+            "uint permuteCandidateDomain(",
+            "bool coldPriorityEnabled(",
+        ),
+        section(split, "bool coldPriorityEnabled(", "// Secondary seeds"),
+        section(split, "void rankCandidate(", "// Every visible point seeds"),
         section(split, "void parents(", "[shader(\"compute\")]"),
         section(split, "void prefix(", "[shader(\"compute\")]"),
         section(split, "void generateDirections(", "uint currentCapacity("),
@@ -1738,7 +2052,7 @@ void inspectDirectory(uint3 id : SV_DispatchThreadID) {
     }
     if (id.x == 0u)
         testResults[2u * count] = uint4(
-            rootRayOffset[0].load(), probeDirectoryCapacity(params), 0u, 0u);
+            heads[rootRayOffsetHead(params)].load(), probeDirectoryCapacity(params), 0u, 0u);
 }
 
 [shader("compute")]
@@ -1836,7 +2150,7 @@ void inspectIntervals(uint3 id : SV_DispatchThreadID) {
     let inspect = make_pipeline("inspectDirectory");
     let inspect_intervals = make_pipeline("inspectIntervals");
 
-    let head_words = (2 * CACHE_BUCKETS + 36 + 8 * directory_capacity) as usize;
+    let head_words = (2 * CACHE_BUCKETS + 36 + 8 * directory_capacity + 1) as usize;
     let count_base = (2 * CACHE_BUCKETS + 36 + 4 * directory_capacity) as usize;
     let mut initial_heads = vec![u32::MAX; head_words];
     initial_heads[count_base..].fill(0);
@@ -1852,11 +2166,6 @@ void inspectIntervals(uint3 id : SV_DispatchThreadID) {
     let entries = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("split_r2_prefix_entries"),
         contents: &entry_bytes,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-    });
-    let root_ray_offset = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("split_r2_root_ray_offset"),
-        contents: &[0u32.to_le_bytes()].concat(),
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
     });
     let result_rows = descriptor_count * 2 + 6;
@@ -1882,7 +2191,7 @@ void inspectIntervals(uint3 id : SV_DispatchThreadID) {
                       parameters: &UniformBuffer<TransportParameters>,
                       has_heads: bool,
                       has_entries: bool,
-                      has_root_offset: bool,
+                      _has_root_offset: bool,
                       has_results: bool| {
         let mut bindings = vec![BindGroupEntry {
             binding: 0,
@@ -1904,12 +2213,6 @@ void inspectIntervals(uint3 id : SV_DispatchThreadID) {
             bindings.push(BindGroupEntry {
                 binding: 13,
                 resource: results.as_entire_binding(),
-            });
-        }
-        if has_root_offset {
-            bindings.push(BindGroupEntry {
-                binding: 32,
-                resource: root_ray_offset.as_entire_binding(),
             });
         }
         device.create_bind_group(
@@ -2168,6 +2471,29 @@ void inspectIntervals(uint3 id : SV_DispatchThreadID) {
 }
 
 #[test]
+fn candidate_inverse_permutation_round_trips_irregular_counts() {
+    for count in [1, 3, 5, 7, 9, 17, 31, 33, 63, 65, 127, 129] {
+        let width = count;
+        let height = 1;
+        let mut visited = vec![false; count as usize];
+        for rank in 0..count {
+            let sample = reference_candidate_from_rank(rank, width, height, count);
+            assert!(
+                !visited[sample as usize],
+                "count {count} repeated sample {sample}"
+            );
+            visited[sample as usize] = true;
+            assert_eq!(
+                reference_candidate_rank(sample, width, height, count),
+                rank,
+                "count {count} did not round-trip rank {rank}"
+            );
+        }
+        assert!(visited.into_iter().all(|sample| sample), "count {count}");
+    }
+}
+
+#[test]
 #[ignore = "requires slangc and a desktop GPU; dispatches production Split probe packing"]
 fn gpu_visible_zero_ray_probe_packs_cached_radiance() {
     fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
@@ -2178,8 +2504,9 @@ fn gpu_visible_zero_ray_probe_packs_cached_radiance() {
     }
 
     const CACHE_BUCKETS: u32 = 16;
-    const DIRECTORY_CAPACITY: u32 = 4;
-    const ENTRY_WORDS: usize = 208 / 4;
+    const DIRECTORY_CAPACITY: u32 = 8;
+    const ENTRY_WORDS: usize = 272 / 4;
+    const ENTRY_COUNT: usize = 65;
     let key = [3i32, -2, 1, 0];
     let empty_key = [7i32, 4, -3, 0];
     let hash_key = |key: [i32; 4], buckets: u32| {
@@ -2231,40 +2558,62 @@ fn gpu_visible_zero_ray_probe_packs_cached_radiance() {
         };
         [color[0], color[1], color[2], support]
     });
-    let expected_table: [[f32; 4]; 36] = std::array::from_fn(|texel| {
-        let x = texel % 6;
-        let y = texel / 6;
-        let normal = decode_normal(Vec2::new(
-            (x as f32 + 0.5) / 6.0,
-            (y as f32 + 0.5) / 6.0,
-        ));
-        let mut sum = [0.0; 3];
-        let mut nominal = 0.0;
-        let mut observed = 0.0;
-        for (direction, sample) in raw_bins.iter().enumerate() {
-            let cosine = normal.dot(bin_direction(direction)).max(0.0);
-            nominal += cosine;
-            if cosine <= 0.0 || sample[3] <= 0.0 {
-                continue;
+    let prefilter_table = |raw_bins: &[[f32; 4]; 32]| -> [[f32; 4]; 36] {
+        std::array::from_fn(|texel| {
+            let x = texel % 6;
+            let y = texel / 6;
+            let normal = decode_normal(Vec2::new((x as f32 + 0.5) / 6.0, (y as f32 + 0.5) / 6.0));
+            let mut sum = [0.0; 3];
+            let mut nominal = 0.0;
+            let mut observed = 0.0;
+            for (direction, sample) in raw_bins.iter().enumerate() {
+                let cosine = normal.dot(bin_direction(direction)).max(0.0);
+                nominal += cosine;
+                if cosine <= 0.0 || sample[3] <= 0.0 {
+                    continue;
+                }
+                let weight = cosine * sample[3].clamp(0.0, 1.0);
+                for (sum, component) in sum.iter_mut().zip(&sample[..3]) {
+                    *sum += component * weight;
+                }
+                observed += weight;
             }
-            let weight = cosine * sample[3].clamp(0.0, 1.0);
-            for (sum, component) in sum.iter_mut().zip(&sample[..3]) {
-                *sum += component * weight;
+            if observed <= 1e-6 || nominal <= 1e-6 {
+                [0.0; 4]
+            } else {
+                let scale = nominal * (4.0 / 32.0) / observed;
+                [
+                    sum[0] * scale,
+                    sum[1] * scale,
+                    sum[2] * scale,
+                    (observed / nominal).clamp(0.0, 1.0),
+                ]
             }
-            observed += weight;
-        }
-        if observed <= 1e-6 || nominal <= 1e-6 {
-            [0.0; 4]
-        } else {
-            let scale = nominal * (4.0 / 32.0) / observed;
-            [
-                sum[0] * scale,
-                sum[1] * scale,
-                sum[2] * scale,
-                (observed / nominal).clamp(0.0, 1.0),
-            ]
-        }
+        })
+    };
+    let expected_table = prefilter_table(&raw_bins);
+    let emissive_bins: [[f32; 4]; 32] = std::array::from_fn(|direction| {
+        [
+            2.0 + direction as f32 * 0.25,
+            3.0,
+            4.0 - direction as f32 * 0.125,
+            1.0,
+        ]
     });
+    let punctual_bins: [[f32; 4]; 32] = std::array::from_fn(|direction| {
+        [
+            8.0,
+            6.0 + direction as f32 * 0.1,
+            4.0,
+            if direction >= 24 && direction % 2 == 0 {
+                0.75
+            } else {
+                0.0
+            },
+        ]
+    });
+    let expected_emissive_table = prefilter_table(&emissive_bins);
+    let expected_punctual_table = prefilter_table(&punctual_bins);
 
     let mut shader_source = String::from(
         r#"
@@ -2280,11 +2629,12 @@ fn gpu_visible_zero_ray_probe_packs_cached_radiance() {
     let production = include_str!("../shaders/split.slang");
     let pack_shader = section(
         production,
-        "groupshared float4 packProbeRadiance[32];",
+        "groupshared float4 packProbeBackground[32];",
         "void commitCache(",
     );
-    let pack_shader =
-        &pack_shader[..pack_shader.rfind("[shader").expect("next production shader entry")];
+    let pack_shader = &pack_shader[..pack_shader
+        .rfind("[shader")
+        .expect("next production shader entry")];
     for source in [
         section(
             production,
@@ -2293,7 +2643,7 @@ fn gpu_visible_zero_ray_probe_packs_cached_radiance() {
         ),
         section(
             production,
-            "uint probeDirectoryCapacity(",
+            "uint probeCountHead(",
             "uint probeDescriptorIndex(",
         ),
         section(
@@ -2306,7 +2656,7 @@ fn gpu_visible_zero_ray_probe_packs_cached_radiance() {
         section(
             production,
             "void seedProbes(",
-            "groupshared float4 packProbeRadiance[32];",
+            "groupshared float4 packProbeBackground[32];",
         ),
         pack_shader,
     ] {
@@ -2369,22 +2719,26 @@ void seedProbeStage(uint3 id : SV_DispatchThreadID) {
     let pack = make_pipeline("packProbes");
 
     let mut parameters = temporal_test_parameters(0);
-    parameters.size = UVec4::new(1, 1, 1, CACHE_BUCKETS);
+    parameters.size = UVec4::new(1, 1, 2, CACHE_BUCKETS);
     parameters.frame.x = 0;
+    parameters.source_history.x = 6;
     let mut parameters = UniformBuffer::from(parameters);
     parameters.write_buffer(device, queue);
 
     let mut heads_words =
         vec![u32::MAX; (2 * CACHE_BUCKETS + 36 + 8 * DIRECTORY_CAPACITY) as usize];
-    let mut entry_words = vec![0u32; 64 * ENTRY_WORDS];
-    for index in 0..64 {
+    heads_words[(2 * CACHE_BUCKETS + 9) as usize] = 0;
+    let mut entry_words = vec![0u32; ENTRY_COUNT * ENTRY_WORDS];
+    for index in 0..ENTRY_COUNT {
         entry_words[index * ENTRY_WORDS + 16] = u32::MAX;
     }
     for (probe, probe_key) in [key, empty_key].into_iter().enumerate() {
         for (direction, source_radiance) in raw_bins.iter().copied().enumerate() {
             let index = match (probe, direction) {
-                (0, 0) => 0,
+                (0, 3) => 0,
                 (1, 0) => 4,
+                // The first probe's canonical descriptor is a traced nonzero direction.
+                (0, 0) => 64,
                 (0, _) => direction + 1,
                 _ => direction + 32,
             };
@@ -2402,10 +2756,28 @@ void seedProbeStage(uint3 id : SV_DispatchThreadID) {
             for (component, value) in radiance.iter().enumerate() {
                 entry_words[base + 8 + component] = value.to_bits();
             }
-            if direction == 0 {
+            let emissive = if probe == 0 {
+                emissive_bins[direction]
+            } else {
+                [9.0, 8.0, 7.0, 0.0]
+            };
+            let punctual = if probe == 0 {
+                punctual_bins[direction]
+            } else {
+                [9.0, 8.0, 7.0, 0.0]
+            };
+            for (component, value) in emissive.iter().enumerate() {
+                entry_words[base + 60 + component] = value.to_bits();
+            }
+            for (component, value) in punctual.iter().enumerate() {
+                entry_words[base + 64 + component] = value.to_bits();
+            }
+            if probe == 0 && direction == 3 {
+                entry_words[base + 17] = 0x8000_0000; // traced canonical
+            } else if probe == 1 && direction == 0 {
                 entry_words[base + 23] = 1; // visible initialized candidate, even with no ray
             }
-            if probe == 0 && radiance[3] > 0.0 {
+            if probe == 0 && (radiance[3] > 0.0 || emissive[3] > 0.0 || punctual[3] > 0.0) {
                 entry_words[base + 44] = (direction as f32).to_bits();
                 entry_words[base + 45] = (-2.0f32).to_bits();
                 entry_words[base + 46] = 1.0f32.to_bits();
@@ -2452,11 +2824,11 @@ void seedProbeStage(uint3 id : SV_DispatchThreadID) {
         contents: &entry_bytes,
         usage: BufferUsages::STORAGE,
     });
-    let directional_bytes =
-        2 * DIRECTORY_CAPACITY as usize * crate::render::PROBE_SIZE as usize;
+    let directional_bytes = 2 * DIRECTORY_CAPACITY as usize * crate::render::PROBE_SIZE as usize;
+    let untouched = (-123.0f32).to_le_bytes();
     let directional_probes = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("split_visible_zero_probe_radiance"),
-        contents: &vec![0u8; directional_bytes],
+        contents: &untouched.repeat(directional_bytes / untouched.len()),
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
     });
     let seed_group = device.create_bind_group(
@@ -2523,29 +2895,64 @@ void seedProbeStage(uint3 id : SV_DispatchThreadID) {
         &pack_group,
         &directional_probes,
         directional_bytes as u64,
-        2,
+        8,
+    );
+    // Groups 2 and 3 point at noncanonical entries for the first probe;
+    // groups 4 through 7 are padding. Only the two seeded probes may pack.
+    let packed_heads = crate::scene::traversal_tests::dispatch_readback(
+        device,
+        queue,
+        &pack,
+        &pack_group,
+        &heads,
+        heads_bytes.len() as u64,
+        8,
+    );
+    let counter = (2 * CACHE_BUCKETS + 9) as usize * 4;
+    assert_eq!(
+        u32::from_le_bytes(packed_heads[counter..counter + 4].try_into().unwrap()),
+        4,
+        "only two canonical probes should pack on each dispatch"
     );
     let probe_words = crate::render::PROBE_SIZE as usize / 16;
     let first = directory_slot * probe_words;
-    for (texel, expected) in expected_table.iter().enumerate() {
-        let actual = output_vec4(&packed, first + texel);
-        for (actual, expected) in actual.iter().zip(expected) {
-            assert!(
-                (actual - expected).abs() <= expected.abs().max(1.0) * 2e-4,
-                "packed texel {texel}: {actual:?} != {expected:?}"
-            );
+    for (offset, table) in [
+        (0, &expected_table),
+        (36, &expected_emissive_table),
+        (72, &expected_punctual_table),
+    ] {
+        for (texel, expected) in table.iter().enumerate() {
+            let actual = output_vec4(&packed, first + offset + texel);
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() <= expected.abs().max(1.0) * 2e-4,
+                    "packed source texel {offset}/{texel}: {actual:?} != {expected:?}"
+                );
+            }
         }
     }
     assert_eq!(
-        output_vec4(&packed, first + 36),
-        [1.0, -2.0, 1.0, 1.0],
-        "supported raw bins retain their aggregate dependency minimum"
+        output_vec4(&packed, first + 108),
+        [0.0, -2.0, 1.0, 1.0],
+        "supported source bins retain their aggregate dependency minimum"
     );
     assert_eq!(
-        output_vec4(&packed, first + 37),
+        output_vec4(&packed, first + 109),
         [32.0, 2.0, 3.0, 1.0],
-        "supported raw bins retain their aggregate dependency maximum"
+        "supported source bins retain their aggregate dependency maximum"
     );
+    for slot in 0..2 * DIRECTORY_CAPACITY as usize {
+        if slot == directory_slot || slot == empty_directory_slot {
+            continue;
+        }
+        for word in 0..probe_words {
+            assert_eq!(
+                output_vec4(&packed, slot * probe_words + word),
+                [-123.0; 4],
+                "noncanonical or padded group wrote probe slot {slot}, word {word}"
+            );
+        }
+    }
     let empty = empty_directory_slot * probe_words;
     for texel in 0..36 {
         assert_eq!(
@@ -2555,6 +2962,624 @@ void seedProbeStage(uint3 id : SV_DispatchThreadID) {
         );
     }
 }
+
+#[test]
+#[ignore = "requires slangc and a desktop GPU; dispatches production Split rank phases"]
+fn gpu_cold_priority_nominates_each_probe_then_fills_fair_budget() {
+    fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start = source.find(start).expect("production shader section start");
+        let tail = &source[start..];
+        &tail[..tail.find(end).expect("production shader section end")]
+    }
+
+    const CANDIDATES: u32 = 8;
+    const WIDTH: u32 = 8;
+    const HEIGHT: u32 = 1;
+    const BUCKETS: u32 = 16;
+    const DIRECTORY_CAPACITY: usize = 32;
+    const ENTRY_WORDS: usize = 272 / 4;
+    const DESCRIPTOR_COUNT: usize = CANDIDATES as usize * 2 * 4;
+    const BUDGET: u32 = 6;
+    const CURSOR: u32 = 2;
+    const COLD_FRAME: u32 = 128;
+    let results_words = (3 * CANDIDATES as usize + 5) * 4;
+    let results_bytes = (results_words * 4) as u64;
+    let production = include_str!("../shaders/split.slang");
+    let rank_source = section(
+        production,
+        "// Deduplicate immutable per-pixel descriptors",
+        "void parents(",
+    );
+    let rank_source = &rank_source[..rank_source.rfind("[shader").expect("next shader entry")];
+    let mut shader_source = String::from(
+        r#"
+#include "common.slang"
+[[vk::binding(0, 0)]] ConstantBuffer<Parameters> params;
+[[vk::binding(6, 0)]] RWStructuredBuffer<Atomic<uint>> heads;
+[[vk::binding(7, 0)]] RWStructuredBuffer<Entry> entries;
+[[vk::binding(13, 0)]] RWStructuredBuffer<uint4> results;
+"#,
+    );
+    for source in [
+        section(
+            production,
+            "uint permuteCandidateDomain(",
+            "bool coldPriorityEnabled(",
+        ),
+        section(
+            production,
+            "bool coldPriorityEnabled(",
+            "// Secondary seeds",
+        ),
+        section(production, "uint probeCountHead(", "uint findProbeNode("),
+        section(production, "uint findProbeNodeSlot(", "uint findEntry("),
+        rank_source,
+    ] {
+        shader_source.push_str(source);
+        shader_source.push('\n');
+    }
+    shader_source.push_str(
+        r#"
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void readRankState(uint3 id : SV_DispatchThreadID) {
+    uint count = params.size.z;
+    if (id.x < count) {
+        Entry low = entries[probeDescriptorIndex(id.x, 0u, 0u)];
+        Entry high = entries[probeDescriptorIndex(id.x, 1u, 0u)];
+        results[id.x] = uint4(low.padding.x, high.padding.x,
+            low.lastSample, high.lastSample);
+        results[count + id.x] = uint4(transportCandidateSelected(id.x) ? 1u : 0u,
+            0u, 0u, 0u);
+        uint variant = id.x % 2u;
+        uint descriptor = probeDescriptorIndex(id.x, variant, 0u);
+        uint slot = findProbeNodeSlot(entries[descriptor].key);
+        uint population = slot == EMPTY ? 0u
+            : heads[probeCountHead(1u, slot, params)].load();
+        results[2u * count + 5u + id.x] = uint4(population, slot, descriptor, 0u);
+    }
+    if (id.x < 4u) {
+        uint group = id.x / 2u;
+        uint variant = id.x % 2u;
+        uint sample = group * 4u + variant;
+        if (params.frame.z == 1u) {
+            sample = id.x == 0u ? 0u : id.x == 1u ? 1u : id.x == 2u ? 5u : 7u;
+            variant = sample % 2u;
+        }
+        uint descriptor = probeDescriptorIndex(sample, variant, 0u);
+        uint slot = findProbeNodeSlot(entries[descriptor].key);
+        uint rays = slot == EMPTY ? 0u
+            : heads[probeCountHead(0u, slot, params)].load();
+        uint nomineeIndex = EMPTY;
+        if (coldPriorityEnabled(params) && params.frame.y == 0u && rays != 0u) {
+            uint nomineeRank = 0xffffffffu - rays;
+            uint nomineeSample = coldCandidateFromRank(nomineeRank);
+            nomineeIndex = probeDescriptorIndex(nomineeSample, 0u, 0u);
+            if (entries[nomineeIndex].valid == 0u
+                || any(entries[nomineeIndex].key != entries[descriptor].key))
+                nomineeIndex = probeDescriptorIndex(nomineeSample, 1u, 0u);
+            rays = nomineeIndex + 1u;
+        }
+        results[2u * count + id.x] = uint4(rays, slot, descriptor, nomineeIndex);
+    }
+    if (id.x == 0u)
+        results[2u * count + 4u] = uint4(heads[2u * params.size.w + 7u].load(), 0u, 0u, 0u);
+}
+"#,
+    );
+    let shader = SlangCompiler::default()
+        .compile_bundle(
+            "split_cold_priority_rank_check.slang",
+            &[
+                ("common.slang", include_str!("../shaders/common.slang")),
+                ("split_cold_priority_rank_check.slang", &shader_source),
+            ],
+            &SlangSettings {
+                target: SlangTarget::Wgsl,
+                entry_points: ["rank", "readRankState"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                optimization: Some(2),
+                ..default()
+            },
+        )
+        .unwrap();
+    let bevy::shader::Source::Wgsl(source) = shader.source else {
+        panic!("expected WGSL from the Split cold-priority regression shader");
+    };
+    let options = WgpuSettings::default();
+    let resources = block_on(initialize_renderer(
+        options.backends.unwrap_or(Backends::PRIMARY),
+        None,
+        &options,
+    ));
+    let device = &resources.0;
+    let queue = &resources.1;
+    let module = device.create_and_validate_shader_module(ShaderModuleDescriptor {
+        label: Some("split_cold_priority_rank_regression"),
+        source: ShaderSource::Wgsl(source),
+    });
+    let pipeline = |entry| {
+        device.create_compute_pipeline(&RawComputePipelineDescriptor {
+            label: Some(entry),
+            layout: None,
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: default(),
+            cache: None,
+        })
+    };
+    let rank = pipeline("rank");
+    let read_state = pipeline("readRankState");
+    let result = device.create_buffer(&BufferDescriptor {
+        label: Some("split_cold_priority_rank_results"),
+        size: results_bytes,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    let make_entries = |fair_mask: Option<&[bool]>, weighted: bool| {
+        let mut words = vec![0u32; DESCRIPTOR_COUNT * ENTRY_WORDS];
+        for sample in 0..CANDIDATES {
+            for variant in 0..2u32 {
+                for level in 0..4u32 {
+                    let index = ((variant * CANDIDATES + sample) * 4 + level) as usize;
+                    let base = index * ENTRY_WORDS;
+                    let group = if !weighted {
+                        sample / 4
+                    } else if variant == 0 {
+                        0
+                    } else {
+                        match sample {
+                            1 | 3 => 0,
+                            5 => 1,
+                            7 => 2,
+                            _ => 3,
+                        }
+                    };
+                    words[base] = group >> level;
+                    words[base + 1] = 0;
+                    words[base + 2] = 0;
+                    words[base + 3] = (variant << 18) | (level << 12);
+                    words[base + 16] = u32::MAX;
+                    words[base + 17] = 1;
+                    let selected_lod = sample % 2;
+                    words[base + 22] = if level == 0
+                        && variant == selected_lod
+                        && fair_mask.is_none_or(|selected| selected[sample as usize])
+                    {
+                        1
+                    } else {
+                        0
+                    };
+                    words[base + 23] = 1;
+                }
+            }
+        }
+        words
+    };
+    let make_state = |fair_mask: Option<&[bool]>, selected_count: u32, weighted: bool| {
+        let mut heads_words =
+            vec![u32::MAX; (2 * BUCKETS + 36 + 8 * DIRECTORY_CAPACITY as u32) as usize];
+        let count_base = 2 * BUCKETS as usize + 36 + 4 * DIRECTORY_CAPACITY;
+        for count in 0..4 * DIRECTORY_CAPACITY {
+            heads_words[count_base + count] = 0;
+        }
+        heads_words[2 * BUCKETS as usize + 7] = selected_count;
+        let heads = device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("split_cold_priority_heads"),
+            contents: &heads_words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>(),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+        });
+        let entry_words = make_entries(fair_mask, weighted);
+        let entry_bytes: Vec<_> = entry_words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let entries = device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("split_cold_priority_entries"),
+            contents: &entry_bytes,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+        });
+        (heads, entries)
+    };
+    let make_parameters = |history_valid: bool, history_frames: u32, phase: u32| {
+        let mut parameters = temporal_test_parameters(history_frames);
+        parameters.size = UVec4::new(WIDTH, HEIGHT, CANDIDATES, BUCKETS);
+        parameters.history.z = if history_valid { 1.0 } else { 0.0 };
+        parameters.interval_history.y = 1.0;
+        parameters.sampling.x = BUDGET;
+        parameters.owner_sequence.z = BUDGET;
+        parameters.owner_sequence.w = CURSOR;
+        parameters.frame.y = phase;
+        parameters
+    };
+    let make_groups = |parameters: TransportParameters, heads: &Buffer, entries: &Buffer| {
+        let mut uniform = UniformBuffer::from(parameters);
+        uniform.write_buffer(device, queue);
+        let rank_group = device.create_bind_group(
+            "split_cold_priority_rank",
+            &rank.get_bind_group_layout(0).into(),
+            &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.binding().unwrap(),
+                },
+                BindGroupEntry {
+                    binding: 6,
+                    resource: heads.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 7,
+                    resource: entries.as_entire_binding(),
+                },
+            ],
+        );
+        let state_group = device.create_bind_group(
+            "split_cold_priority_state",
+            &read_state.get_bind_group_layout(0).into(),
+            &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.binding().unwrap(),
+                },
+                BindGroupEntry {
+                    binding: 6,
+                    resource: heads.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 7,
+                    resource: entries.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 13,
+                    resource: result.as_entire_binding(),
+                },
+            ],
+        );
+        (uniform, rank_group, state_group)
+    };
+    let read_state = |group: &BindGroup| {
+        let bytes = crate::scene::traversal_tests::dispatch_readback(
+            device,
+            queue,
+            &read_state,
+            group,
+            &result,
+            results_bytes,
+            1,
+        );
+        (0..3 * CANDIDATES as usize + 5)
+            .map(|index| output_u32x4(&bytes, index))
+            .collect::<Vec<_>>()
+    };
+    let fair_selected: Vec<bool> = (0..CANDIDATES)
+        .map(|sample| {
+            reference_candidate_selected(sample, WIDTH, HEIGHT, CANDIDATES, CURSOR, BUDGET)
+        })
+        .collect();
+
+    let (cold_heads, cold_entries) = make_state(None, 0, false);
+    let mut cold_uniforms = Vec::new();
+    let mut cold_rank_groups = Vec::new();
+    let mut cold_state_groups = Vec::new();
+    for phase in 0..4 {
+        let mut parameters = make_parameters(false, 24, phase);
+        parameters.frame.x = COLD_FRAME;
+        let (uniform, rank_group, state_group) =
+            make_groups(parameters, &cold_heads, &cold_entries);
+        cold_uniforms.push(uniform);
+        cold_rank_groups.push(rank_group);
+        cold_state_groups.push(state_group);
+    }
+    let head_bytes = cold_heads.size();
+    let mut nominees = [0u32; 4];
+    for phase in 0..4 {
+        let _ = crate::scene::traversal_tests::dispatch_readback(
+            device,
+            queue,
+            &rank,
+            &cold_rank_groups[phase],
+            &cold_heads,
+            head_bytes,
+            1,
+        );
+        let state = read_state(&cold_state_groups[phase]);
+        let keys = &state[2 * CANDIDATES as usize..2 * CANDIDATES as usize + 4];
+        let selected_counter = state[2 * CANDIDATES as usize + 4][0];
+        if phase == 0 {
+            assert_eq!(
+                selected_counter, 0,
+                "cold nominations do not consume the ray budget"
+            );
+            for (key, record) in keys.iter().enumerate() {
+                let group = key / 2;
+                let variant = key % 2;
+                let first_sample = (group * 4 + variant) as u32;
+                let second_sample = first_sample + 2;
+                let first_index = ((variant as u32 * CANDIDATES + first_sample) * 4) as usize;
+                let second_index = ((variant as u32 * CANDIDATES + second_sample) * 4) as usize;
+                let expected_index = if reference_cold_candidate_rank(
+                    first_sample,
+                    WIDTH,
+                    HEIGHT,
+                    CANDIDATES,
+                    COLD_FRAME,
+                ) < reference_cold_candidate_rank(
+                    second_sample,
+                    WIDTH,
+                    HEIGHT,
+                    CANDIDATES,
+                    COLD_FRAME,
+                ) {
+                    first_index
+                } else {
+                    second_index
+                };
+                assert_eq!(
+                    record[3] as usize, expected_index,
+                    "probe {key} must choose the frame-seeded lowest-rank eligible descriptor"
+                );
+                assert_eq!(record[0] as usize, expected_index + 1);
+            }
+            nominees = std::array::from_fn(|key| keys[key][3]);
+
+            // Make the canonical owner and nominee unambiguous for the next
+            // phase. Key zero's canonical descriptor is index 0, but descriptor
+            // 8 is another eligible receiver for the same probe. This catches
+            // confusing its nominated value 9 with the committed ray count 1.
+            for (key, record) in keys.iter().enumerate() {
+                let group = key / 2;
+                let variant = key % 2;
+                let owner_sample = (group * 4) as u32;
+                let owner_index = (variant as u32 * CANDIDATES + owner_sample) * 4;
+                let directory_head = 2 * BUCKETS as usize + 36 + record[1] as usize;
+                queue.write_buffer(
+                    &cold_heads,
+                    (directory_head * 4) as u64,
+                    &owner_index.to_le_bytes(),
+                );
+            }
+            let key_zero_count_head =
+                2 * BUCKETS as usize + 36 + 4 * DIRECTORY_CAPACITY + keys[0][1] as usize;
+            let nominee_priority =
+                u32::MAX - reference_cold_candidate_rank(2, WIDTH, HEIGHT, CANDIDATES, COLD_FRAME);
+            queue.write_buffer(
+                &cold_heads,
+                (key_zero_count_head * 4) as u64,
+                &nominee_priority.to_le_bytes(),
+            );
+            nominees[0] = 8;
+        } else if phase == 1 {
+            assert_eq!(
+                selected_counter, 0,
+                "building the population histogram does not reserve updates"
+            );
+        } else if phase == 2 {
+            assert_eq!(
+                selected_counter, 4,
+                "one nominee is admitted per base probe"
+            );
+            assert_eq!(keys.iter().map(|record| record[0]).sum::<u32>(), 4);
+            let cold_markers = state[..CANDIDATES as usize]
+                .iter()
+                .map(|record| (record[0] == 2) as usize + (record[1] == 2) as usize)
+                .sum::<usize>();
+            assert_eq!(cold_markers, 4, "canonical owners admit each nominee once");
+            assert_eq!(
+                state[2][0], 2,
+                "non-owner descriptor 8 is admitted by owner 0"
+            );
+            assert_eq!(
+                state[0][0], 1,
+                "owner 0 stays eligible after nominating descriptor 8"
+            );
+            for nominee in nominees {
+                let sample = (nominee as usize / 4) % CANDIDATES as usize;
+                let variant = nominee as usize / (CANDIDATES as usize * 4);
+                let record = state[sample];
+                assert_eq!(record[variant], 2, "phase 2 marks only the nominee cold");
+            }
+        } else if phase == 3 {
+            assert_eq!(
+                selected_counter, BUDGET,
+                "fair fill reaches the traversal budget"
+            );
+            assert_eq!(keys.iter().map(|record| record[0]).sum::<u32>(), BUDGET);
+            let mut total_selected = 0;
+            for sample in 0..CANDIDATES as usize {
+                let record = state[sample];
+                assert!(record[0] <= 1 && record[1] <= 1);
+                assert!(
+                    record[0] + record[1] <= 1,
+                    "sample {sample} traces one LOD only"
+                );
+                let chosen = if record[0] == 1 {
+                    Some((0, record[2]))
+                } else if record[1] == 1 {
+                    Some((1, record[3]))
+                } else {
+                    None
+                };
+                if let Some((variant, local_ordinal)) = chosen {
+                    total_selected += 1;
+                    let key = (sample / 4) * 2 + variant;
+                    let nominee = nominees[key];
+                    let descriptor = ((variant * CANDIDATES as usize + sample) * 4) as u32;
+                    if descriptor != nominee {
+                        assert!(
+                            fair_selected[sample],
+                            "non-nominee sample {sample} must be fair-selected"
+                        );
+                    }
+                    assert!(
+                        local_ordinal < keys[key][0],
+                        "local ray ordinal stays within its probe"
+                    );
+                }
+            }
+            assert_eq!(total_selected, BUDGET as usize);
+            for (key, probe) in keys.iter().enumerate() {
+                let group = key / 2;
+                let variant = key % 2;
+                let mut ordinals = Vec::new();
+                for sample in [group * 4 + variant, group * 4 + variant + 2] {
+                    let record = state[sample];
+                    let (selected, ordinal) = if variant == 0 {
+                        (record[0], record[2])
+                    } else {
+                        (record[1], record[3])
+                    };
+                    if selected == 1 {
+                        ordinals.push(ordinal);
+                    }
+                }
+                ordinals.sort_unstable();
+                assert_eq!(ordinals, (0..probe[0]).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    // Warm or history-disabled frames retain the original fair selection exactly.
+    for (history_valid, history_frames) in [(true, 24), (false, 0)] {
+        let (warm_heads, warm_entries) = make_state(Some(&fair_selected), BUDGET, false);
+        let (warm_uniform, warm_rank_group, warm_state_group) = make_groups(
+            make_parameters(history_valid, history_frames, 0),
+            &warm_heads,
+            &warm_entries,
+        );
+        let _ = crate::scene::traversal_tests::dispatch_readback(
+            device,
+            queue,
+            &rank,
+            &warm_rank_group,
+            &warm_heads,
+            warm_heads.size(),
+            1,
+        );
+        let state = read_state(&warm_state_group);
+        let records = &state[..CANDIDATES as usize];
+        let mut selected_count = 0;
+        for sample in 0..CANDIDATES as usize {
+            let expected_low = fair_selected[sample] && sample % 2 == 0;
+            let expected_high = fair_selected[sample] && sample % 2 == 1;
+            assert_eq!(records[sample][0], if expected_low { 1 } else { 0 });
+            assert_eq!(records[sample][1], if expected_high { 1 } else { 0 });
+            assert_eq!(
+                state[CANDIDATES as usize + sample][0],
+                if fair_selected[sample] { 1 } else { 0 }
+            );
+            selected_count += records[sample][0] + records[sample][1];
+        }
+        assert_eq!(selected_count, BUDGET);
+        assert_eq!(state[2 * CANDIDATES as usize + 4][0], BUDGET);
+        let _ = &warm_uniform;
+    }
+    // A cold budget follows projected candidate population before fair fill:
+    // dense visible probes outrank the sparse probes they cover less often.
+    let (weighted_heads, weighted_entries) = make_state(None, 0, true);
+    for phase in 0..3 {
+        let mut parameters = make_parameters(false, 24, phase);
+        parameters.sampling.x = 2;
+        parameters.owner_sequence.z = 2;
+        parameters.frame.x = COLD_FRAME;
+        parameters.frame.z = 1;
+        let (uniform, rank_group, state_group) =
+            make_groups(parameters, &weighted_heads, &weighted_entries);
+        let _ = crate::scene::traversal_tests::dispatch_readback(
+            device,
+            queue,
+            &rank,
+            &rank_group,
+            &weighted_heads,
+            weighted_heads.size(),
+            1,
+        );
+        let state = read_state(&state_group);
+        let selected_counter = state[2 * CANDIDATES as usize + 4][0];
+        let populations = &state[2 * CANDIDATES as usize + 5..3 * CANDIDATES as usize + 5];
+        assert_eq!(
+            populations
+                .iter()
+                .map(|record| record[0])
+                .collect::<Vec<_>>(),
+            vec![4u32, 2, 4, 2, 4, 1, 4, 1],
+            "source populations count selected-LOD candidates per probe"
+        );
+        if phase < 2 {
+            assert_eq!(selected_counter, 0, "cold ranking phases spend no rays");
+        } else {
+            let keys = &state[2 * CANDIDATES as usize..2 * CANDIDATES as usize + 4];
+            assert_eq!(
+                keys.iter().map(|record| record[0]).collect::<Vec<_>>(),
+                vec![1u32, 1, 0, 0],
+                "the fixed budget admits populations 4 and 2 before population 1"
+            );
+            assert_eq!(selected_counter, 2);
+        }
+        let _ = uniform;
+    }
+
+    // When unique cold probes outnumber the update budget, admission must
+    // remain bounded even though every probe has a nominated descriptor.
+    let (limited_heads, limited_entries) = make_state(None, 0, false);
+    for phase in 0..4 {
+        let mut parameters = make_parameters(false, 24, phase);
+        parameters.sampling.x = 2;
+        parameters.owner_sequence.z = 2;
+        parameters.frame.x = COLD_FRAME;
+        let (uniform, rank_group, state_group) =
+            make_groups(parameters, &limited_heads, &limited_entries);
+        let _ = crate::scene::traversal_tests::dispatch_readback(
+            device,
+            queue,
+            &rank,
+            &rank_group,
+            &limited_heads,
+            limited_heads.size(),
+            1,
+        );
+        let state = read_state(&state_group);
+        let selected_counter = state[2 * CANDIDATES as usize + 4][0];
+        if phase < 2 {
+            assert_eq!(
+                selected_counter, 0,
+                "cold preparation does not spend the budget"
+            );
+            let _ = uniform;
+            continue;
+        }
+        let keys = &state[2 * CANDIDATES as usize..2 * CANDIDATES as usize + 4];
+        assert_eq!(
+            selected_counter, 2,
+            "cold admission and fair fill must not exceed the update budget"
+        );
+        assert_eq!(
+            keys.iter().map(|record| record[0]).sum::<u32>(),
+            2,
+            "only two of the four nominated probes may receive a ray"
+        );
+        let admitted_marker = if phase == 2 { 2 } else { 1 };
+        let admitted = state[..CANDIDATES as usize]
+            .iter()
+            .map(|record| {
+                (record[0] == admitted_marker) as usize + (record[1] == admitted_marker) as usize
+            })
+            .sum::<usize>();
+        assert_eq!(
+            admitted, 2,
+            "each reserved update belongs to exactly one cold nominee"
+        );
+        let _ = uniform;
+    }
+
+    let _ = (&cold_uniforms, cold_rank_groups, cold_state_groups);
+}
+
 #[test]
 #[ignore = "requires slangc and a desktop GPU; dispatches production Split interval deposition"]
 fn gpu_split_deposit_stops_at_first_hit_and_leaves_far_intervals_unfilled() {
@@ -2566,7 +3591,7 @@ fn gpu_split_deposit_stops_at_first_hit_and_leaves_far_intervals_unfilled() {
     }
 
     const CACHE_BUCKETS: u32 = 16;
-    const ENTRY_WORDS: usize = 208 / 4;
+    const ENTRY_WORDS: usize = 272 / 4;
     const SENTINEL: [f32; 4] = [9.0, 8.0, 7.0, 6.0];
     let production = include_str!("../shaders/split.slang");
 
@@ -2602,7 +3627,7 @@ static const uint HIT_QUERY_UNSUPPORTED = 4u;
         section(
             production,
             "float splitIntervalEnd(",
-            "uint probeDirectoryCapacity(",
+            "uint probeCountHead(",
         ),
         section(production, "void deposit(", "void traceTransport("),
     ] {
@@ -2618,8 +3643,10 @@ void depositCheck(uint3 id : SV_DispatchThreadID) {
     hit.distance = splitIntervalEnd(1u, 0u);
     DependencyContext rayDependency = dependencyEmpty();
     DependencyContext outgoingDependency = dependencyEmpty();
+    TransportRadiance radiance = (TransportRadiance)0;
+    radiance.background = float3(4, 2, 1);
     deposit(0u, float3(0.5, 0.5, 0.5), float3(0.0),
-        float3(0, 0, 1), hit, float3(4, 2, 1), 0u,
+        float3(0, 0, 1), hit, radiance, 0u,
         rayDependency, 0.0, hit.distance, 0.001, outgoingDependency);
     [unroll] for (uint level = 0u; level < 4u; ++level)
         results[level] = asuint(entries[level].interval);

@@ -72,10 +72,10 @@ uint4 geometryPageWord(uint index) {
 }
 uint4 geometryWord(uint index) {
     if (params.geometryPages.x == 0) return geometryInlineWord(index);
-    uint4 value = geometryPageWord(index);
-    if (params.geometryPages.x != 2) return value;
+    if (params.geometryPages.x != 2) return geometryPageWord(index);
     uint4 header = geometryPageWord(0);
-    if (index < header.y || index >= header.y + header.w * header.z) return value;
+    if (index < header.y || index >= header.y + header.w * header.z)
+        return geometryPageWord(index);
     uint vertex = (index - header.y) / header.z;
     uint field = (index - header.y) % header.z;
     uint4 global = geometryInlineWord(0u);
@@ -91,7 +91,7 @@ uint4 geometryWord(uint index) {
         if (vertex >= range.x && vertex < range.x + range.y)
             return geometryPageWord(global.z + (range.z + vertex - range.x) * 5 + field);
     }
-    return value;
+    return geometryPageWord(index);
 }
 #else
 uint4 geometryWord(uint index) { return geometryWords[index]; }
@@ -158,8 +158,7 @@ uint3 triangleIndices(uint triangle, uint4 header) { return geometryWord(header.
 uint3 triangleIndices(uint triangle) { return triangleIndices(triangle, geometryWord(0)); }
 uint vertexBase(uint vertex, uint4 header) { return header.y + vertex * header.z; }
 uint vertexBase(uint vertex) { return vertexBase(vertex, geometryWord(0)); }
-Triangle localTriangle(uint index, uint4 header) {
-    uint3 indices = triangleIndices(index, header);
+Triangle localTriangle(uint3 indices, uint4 header) {
     Triangle triangle;
     triangle.a = float4(asfloat(geometryWord(vertexBase(indices.x, header)).xyz), 0);
     triangle.b = float4(asfloat(geometryWord(vertexBase(indices.y, header)).xyz), 0);
@@ -167,12 +166,18 @@ Triangle localTriangle(uint index, uint4 header) {
     triangle.albedo = 0; triangle.emission = 0;
     return triangle;
 }
+Triangle localTriangle(uint index, uint4 header) {
+    return localTriangle(triangleIndices(index, header), header);
+}
 Triangle localTriangle(uint index) { return localTriangle(index, geometryWord(0)); }
+float4 hitVertexAttribute(Hit hit, uint attribute, uint3 indices, uint4 header) {
+    return asfloat(geometryWord(vertexBase(indices.x, header) + attribute)) * hit.barycentric.x
+         + asfloat(geometryWord(vertexBase(indices.y, header) + attribute)) * hit.barycentric.y
+         + asfloat(geometryWord(vertexBase(indices.z, header) + attribute)) * hit.barycentric.z;
+}
 float4 hitVertexAttribute(Hit hit, uint attribute) {
-    uint3 indices = triangleIndices(hit.triangle);
-    return asfloat(geometryWord(vertexBase(indices.x) + attribute)) * hit.barycentric.x
-         + asfloat(geometryWord(vertexBase(indices.y) + attribute)) * hit.barycentric.y
-         + asfloat(geometryWord(vertexBase(indices.z) + attribute)) * hit.barycentric.z;
+    uint4 header = geometryWord(0);
+    return hitVertexAttribute(hit, attribute, triangleIndices(hit.triangle, header), header);
 }
 float3 unitVector(float3 value, float3 fallback) {
     float scale = max(abs(value.x), max(abs(value.y), abs(value.z)));
@@ -189,13 +194,26 @@ BvhNode sceneNode(uint index) {
     node.maximum = asfloat(b.xyz); node.count = b.w; return node;
 }
 [ForceInline]
-uint instanceBase(uint instance) { return sceneWord(0).y + instance * sceneWord(0).w; }
+uint instanceBase(uint instance) {
+    uint4 header = sceneWord(0);
+    return header.y + instance * header.w;
+}
 uint2 hitInstanceIdentity(Hit hit) { return sceneWord(instanceBase(hit.instance) + 7).xy; }
 bool instanceVisibleRecord(uint4 mask) {
-    [loop] for (uint i = 0; i < min(mask.y, params.layers.y); ++i) {
-        uint instanceBits = sceneWord(mask.x + i / 4)[i & 3];
-        uint cameraBits = lights[params.layers.x + i / 4].source[i & 3];
-        if ((instanceBits & cameraBits) != 0) return true;
+    uint count = min(mask.y, params.layers.y);
+    uint wholeWords = count / 4u;
+    // One scene/page lookup and one light lookup cover four layer bits.
+    [loop] for (uint word = 0; word < wholeWords; ++word) {
+        uint4 instanceBits = sceneWord(mask.x + word);
+        uint4 cameraBits = lights[params.layers.x + word].source;
+        if (any((instanceBits & cameraBits) != uint4(0))) return true;
+    }
+    if (wholeWords * 4u < count) {
+        uint4 instanceBits = sceneWord(mask.x + wholeWords);
+        uint4 cameraBits = lights[params.layers.x + wholeWords].source;
+        [unroll] for (uint i = 0; i < 3u; ++i) {
+            if (wholeWords * 4u + i < count && (instanceBits[i] & cameraBits[i]) != 0) return true;
+        }
     }
     return false;
 }
@@ -227,8 +245,6 @@ struct HitAttributes {
     float3 geometricNormal;
     float3 worldNormal; // normalized per vertex, then interpolated (MikkTSpace)
     float4 worldTangent;
-    float4 uv; // UV0.xy, UV1.zw
-    float4 color;
 };
 float3 triangleGeometricNormal(uint base, uint flags, Triangle triangle) {
     return ((flags & 4) != 0 ? -1 : 1) * unitVector(transformDirection(base,
@@ -240,14 +256,16 @@ float3 hitGeometricNormal(Hit hit) {
 }
 HitAttributes hitAttributes(Hit hit) {
     uint base = instanceBase(hit.instance);
-    uint3 indices = triangleIndices(hit.triangle);
-    Triangle triangle = localTriangle(hit.triangle);
-    float sign = (sceneWord(base + 6).w & 4) != 0 ? -1 : 1;
+    uint4 header = geometryWord(0);
+    uint3 indices = triangleIndices(hit.triangle, header);
+    Triangle triangle = localTriangle(indices, header);
+    uint instanceFlags = sceneWord(base + 6).w;
+    float sign = (instanceFlags & 4) != 0 ? -1 : 1;
     HitAttributes attributes;
-    attributes.geometricNormal = triangleGeometricNormal(base, sceneWord(base + 6).w, triangle);
+    attributes.geometricNormal = triangleGeometricNormal(base, instanceFlags, triangle);
     attributes.worldNormal = 0; attributes.worldTangent = 0;
     [loop] for (uint i = 0; i < 3; ++i) {
-        uint vertex = vertexBase(indices[i]);
+        uint vertex = vertexBase(indices[i], header);
         uint flags = geometryWord(vertex).w;
         float3 normal = attributes.geometricNormal;
         if ((flags & 1) != 0)
@@ -259,8 +277,6 @@ HitAttributes hitAttributes(Hit hit) {
         attributes.worldTangent += float4(unitVector(transformDirection(base + 3, tangent.xyz), float3(0)),
                                           tangent.w * sign) * hit.barycentric[i];
     }
-    attributes.uv = hitVertexAttribute(hit, 3);
-    attributes.color = hitVertexAttribute(hit, 4);
     return attributes;
 }
 #include "material.slang"
@@ -270,8 +286,9 @@ float3 hitShadingNormal(Hit hit, HitAttributes attributes, float3 incoming) {
 float3 hitEmission(Hit hit, float3 baseColor) {
     uint material = materialBase(hit);
     uint flags = sceneWord(instanceBase(hit.instance)+6).w;
-    float3 emission = asfloat(sceneWord(material+1).xyz)*materialSample(hit,1).xyz;
-    if ((flags&16) != 0) emission = baseColor;
+    float3 emission;
+    if ((flags & 16) != 0) emission = baseColor;
+    else emission = asfloat(sceneWord(material+1).xyz)*materialSample(hit,1).xyz;
 #ifndef GI_TRAVERSAL_CHECK
     float exposureWeight = (flags&16) != 0 ? 0 : asfloat(sceneWord(material+2).w);
     // Preserve Bevy's emissive exposure weight before cached GI is pre-exposed.
@@ -300,7 +317,10 @@ float3 emitterRadiance(Light light, float3 barycentric) {
     if (!instanceVisible(light.source.x)) return float3(0);
     Hit hit; hit.distance = 0; hit.instance = light.source.x; hit.triangle = light.source.y;
     hit.barycentric = barycentric; hit.errors = 0; hit.footprint = 0;
-    return materialAccepts(hit, materialAlphaCutoff(hit)) ? max(worldTriangle(hit).emission.xyz, 0) : float3(0);
+    float coverage = materialCoverage(hit, materialAlphaCutoff(hit));
+    if (!(coverage > 0.0)) return 0.0;
+    float3 baseColor = materialBaseColor(hit).rgb;
+    return max(hitEmission(hit, baseColor), 0.0) * coverage;
 }
 float sourceCosine(Triangle triangle, float3 direction) {
     float c = dot(normalize(cross(triangle.b.xyz - triangle.a.xyz, triangle.c.xyz - triangle.a.xyz)), -direction);
@@ -313,10 +333,23 @@ float sourceCosine(Light light, float3 direction) {
 }
 
 [ForceInline]
+bool conventionalLightIsPunctual(Light light) {
+    // Conventional records use position.w > 0 for finite point/spot sources;
+    // directional records encode the direction to the source in position.xyz.
+    return light.position.w > 0.0;
+}
+[ForceInline]
+void addConventionalLightRadiance(inout float3 background, inout float3 punctual,
+                                  bool finiteLight, float3 contribution) {
+    if (finiteLight) punctual += contribution;
+    else background += contribution;
+}
+
+[ForceInline]
 bool boxRayInterval(float3 origin, float3 direction, BvhNode node, float limit,
                     out float entry, out float exit) {
     float near = 0.0, far = limit;
-    [loop] for (uint axis = 0; axis < 3; ++axis) {
+    [unroll] for (uint axis = 0; axis < 3; ++axis) {
         if (direction[axis] == 0) {
             if (origin[axis] < node.minimum[axis] || origin[axis] > node.maximum[axis]) {
                 entry = 0.0; exit = 0.0;
@@ -356,17 +389,36 @@ float orientedEdge(float2 a, float2 b) {
     if (abs(edge) <= error) edge = 0;
     return reverse ? -edge : edge;
 }
-float3 intersectTriangle(float3 origin, float3 direction, Triangle triangle) {
+struct TriangleRay {
+    uint kx, ky, kz;
+    float sx, sy;
+    bool valid;
+};
+
+TriangleRay triangleRay(float3 direction) {
+    // The shear and dominant axis depend only on the local ray, not on the
+    // triangle. Reuse them for every primitive visited in this instance.
+    TriangleRay ray = (TriangleRay)0;
+    float3 magnitude = abs(direction);
+    ray.kz = magnitude.x > magnitude.y ? (magnitude.x > magnitude.z ? 0 : 2) : (magnitude.y > magnitude.z ? 1 : 2);
+    ray.valid = direction[ray.kz] != 0;
+    if (!ray.valid) return ray;
+    ray.kx = (ray.kz + 1) % 3;
+    ray.ky = (ray.kx + 1) % 3;
+    if (direction[ray.kz] < 0) { uint swap = ray.kx; ray.kx = ray.ky; ray.ky = swap; }
+    ray.sx = direction[ray.kx] / direction[ray.kz];
+    ray.sy = direction[ray.ky] / direction[ray.kz];
+    return ray;
+}
+
+float3 intersectTriangle(float3 origin, float3 direction, TriangleRay ray, Triangle triangle) {
     // Sheared edge functions give adjacent triangles matching edge decisions.
     // No absolute determinant epsilon: local directions retain world t and can
     // be arbitrarily short/long under nonuniform instance scale.
-    float3 magnitude = abs(direction);
-    uint kz = magnitude.x > magnitude.y ? (magnitude.x > magnitude.z ? 0 : 2) : (magnitude.y > magnitude.z ? 1 : 2);
-    if (direction[kz] == 0) return float3(-1, 0, 0);
-    uint kx = (kz + 1) % 3, ky = (kx + 1) % 3;
-    if (direction[kz] < 0) { uint swap = kx; kx = ky; ky = swap; }
+    if (!ray.valid) return float3(-1, 0, 0);
+    uint kx = ray.kx, ky = ray.ky, kz = ray.kz;
+    float sx = ray.sx, sy = ray.sy;
     float3 a = triangle.a.xyz - origin, b = triangle.b.xyz - origin, c = triangle.c.xyz - origin;
-    float sx = direction[kx] / direction[kz], sy = direction[ky] / direction[kz];
     float2 pa = float2(a[kx] - sx * a[kz], a[ky] - sy * a[kz]);
     float2 pb = float2(b[kx] - sx * b[kz], b[ky] - sy * b[kz]);
     float2 pc = float2(c[kx] - sx * c[kz], c[ky] - sy * c[kz]);
@@ -389,13 +441,16 @@ float3 intersectTriangle(float3 origin, float3 direction, Triangle triangle) {
     return isfinite(distance) ? float3(distance, weights.yz) : float3(-1, 0, 0);
 }
 
-Hit traceTriangle(float3 origin, float3 direction, float3 worldDirection, float coneWidth, float coneSpread,
-                  uint triangleIndex, uint instance, uint base, uint flags, uint4 geometryHeader, Hit hit) {
+Hit traceTriangle(float3 origin, float3 direction, TriangleRay ray, float3 worldDirection,
+                  float coneWidth, float coneSpread, uint triangleIndex, uint instance,
+                  uint base, uint flags, uint4 geometryHeader, Hit hit) {
     Triangle triangle = localTriangle(triangleIndex, geometryHeader);
-    float facing = dot(cross(triangle.b.xyz-triangle.a.xyz, triangle.c.xyz-triangle.a.xyz), direction)
-                   * ((flags & 4) != 0 ? -1 : 1);
-    if (((flags & 1) != 0 && facing >= 0) || ((flags & 2) != 0 && facing <= 0)) return hit;
-    float3 intersection = intersectTriangle(origin, direction, triangle);
+    if ((flags & 3u) != 0) {
+        float facing = dot(cross(triangle.b.xyz-triangle.a.xyz, triangle.c.xyz-triangle.a.xyz), direction)
+                       * ((flags & 4) != 0 ? -1 : 1);
+        if (((flags & 1) != 0 && facing >= 0) || ((flags & 2) != 0 && facing <= 0)) return hit;
+    }
+    float3 intersection = intersectTriangle(origin, direction, ray, triangle);
     float distance = intersection.x;
     // Reject sub-precision self hits at translated triangle boundaries.
     if (distance > 0.000025 && distance < hit.distance) {
@@ -403,7 +458,7 @@ Hit traceTriangle(float3 origin, float3 direction, float3 worldDirection, float 
         candidate.barycentric = float3(1 - intersection.y - intersection.z, intersection.yz);
         candidate.footprint = 0;
         float cutoff = materialAlphaCutoff(candidate);
-        if (cutoff >= 0 && (coneWidth > 0 || coneSpread > 0)) {
+        if (cutoff != -1.0 && (coneWidth > 0 || coneSpread > 0)) {
             float cosine = abs(dot(triangleGeometricNormal(base, flags, triangle), worldDirection));
             candidate.footprint = (max(coneWidth, 0.0) + max(coneSpread, 0.0) * distance)
                                   / max(cosine, 0.001);
@@ -420,14 +475,24 @@ Hit traceInstance(float3 origin, float3 direction, uint instance, Hit hit, bool 
     uint base = instanceBase(instance);
     uint4 instanceRecord = sceneWord(base + 6);
     if (!instanceVisibleRecord(instanceRecord)) return hit;
-    float3 localOrigin = transformPoint(base, origin);
+    // Both transforms use the same three inverse-matrix rows. Loading them
+    // once avoids repeating paged-scene/overlay resolution for every instance.
+    float4 row0 = asfloat(sceneWord(base));
+    float4 row1 = asfloat(sceneWord(base + 1));
+    float4 row2 = asfloat(sceneWord(base + 2));
+    float4 point = float4(origin, 1);
+    float4 vector = float4(direction, 0);
+    float3 localOrigin = float3(dot(row0, point), dot(row1, point), dot(row2, point));
     // Keep this unnormalized so triangle/box distances remain world distances.
-    float3 localDirection = transformPoint(base, direction, true);
+    float3 localDirection = float3(dot(row0, vector), dot(row1, vector), dot(row2, vector));
     uint flags = instanceRecord.w;
-    uint stack[49]; uint count = 0;
-    uint currentNode = sceneWord(base + 8).x;
+    uint2 stack[49]; uint count = 0;
+    uint4 geometry = sceneWord(base + 8);
+    uint currentNode = geometry.x;
     BvhNode node = sceneNode(currentNode);
     bool currentNodeReady = intersectBox(localOrigin, localDirection, node, hit.distance);
+    TriangleRay ray = (TriangleRay)0;
+    if (currentNodeReady) ray = triangleRay(localDirection);
     uint traversalSteps = 0u;
     [loop] while (currentNodeReady || count != 0) {
         if (++traversalSteps > MAX_TRAVERSAL_STEPS) {
@@ -435,9 +500,11 @@ Hit traceInstance(float3 origin, float3 direction, uint instance, Hit hit, bool 
             break;
         }
         if (!currentNodeReady) {
-            currentNode = stack[--count];
+            // The box was already tested; only a closer hit can prune it.
+            uint2 deferred = stack[--count];
+            if (asfloat(deferred.y) > hit.distance) continue;
+            currentNode = deferred.x;
             node = sceneNode(currentNode);
-            if (!intersectBox(localOrigin, localDirection, node, hit.distance)) continue;
         }
         currentNodeReady = false;
         if (node.count == 0) {
@@ -445,7 +512,6 @@ Hit traceInstance(float3 origin, float3 direction, uint instance, Hit hit, bool 
                 // Unexpected topology cannot silently drop an occluder. Fall
                 // back to this instance's primitive range and report the flag.
                 hit.errors |= 1;
-                uint4 geometry = sceneWord(base + 8);
                 node.first = geometry.y; node.count = geometry.z;
                 count = 0;
             } else {
@@ -457,11 +523,11 @@ Hit traceInstance(float3 origin, float3 direction, uint instance, Hit hit, bool 
                 float rightEntry = boxEntryDistance(localOrigin, localDirection, rightNode, hit.distance);
                 if (leftEntry >= 0.0 && rightEntry >= 0.0) {
                     if (leftEntry <= rightEntry) {
-                        stack[count++] = rightIndex;
+                        stack[count++] = uint2(rightIndex, asuint(rightEntry));
                         currentNode = leftIndex;
                         node = leftNode;
                     } else {
-                        stack[count++] = leftIndex;
+                        stack[count++] = uint2(leftIndex, asuint(leftEntry));
                         currentNode = rightIndex;
                         node = rightNode;
                     }
@@ -478,22 +544,128 @@ Hit traceInstance(float3 origin, float3 direction, uint instance, Hit hit, bool 
                 continue;
             }
         }
-        // Share the leaf scan with overflow fallback to avoid duplicating the
-        // full material/intersection call graph in the driver compiler. The
-        // range is clamped to this instance's primitives and to a fixed maximum
-        // so a malformed node cannot turn one leaf into an unbounded scan.
-        uint4 leafGeometry = sceneWord(base + 8);
-        uint triangleBegin = max(node.first, leafGeometry.y);
-        uint triangleEnd = min(node.first + node.count, leafGeometry.y + leafGeometry.z);
-        triangleEnd = min(triangleEnd, triangleBegin + MAX_LEAF_TRIANGLES);
-        [loop] for (uint i = triangleBegin; i < triangleEnd; ++i) {
-            hit = traceTriangle(localOrigin, localDirection, direction, coneWidth, coneSpread,
+        // A clipped closest-hit scan cannot prove that a reported hit is
+        // nearest, or that a miss is actually empty.
+        uint triangleBegin = max(node.first, geometry.y);
+        uint triangleLimit = geometry.y + geometry.z;
+        uint requestedEnd = node.first + node.count;
+        uint triangleEnd = min(requestedEnd, triangleLimit);
+        bool truncated = node.first < geometry.y || requestedEnd < node.first
+            || requestedEnd > triangleLimit || node.count > MAX_LEAF_TRIANGLES;
+        uint boundedEnd = min(triangleEnd, triangleBegin + MAX_LEAF_TRIANGLES);
+        truncated = truncated || boundedEnd < triangleEnd;
+        if (truncated) hit.errors |= HIT_QUERY_UNSUPPORTED;
+        [loop] for (uint i = triangleBegin; i < boundedEnd; ++i) {
+            hit = traceTriangle(localOrigin, localDirection, ray, direction, coneWidth, coneSpread,
                                 i, instance, base, flags, geometryHeader, hit);
             if (anyHit && hit.triangle != EMPTY) return hit;
         }
     }
     return hit;
 }
+#ifdef PENUMBRA_HARDWARE_RAY_QUERY
+// Hardware ray queries replace only the BVH walk. Slang's WGSL target has no
+// ray-query types, and naga requires each query to be a local of the function
+// that drives it, so render.rs prepends the two query loops in WGSL
+// (`ray_query_source`). Every BLAS is non-opaque: the loops call the candidate
+// callbacks below, which re-test each proposed triangle with the software
+// tests. Accepted hits keep the software distance, barycentrics, culling,
+// layer and alpha-coverage decisions.
+static float3 hardwareOrigin;
+static float3 hardwareDirection;
+static float hardwareLimit;
+static float hardwareConeWidth;
+static float hardwareConeSpread;
+static uint4 hardwareGeometryHeader;
+static Hit hardwareHit;
+
+// Runs the closest-hit loop; always returns true.
+bool hardwareQueryClosest(float3 origin, float3 direction, float limit, bool anyHit) {
+    __target_switch { case wgsl: __intrinsic_asm "penumbraRayQueryClosest($0, $1, $2, $3)"; }
+}
+// Runs the occlusion loop; returns 1 when blocked and 0 otherwise.
+uint hardwareQueryOccluded(float3 origin, float3 direction, float limit) {
+    __target_switch { case wgsl: __intrinsic_asm "penumbraRayQueryOccluded($0, $1, $2)"; }
+}
+
+// The TLAS custom data is the packed instance index, and each BLAS covers that
+// instance's contiguous triangle range in order.
+[ForceInline]
+uint hardwareTriangle(uint instance, uint primitive, out uint base, out uint4 record,
+                      out float3 localOrigin, out float3 localDirection) {
+    base = instanceBase(instance);
+    record = sceneWord(base + 6);
+    float4 row0 = asfloat(sceneWord(base));
+    float4 row1 = asfloat(sceneWord(base + 1));
+    float4 row2 = asfloat(sceneWord(base + 2));
+    float4 point = float4(hardwareOrigin, 1);
+    float4 vector = float4(hardwareDirection, 0);
+    localOrigin = float3(dot(row0, point), dot(row1, point), dot(row2, point));
+    // Unnormalized, as in traceInstance, so local distances stay world distances.
+    localDirection = float3(dot(row0, vector), dot(row1, vector), dot(row2, vector));
+    return sceneWord(base + 8).y + primitive;
+}
+
+// Called by the WGSL closest-hit loop; true confirms the candidate.
+[noinline]
+bool hardwareClosestCandidate(uint instance, uint primitive) {
+    if (instance == EMPTY) return false;
+    uint base;
+    uint4 record;
+    float3 localOrigin, localDirection;
+    uint triangle = hardwareTriangle(instance, primitive, base, record,
+                                     localOrigin, localDirection);
+    if (!instanceVisibleRecord(record)) return false;
+    Hit candidate = traceTriangle(localOrigin, localDirection, triangleRay(localDirection),
+        hardwareDirection, hardwareConeWidth, hardwareConeSpread, triangle, instance, base,
+        record.w, hardwareGeometryHeader, hardwareHit);
+    // traceTriangle returns its input unchanged unless it accepts a closer hit.
+    if (!(candidate.distance < hardwareHit.distance)) return false;
+    hardwareHit = candidate;
+    return true;
+}
+
+// Called by the WGSL occlusion loop; true ends the query as blocked.
+[noinline]
+bool hardwareOccludedCandidate(uint instance, uint primitive) {
+    if (instance == EMPTY) return false;
+    uint base;
+    uint4 record;
+    float3 localOrigin, localDirection;
+    uint triangle = hardwareTriangle(instance, primitive, base, record,
+                                     localOrigin, localDirection);
+    if (!instanceVisibleRecord(record)) return false;
+    return occludedTriangle(localOrigin, localDirection, triangleRay(localDirection),
+                            triangle, instance, record.w, hardwareLimit,
+                            hardwareGeometryHeader);
+}
+
+Hit hardwareClosestHit(float3 origin, float3 direction, Hit hit, bool anyHit,
+                       float coneWidth, float coneSpread, uint4 geometryHeader) {
+    hardwareOrigin = origin;
+    hardwareDirection = direction;
+    hardwareConeWidth = coneWidth;
+    hardwareConeSpread = coneSpread;
+    hardwareGeometryHeader = geometryHeader;
+    hardwareHit = hit;
+    // The query always returns true. The guarded call keeps the callback in
+    // the emitted module, where only the WGSL loop calls it.
+    if (!hardwareQueryClosest(origin, direction, hit.distance, anyHit))
+        hardwareClosestCandidate(EMPTY, 0u);
+    return hardwareHit;
+}
+
+bool hardwareOccluded(float3 origin, float3 direction, float limit, uint4 geometryHeader) {
+    hardwareOrigin = origin;
+    hardwareDirection = direction;
+    hardwareLimit = limit;
+    hardwareGeometryHeader = geometryHeader;
+    uint blocked = hardwareQueryOccluded(origin, direction, limit);
+    // Never above one; the guarded call keeps the callback in the module.
+    if (blocked > 1u) hardwareOccludedCandidate(EMPTY, 0u);
+    return blocked != 0u;
+}
+#endif
 Hit traceRayTracked(float3 origin, float3 direction, float limit,
                     out DependencyContext dependency, out float dependencyStart,
                     out float dependencyDistance, out float dependencyPadding,
@@ -508,10 +680,9 @@ Hit traceRayTracked(float3 origin, float3 direction, float limit,
     uint effectiveAdmissionLimit = admissionLimit == 0u
         ? ordinaryTransportAdmissionLimit() : admissionLimit;
     if (!admitTransportQuery(effectiveAdmissionLimit)) { hit.errors |= HIT_QUERY_UNSUPPORTED; return hit; }
-    uint4 geometryHeader = geometryWord(0);
-    // The near-child walk keeps one deferred branch per depth while retaining
-    // the original stack capacity and overflow fallback threshold.
-    uint stack[49]; uint count = 0;
+    // The near-child walk retains each deferred box's entry distance so a
+    // closer hit can prune it without retesting the box.
+    uint2 stack[49]; uint count = 0;
     uint currentNode = 0;
     BvhNode node = sceneNode(currentNode);
     float rootEntry, rootExit;
@@ -519,9 +690,14 @@ Hit traceRayTracked(float3 origin, float3 direction, float limit,
                                           rootEntry, rootExit);
     dependency = dependencyEmpty();
     if (!intersectsRoot) return hit;
+    uint4 geometryHeader = geometryWord(0);
     dependencyStart = max(rootEntry, 0.0);
     dependencyDistance = min(limit, rootExit);
-    bool currentNodeReady = intersectBox(origin, direction, node, hit.distance);
+#ifdef PENUMBRA_HARDWARE_RAY_QUERY
+    hit = hardwareClosestHit(origin, direction, hit, anyHit, coneWidth, coneSpread,
+                             geometryHeader);
+#else
+    bool currentNodeReady = rootEntry >= 0.0;
     uint traversalSteps = 0u;
     [loop] while (currentNodeReady || count != 0) {
         if (++traversalSteps > MAX_TRAVERSAL_STEPS) {
@@ -529,9 +705,10 @@ Hit traceRayTracked(float3 origin, float3 direction, float limit,
             break;
         }
         if (!currentNodeReady) {
-            currentNode = stack[--count];
+            uint2 deferred = stack[--count];
+            if (asfloat(deferred.y) > hit.distance) continue;
+            currentNode = deferred.x;
             node = sceneNode(currentNode);
-            if (!intersectBox(origin, direction, node, hit.distance)) continue;
         }
         currentNodeReady = false;
         if (node.count == 0) {
@@ -548,11 +725,11 @@ Hit traceRayTracked(float3 origin, float3 direction, float limit,
                 float rightEntry = boxEntryDistance(origin, direction, rightNode, hit.distance);
                 if (leftEntry >= 0.0 && rightEntry >= 0.0) {
                     if (leftEntry <= rightEntry) {
-                        stack[count++] = rightIndex;
+                        stack[count++] = uint2(rightIndex, asuint(rightEntry));
                         currentNode = leftIndex;
                         node = leftNode;
                     } else {
-                        stack[count++] = leftIndex;
+                        stack[count++] = uint2(leftIndex, asuint(leftEntry));
                         currentNode = rightIndex;
                         node = rightNode;
                     }
@@ -569,17 +746,26 @@ Hit traceRayTracked(float3 origin, float3 direction, float limit,
                 continue;
             }
         }
+        uint requestedEnd = node.first + node.count;
+        bool truncated = requestedEnd < node.first || node.first > params.frame.z
+            || requestedEnd > params.frame.z || node.count > MAX_LEAF_INSTANCES;
         uint instanceBegin = min(node.first, params.frame.z);
-        uint instanceEnd = min(node.first + node.count, params.frame.z);
-        instanceEnd = min(instanceEnd, instanceBegin + MAX_LEAF_INSTANCES);
-        [loop] for (uint i = instanceBegin; i < instanceEnd; ++i) {
+        uint instanceEnd = min(requestedEnd, params.frame.z);
+        uint boundedEnd = min(instanceEnd, instanceBegin + MAX_LEAF_INSTANCES);
+        truncated = truncated || boundedEnd < instanceEnd;
+        if (truncated) hit.errors |= HIT_QUERY_UNSUPPORTED;
+        [loop] for (uint i = instanceBegin; i < boundedEnd; ++i) {
             hit = traceInstance(origin, direction, i, hit, anyHit, coneWidth, coneSpread, geometryHeader);
             if (anyHit && hit.triangle != EMPTY) {
+                // Any accepted hit is a complete proof for an any-hit query,
+                // regardless of earlier branches that could not be inspected.
+                hit.errors &= ~HIT_QUERY_UNSUPPORTED;
                 count = 0;
                 break;
             }
         }
     }
+#endif
     if (hit.triangle != EMPTY && (coneWidth > 0 || coneSpread > 0)) {
         uint base = instanceBase(hit.instance);
         uint flags = sceneWord(base + 6).w;
@@ -596,7 +782,6 @@ Hit traceRayTracked(float3 origin, float3 direction, float limit,
                              origin + direction * dependencyEnd, padding);
     return hit;
 }
-
 Hit traceRay(float3 origin, float3 direction, float limit, bool anyHit = false,
              float coneWidth = 0, float coneSpread = 0, uint admissionLimit = 0u) {
     DependencyContext unusedDependency;
@@ -606,37 +791,53 @@ Hit traceRay(float3 origin, float3 direction, float limit, bool anyHit = false,
                            coneWidth, coneSpread, admissionLimit);
 }
 
-bool occludedTriangle(float3 origin, float3 direction, uint triangleIndex, uint instance, uint flags,
-                      float limit, uint4 geometryHeader) {
+bool occludedTriangle(float3 origin, float3 direction, TriangleRay ray, uint triangleIndex,
+                      uint instance, uint flags, float limit, uint4 geometryHeader) {
     Triangle triangle = localTriangle(triangleIndex, geometryHeader);
-    float facing = dot(cross(triangle.b.xyz-triangle.a.xyz,triangle.c.xyz-triangle.a.xyz),direction)
-                   * ((flags & 4) != 0 ? -1 : 1);
-    if (((flags & 1) != 0 && facing >= 0) || ((flags & 2) != 0 && facing <= 0)) return false;
-    float3 intersection = intersectTriangle(origin,direction,triangle);
+    if ((flags & 3u) != 0) {
+        float facing = dot(cross(triangle.b.xyz-triangle.a.xyz,triangle.c.xyz-triangle.a.xyz),direction)
+                       * ((flags & 4) != 0 ? -1 : 1);
+        if (((flags & 1) != 0 && facing >= 0) || ((flags & 2) != 0 && facing <= 0)) return false;
+    }
+    float3 intersection = intersectTriangle(origin,direction,ray,triangle);
     if (!(intersection.x > 0.000025 && intersection.x < limit)) return false;
     Hit candidate; candidate.distance = intersection.x; candidate.triangle = triangleIndex;
     candidate.instance = instance; candidate.errors = 0;
     candidate.barycentric = float3(1-intersection.y-intersection.z,intersection.yz);
     candidate.footprint = 0;
     float cutoff = materialAlphaCutoff(candidate);
-    if (cutoff < 0) return true;
+    if (cutoff == -1.0) return true;
     return materialAccepts(candidate,cutoff);
 }
 
-bool occludedInstance(float3 origin, float3 direction, uint instance, float limit, uint4 geometryHeader) {
+bool occludedInstance(float3 origin, float3 direction, uint instance, float limit,
+                      uint4 geometryHeader, out bool querySupported) {
+    querySupported = true;
     uint base = instanceBase(instance);
     uint4 instanceRecord = sceneWord(base+6);
     if (!instanceVisibleRecord(instanceRecord)) return false;
-    float3 localOrigin = transformPoint(base,origin);
-    float3 localDirection = transformPoint(base,direction,true);
+    float4 row0 = asfloat(sceneWord(base));
+    float4 row1 = asfloat(sceneWord(base + 1));
+    float4 row2 = asfloat(sceneWord(base + 2));
+    float4 point = float4(origin, 1);
+    float4 vector = float4(direction, 0);
+    float3 localOrigin = float3(dot(row0, point), dot(row1, point), dot(row2, point));
+    float3 localDirection = float3(dot(row0, vector), dot(row1, vector), dot(row2, vector));
     uint flags = instanceRecord.w;
     uint stack[49]; uint count = 0;
-    uint currentNode = sceneWord(base+8).x;
+    uint4 geometry = sceneWord(base+8);
+    uint currentNode = geometry.x;
     BvhNode node = sceneNode(currentNode);
     bool currentNodeReady = intersectBox(localOrigin,localDirection,node,limit);
+    TriangleRay ray = (TriangleRay)0;
+    if (currentNodeReady) ray = triangleRay(localDirection);
     uint traversalSteps = 0u;
+    bool incomplete = false;
     [loop] while (currentNodeReady || count != 0) {
-        if (++traversalSteps > MAX_TRAVERSAL_STEPS) return true;
+        if (++traversalSteps > MAX_TRAVERSAL_STEPS) {
+            querySupported = false;
+            return false;
+        }
         if (!currentNodeReady) {
             currentNode = stack[--count];
             node = sceneNode(currentNode);
@@ -645,7 +846,6 @@ bool occludedInstance(float3 origin, float3 direction, uint instance, float limi
         currentNodeReady = false;
         if (node.count == 0) {
             if (count + 2 > 49) {
-                uint4 geometry = sceneWord(base+8);
                 node.first = geometry.y; node.count = geometry.z;
                 count = 0;
             } else {
@@ -678,15 +878,24 @@ bool occludedInstance(float3 origin, float3 direction, uint instance, float limi
                 continue;
             }
         }
-        // Share the material-tested scan with stack overflow to keep driver
-        // compilation bounded. Clamp its range like the primary traversal.
-        uint4 leafGeometry = sceneWord(base+8);
-        uint triangleBegin = max(node.first, leafGeometry.y);
-        uint triangleEnd = min(node.first+node.count, leafGeometry.y+leafGeometry.z);
-        triangleEnd = min(triangleEnd, triangleBegin + MAX_LEAF_TRIANGLES);
-        [loop] for (uint i = triangleBegin; i < triangleEnd; ++i)
-            if (occludedTriangle(localOrigin,localDirection,i,instance,flags,limit,geometryHeader)) return true;
+        // Scan only the proven primitive range and preserve incompleteness if
+        // an oversized or malformed range was clipped. A real accepted hit is
+        // still a complete proof that this shadow ray is blocked.
+        uint triangleBegin = max(node.first, geometry.y);
+        uint triangleLimit = geometry.y + geometry.z;
+        uint requestedEnd = node.first + node.count;
+        uint triangleEnd = min(requestedEnd, triangleLimit);
+        bool truncated = node.first < geometry.y || requestedEnd < node.first
+            || requestedEnd > triangleLimit || node.count > MAX_LEAF_TRIANGLES;
+        uint boundedEnd = min(triangleEnd, triangleBegin + MAX_LEAF_TRIANGLES);
+        truncated = truncated || boundedEnd < triangleEnd;
+        incomplete = incomplete || truncated;
+        [loop] for (uint i = triangleBegin; i < boundedEnd; ++i) {
+            if (occludedTriangle(localOrigin,localDirection,ray,i,instance,flags,limit,geometryHeader))
+                return true;
+        }
     }
+    querySupported = !incomplete;
     return false;
 }
 
@@ -705,18 +914,40 @@ bool traceOccluded(float3 origin, float3 direction, float limit, out bool queryS
 
 bool traceOccluded(float3 origin, float3 direction, float limit,
                     out bool querySupported, uint admissionLimit) {
+    bool intersectsRoot;
+    float rootEntry, rootExit;
+    return traceOccluded(origin, direction, limit, querySupported, admissionLimit,
+                         intersectsRoot, rootEntry, rootExit);
+}
+
+bool traceOccluded(float3 origin, float3 direction, float limit,
+                    out bool querySupported, uint admissionLimit,
+                    out bool intersectsRoot, out float rootEntry, out float rootExit) {
+    intersectsRoot = false;
+    rootEntry = 0.0;
+    rootExit = 0.0;
     querySupported = true;
     if (params.frame.z == 0) return false;
     if (admissionLimit == 0u) admissionLimit = ordinaryTransportAdmissionLimit();
     if (!admitTransportQuery(admissionLimit)) { querySupported = false; return false; }
-    uint4 geometryHeader = geometryWord(0);
     uint stack[49]; uint count = 0;
     uint currentNode = 0;
     BvhNode node = sceneNode(currentNode);
-    bool currentNodeReady = intersectBox(origin,direction,node,limit);
+    intersectsRoot = boxRayInterval(origin, direction, node, limit, rootEntry, rootExit);
+    bool currentNodeReady = intersectsRoot && rootEntry >= 0.0;
+    if (!currentNodeReady) return false;
+    uint4 geometryHeader = geometryWord(0);
+#ifdef PENUMBRA_HARDWARE_RAY_QUERY
+    // Hardware traversal is never truncated, so every admitted query is complete.
+    return hardwareOccluded(origin, direction, limit, geometryHeader);
+#else
     uint traversalSteps = 0u;
+    bool incomplete = false;
     [loop] while (currentNodeReady || count != 0) {
-        if (++traversalSteps > MAX_TRAVERSAL_STEPS) return true;
+        if (++traversalSteps > MAX_TRAVERSAL_STEPS) {
+            querySupported = false;
+            return false;
+        }
         if (!currentNodeReady) {
             currentNode = stack[--count];
             node = sceneNode(currentNode);
@@ -757,27 +988,49 @@ bool traceOccluded(float3 origin, float3 direction, float limit,
                 continue;
             }
         }
-        uint occlusionBegin = min(node.first, params.frame.z);
-        uint occlusionEnd = min(node.first+node.count, params.frame.z);
-        occlusionEnd = min(occlusionEnd, occlusionBegin + MAX_LEAF_INSTANCES);
-        [loop] for (uint instance = occlusionBegin; instance < occlusionEnd; ++instance)
-            if (occludedInstance(origin,direction,instance,limit,geometryHeader)) return true;
+        uint requestedEnd = node.first + node.count;
+        bool truncated = requestedEnd < node.first || node.first > params.frame.z
+            || requestedEnd > params.frame.z || node.count > MAX_LEAF_INSTANCES;
+        uint instanceBegin = min(node.first, params.frame.z);
+        uint instanceEnd = min(requestedEnd, params.frame.z);
+        uint boundedEnd = min(instanceEnd, instanceBegin + MAX_LEAF_INSTANCES);
+        incomplete = incomplete || truncated || boundedEnd < instanceEnd;
+        [loop] for (uint instance = instanceBegin; instance < boundedEnd; ++instance) {
+            bool instanceSupported;
+            bool blocked = occludedInstance(origin,direction,instance,limit,
+                                             geometryHeader,instanceSupported);
+            incomplete = incomplete || !instanceSupported;
+            if (blocked) {
+                // Any accepted blocker proves the result even if another branch
+                // could not be fully inspected.
+                querySupported = true;
+                return true;
+            }
+        }
     }
+    querySupported = !incomplete;
     return false;
+#endif
 }
 
 bool traceOccludedTracked(float3 origin, float3 direction, float limit,
                           out bool querySupported, out DependencyContext dependency,
                           uint admissionLimit = 0u) {
-    bool blocked = traceOccluded(origin, direction, limit, querySupported, admissionLimit);
+    bool intersectsRoot;
+    float entry, exit;
+    bool blocked = traceOccluded(origin, direction, limit, querySupported, admissionLimit,
+                                 intersectsRoot, entry, exit);
     dependency = dependencyUnknown();
     if (!querySupported) return blocked;
     dependency = dependencyEmpty();
-    if (params.frame.z == 0) return blocked;
-    float entry, exit;
-    if (!boxRayInterval(origin, direction, sceneNode(0), limit, entry, exit)) return blocked;
+    if (!intersectsRoot) return blocked;
     dependencyIncludeSegment(dependency, origin + direction * max(entry, 0.0),
                              origin + direction * exit, 0.0);
     return blocked;
 }
 
+[ForceInline]
+void dependencyIncludeVisibilityTarget(inout DependencyContext dependency,
+                                       float3 target) {
+    dependencyIncludeSegment(dependency, target, target, 0.0);
+}

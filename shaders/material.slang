@@ -28,36 +28,44 @@ float textureUv(float uv, uint mode) {
     if (mode == 2) { float value = frac(uv * 0.5) * 2; return value <= 1 ? value : 2 - value; }
     return saturate(uv);
 }
-float4 textureTexel(uint4 mip, int2 texel, uint flags) {
+float4 textureTexel(uint4 mip, int2 texel, uint flags, uint base, uint tileSide, uint pages) {
     // A zero-sized mip record means this slot has no usable texture data. Index
     // arithmetic on it would overflow into an out-of-range scene/material read,
     // which can fault the GPU instead of returning a texel.
     if (mip.x == 0 || mip.y == 0) return 1;
     int2 wrapped = int2(textureIndex(texel.x, int(mip.x), flags & 3),
                         textureIndex(texel.y, int(mip.y), (flags >> 2) & 3));
-    uint width, height, pages; materialAtlas.GetDimensions(width, height, pages);
-    if (width <= 2 || pages == 0) return 1;
-    uint tileSide = width - 2;
+    if (tileSide == 0 || pages == 0) return 1;
     uint2 tile = uint2(wrapped) / tileSide;
-    uint4 rectangle = sceneWord(sceneWord(0).x + mip.w + tile.y * mip.z + tile.x);
+    uint4 rectangle = sceneWord(base + mip.w + tile.y * mip.z + tile.x);
     if (rectangle.z >= pages) return 1;
     uint2 pixel = rectangle.xy + 1 + uint2(wrapped) % tileSide;
     return materialAtlas.Load(int4(int2(pixel), int(rectangle.z), 0));
 }
-float4 textureMip(uint texture, uint level, float2 uv, bool linear) {
-    uint base = sceneWord(0).x;
-    uint4 record = sceneWord(base + texture);
-    if (record.y == 0) return 1;
+float4 textureMip(uint base, uint4 record, uint level, float2 uv, bool linear,
+                  uint tileSide, uint pages) {
     level = min(level, record.y - 1);
     uint4 mip = sceneWord(base + record.x + level);
     uv = float2(textureUv(uv.x, record.z & 3), textureUv(uv.y, (record.z >> 2) & 3));
     float2 position = uv * float2(mip.xy);
-    if (!linear) return textureTexel(mip, int2(floor(position)), record.z);
+    if (!linear) return textureTexel(mip, int2(floor(position)), record.z, base, tileSide, pages);
     position -= 0.5;
     int2 low = int2(floor(position));
     float2 weight = frac(position);
-    return lerp(lerp(textureTexel(mip, low, record.z), textureTexel(mip, low + int2(1, 0), record.z), weight.x),
-                lerp(textureTexel(mip, low + int2(0, 1), record.z), textureTexel(mip, low + 1, record.z), weight.x), weight.y);
+    // Each packed tile carries source-correct one-texel gutters, including
+    // wrapped edges and corners. Anchor inside the image, then fetch all four
+    // taps from that tile rather than resolving four independent rectangles.
+    if (mip.x == 0 || mip.y == 0 || tileSide == 0 || pages == 0) return 1;
+    int2 anchor = clamp(low, int2(0, 0), int2(mip.xy) - 1);
+    uint2 tile = uint2(anchor) / tileSide;
+    uint4 rectangle = sceneWord(base + mip.w + tile.y * mip.z + tile.x);
+    if (rectangle.z >= pages) return 1;
+    int2 pixel = int2(rectangle.xy) + 1 + int2(uint2(anchor) % tileSide) + low - anchor;
+    int page = int(rectangle.z);
+    return lerp(lerp(materialAtlas.Load(int4(pixel, page, 0)),
+                     materialAtlas.Load(int4(pixel + int2(1, 0), page, 0)), weight.x),
+                lerp(materialAtlas.Load(int4(pixel + int2(0, 1), page, 0)),
+                     materialAtlas.Load(int4(pixel + 1, page, 0)), weight.x), weight.y);
 }
 float4 sampleTexture(uint texture, float2 uv, float lod = 0) {
     if (texture == EMPTY) return 1;
@@ -68,27 +76,44 @@ float4 sampleTexture(uint texture, float2 uv, float lod = 0) {
     // convert to an out-of-range unsigned index below. Fall back to the
     // neutral texel both cases would otherwise invent an address for.
     if (record.y == 0) return 1;
+    uint width, height, pages;
+    materialAtlas.GetDimensions(width, height, pages);
+    uint tileSide = width > 2 ? width - 2 : 0;
     if (!isfinite(lod)) lod = 0;
     float maximum = min(asfloat(size.w), float(record.y - 1));
     lod = clamp(lod, min(asfloat(size.z), maximum), maximum);
     if (!(lod >= 0.0)) lod = 0;
     bool linear = (record.z & (lod > 0 ? 32 : 16)) != 0;
-    if ((record.z & 64) == 0) return textureMip(texture, uint(floor(lod + 0.5)), uv, linear);
+    if ((record.z & 64) == 0)
+        return textureMip(base, record, uint(floor(lod + 0.5)), uv, linear, tileSide, pages);
     uint low = uint(floor(lod)), high = min(low + 1, record.y - 1);
-    return lerp(textureMip(texture, low, uv, linear), textureMip(texture, high, uv, linear), frac(lod));
+    float4 lowSample = textureMip(base, record, low, uv, linear, tileSide, pages);
+    // Keep the lerp even when both levels coincide, preserving its floating
+    // point behavior while avoiding a duplicate mip/atlas lookup.
+    float4 highSample = high == low ? lowSample
+        : textureMip(base, record, high, uv, linear, tileSide, pages);
+    return lerp(lowSample, highSample, frac(lod));
 }
-float textureLod(Hit hit, uint slot) {
-    uint texture = materialTexture(hit, slot);
-    if (texture == EMPTY || hit.footprint <= 0) return 0;
-    uint3 vertices = triangleIndices(hit.triangle);
+float textureLod(Hit hit, uint slot, uint texture) {
+    if (hit.footprint <= 0) return 0;
+    uint4 geometryHeader = geometryWord(0);
+    uint3 vertices = triangleIndices(hit.triangle, geometryHeader);
     uint base = materialBase(hit);
     uint channel = (sceneWord(base + 7).y >> slot) & 1;
+    float3 uvRow0 = asfloat(sceneWord(base + 4).xyz);
+    float3 uvRow1 = asfloat(sceneWord(base + 5).xyz);
+    uint instance = instanceBase(hit.instance) + 3;
+    float4 row0 = asfloat(sceneWord(instance));
+    float4 row1 = asfloat(sceneWord(instance + 1));
+    float4 row2 = asfloat(sceneWord(instance + 2));
     float2 uv[3]; float3 positions[3];
     for (uint i = 0; i < 3; ++i) {
-        uint vertex = vertexBase(vertices[i]);
+        uint vertex = vertexBase(vertices[i], geometryHeader);
         float4 coordinates = asfloat(geometryWord(vertex + 3));
-        uv[i] = transformUv(base, channel != 0 ? coordinates.zw : coordinates.xy);
-        positions[i] = transformPoint(instanceBase(hit.instance) + 3, asfloat(geometryWord(vertex).xyz));
+        float3 uvValue = float3(channel != 0 ? coordinates.zw : coordinates.xy, 1);
+        uv[i] = float2(dot(uvRow0, uvValue), dot(uvRow1, uvValue));
+        float4 position = float4(asfloat(geometryWord(vertex).xyz), 1);
+        positions[i] = float3(dot(row0, position), dot(row1, position), dot(row2, position));
     }
     float3 a = positions[1] - positions[0], b = positions[2] - positions[0];
     float3 crossEdges = cross(a, b);
@@ -106,7 +131,9 @@ float4 materialSample(Hit hit, uint slot) {
 #ifdef GI_WARMUP
     return 1;
 #else
-    return sampleTexture(materialTexture(hit, slot), materialUv(hit, slot), textureLod(hit, slot));
+    uint texture = materialTexture(hit, slot);
+    if (texture == EMPTY) return 1;
+    return sampleTexture(texture, materialUv(hit, slot), textureLod(hit, slot, texture));
 #endif
 }
 float4 materialBaseColor(Hit hit) {
@@ -120,11 +147,26 @@ float materialPerceptualRoughness(Hit hit) {
 float materialAlphaCutoff(Hit hit) {
     return asfloat(sceneWord(materialBase(hit) + 1).w);
 }
-bool materialAccepts(Hit hit, float cutoff) {
-    if (cutoff < 0) return true;
+// Opaque uses -1, while -2 denotes fractional alpha coverage. Other values
+// are Bevy's binary mask cutoff.
+float materialCoverage(Hit hit, float cutoff) {
+    if (cutoff == -1.0) return 1.0;
     uint base = materialBase(hit);
-    float alpha = asfloat(sceneWord(base)).w * hitVertexAttribute(hit, 4).w;
-    return alpha * materialSample(hit, 0).w >= cutoff;
+    float alpha = asfloat(sceneWord(base)).w * hitVertexAttribute(hit, 4).w
+        * materialSample(hit, 0).w;
+    if (cutoff == -2.0) return isfinite(alpha) ? saturate(alpha) : 0.0;
+    return alpha >= cutoff ? 1.0 : 0.0;
+}
+bool materialAccepts(Hit hit, float cutoff) {
+    float coverage = materialCoverage(hit, cutoff);
+    if (coverage <= 0.0) return false;
+    if (coverage >= 1.0) return true;
+    // A per-intersection, per-frame Bernoulli sample estimates fractional
+    // coverage without forcing an alpha threshold on blended materials.
+    int4 key = int4(asint(hit.barycentric.y), asint(hit.barycentric.z),
+        int(hit.triangle), int(hit.instance ^ (params.frame.x * 0x9e3779b9u)));
+    float sample = float(hashKey(key, 0x1000000u)) * (1.0 / 16777216.0);
+    return sample < coverage;
 }
 float3 materialNormal(Hit hit, HitAttributes attributes, float3 incoming) {
     uint base = materialBase(hit);

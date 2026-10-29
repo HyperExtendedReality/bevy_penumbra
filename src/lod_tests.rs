@@ -50,11 +50,7 @@ void checkLod(uint3 thread : SV_DispatchThreadID) {{
 }}
 "#,
         lod = section(split, "void splitLodBlend(", "uint transportCacheBucket("),
-        interval = section(
-            split,
-            "float splitIntervalEnd(",
-            "uint probeDirectoryCapacity("
-        ),
+        interval = section(split, "float splitIntervalEnd(", "uint probeCountHead("),
     );
     let shader = SlangCompiler::default()
         .compile_bundle(

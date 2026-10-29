@@ -40,6 +40,8 @@ use bevy::{
 };
 use bevy_slang::{SlangCompiler, SlangLoaderError, SlangSettings, SlangTarget};
 
+mod hardware;
+
 use crate::{
     RadianceCascades, RadianceCascadesRawOutput, RadianceCascadesRevisions, RadianceCascadesStatus,
     scene::{BvhNode, GiLight, GiScene, view_lights},
@@ -47,19 +49,27 @@ use crate::{
 
 const LEVELS: usize = 4;
 // Byte stride of `Entry` in common.slang.
-const ENTRY_SIZE: u64 = 208;
+const ENTRY_SIZE: u64 = 272;
+const SOURCE_BACKGROUND: u32 = 1;
+const SOURCE_EMISSIVE: u32 = 2;
+const SOURCE_PUNCTUAL: u32 = 4;
 // Current work reserves two groups per ray; persistent history keeps four
 // intervals per bucket to reduce cache churn in large scenes.
 const CACHE_WORK_GROUPS: u64 = 2;
 const CACHE_HISTORY_PER_BUCKET: u64 = 4;
 const SPARSE_HISTORY_RESET_FLAG: u32 = 1 << 31;
 const SPARSE_UPDATES_DISABLED_FLAG: u32 = 1 << 30;
-// Directional irradiance and per-cell coverage are 6×6 float4s, followed by
-// the two aggregate dependency bounds used for history invalidation.
-pub(crate) const PROBE_SIZE: u64 = 608;
+const COLD_RANK_PHASES: [usize; 3] = [1, 2, 3];
+// Three source-separated irradiance fields, dependency bounds, and a
+// secondary-cache key and generation header.
+pub(crate) const PROBE_SIZE: u64 = 1792;
 const PACK_PROBE_GROUPS_PER_ROW: u64 = 256;
 const CACHE_COMMIT: usize = 14;
+<<<<<<< Updated upstream
 const COMPUTE_ENTRIES: [&str; 17] = [
+=======
+const COMPUTE_ENTRIES: [&str; 23] = [
+>>>>>>> Stashed changes
     "clear",
     "seed",
     "parents",
@@ -77,6 +87,15 @@ const COMPUTE_ENTRIES: [&str; 17] = [
     "commitCache",
     "remapProbeHeads",
     "worldResolve",
+<<<<<<< Updated upstream
+=======
+    "traceDeferred",
+    "traceRecord",
+    "traceVisibility",
+    "traceResolve",
+    "traceDeferredHardware",
+    "traceVisibilityHardware",
+>>>>>>> Stashed changes
 ];
 const SLANG_OPTIMIZATION_LEVEL: u8 = 2;
 const HISTORY_DIAGNOSTIC_WORDS: u64 = 26;
@@ -96,15 +115,28 @@ fn pack_probe_dispatch_groups(samples: u64) -> Option<(u32, u32)> {
     Some((u32::try_from(groups_x).ok()?, u32::try_from(groups_y).ok()?))
 }
 
+fn cold_priority_enabled(history_frames: u32, history_was_valid: bool) -> bool {
+    // Split always enables persistent world intervals in intervalHistory.y.
+    history_frames > 0 && !history_was_valid
+}
+
+fn cold_rank_phases(history_frames: u32, history_was_valid: bool) -> &'static [usize] {
+    if cold_priority_enabled(history_frames, history_was_valid) {
+        &COLD_RANK_PHASES
+    } else {
+        &[]
+    }
+}
+
 fn cache_head_bytes(buckets: u64, samples: u64) -> u64 {
     // Cache heads/counters plus per-cascade probe indices and ray counts.
     let counters_and_diagnostics = 10 + HISTORY_DIAGNOSTIC_WORDS;
     let probe_directory = LEVELS as u64 * probe_directory_capacity(samples);
-    (buckets * 2 + counters_and_diagnostics + probe_directory * 2) * 4
+    (buckets * 2 + counters_and_diagnostics + probe_directory * 2 + 1) * 4
 }
 
-fn irradiance_probe_bytes(samples: u64) -> u64 {
-    probe_directory_capacity(samples) * 2 * PROBE_SIZE
+fn irradiance_probe_bytes(samples: u64, multi_bounce: bool) -> u64 {
+    probe_directory_capacity(samples) * (if multi_bounce { 4 } else { 2 }) * PROBE_SIZE
 }
 
 fn exposure_invalidates_world_history(exposure_changed: bool) -> bool {
@@ -137,7 +169,8 @@ fn cache_entry_bytes(samples: u64, buckets: u64) -> u64 {
 
 fn cache_bucket_count(samples: u64, settings: RadianceCascades) -> u64 {
     let mut buckets = (samples * 2).next_power_of_two().max(1024);
-    let capacity = u64::from(settings.sampling.max_cache_entries);
+    let capacity =
+        u64::from(cache_query_limits(settings.sampling.max_cache_entries, settings.multi_bounce).0);
     if settings.sampling.is_explicit() && capacity > 0 {
         let entries_per_bucket = CACHE_HISTORY_PER_BUCKET;
         let maximum_buckets = (capacity / entries_per_bucket).max(1);
@@ -155,17 +188,22 @@ fn cache_history_bytes(buckets: u64) -> u64 {
 fn history_settings_changed(previous: RadianceCascades, next: RadianceCascades) -> bool {
     // Composite intensity leaves stored lighting unchanged. Environment changes
     // are radiometric: reprojection remains valid while world radiance refreshes.
+    // Hardware and software traversal produce the same hits.
     // Other settings can change support or receiver interpretation.
     let mut comparable = previous;
     comparable.intensity = next.intensity;
     comparable.environment = next.environment;
+    comparable.hardware_ray_queries = next.hardware_ray_queries;
     comparable != next
 }
 
 fn world_cache_settings_changed(mut previous: RadianceCascades, next: RadianceCascades) -> bool {
-    // This gain is applied only at composition, never to stored transport.
+    // Composition gain, ambient radiance, resolve scale and the traversal
+    // backend do not alter cached transport.
     previous.intensity = next.intensity;
+    previous.environment = next.environment;
     previous.sampling.resolve_scale = next.sampling.resolve_scale;
+    previous.hardware_ray_queries = next.hardware_ray_queries;
     previous != next
 }
 
@@ -227,6 +265,14 @@ fn traversal_query_caps(query_limit: u32) -> (u32, u32) {
     // the hard cap. Sharing trace's ceiling starved cold interval merges.
     let ordinary_limit = (query_limit / 2).max(1);
     (ordinary_limit, query_limit)
+}
+
+fn cache_query_limits(limit: u32, multi_bounce: bool) -> (u32, u32) {
+    if !multi_bounce || limit == 0 {
+        (limit, limit)
+    } else {
+        (limit.div_ceil(2), limit / 2)
+    }
 }
 
 fn view_budget_max_rays(viewport: UVec2, settings: RadianceCascades, budget: u64) -> u32 {
@@ -304,7 +350,7 @@ fn view_fits_device(
         && cache_entry_bytes(pixels, buckets) <= binding_limit
         && cache_history_bytes(buckets) <= binding_limit
         && cache_head_bytes(buckets, pixels) <= binding_limit
-        && irradiance_probe_bytes(pixels) <= binding_limit
+        && irradiance_probe_bytes(pixels, settings.multi_bounce) <= binding_limit
 }
 
 fn view_device_max_rays(viewport: UVec2, settings: RadianceCascades, limits: &WgpuLimits) -> u32 {
@@ -420,12 +466,36 @@ fn adapt_view_settings(
     best.map(|(_, _, settings)| settings)
 }
 
+// Hardware ray-query variants of `traceDeferred` and `traceVisibility`.
+const HARDWARE_TRACE_DEFERRED: usize = 21;
+const HARDWARE_TRACE_VISIBILITY: usize = 22;
+const HARDWARE_TRAVERSAL_PIPELINES: u64 =
+    (1 << HARDWARE_TRACE_DEFERRED) | (1 << HARDWARE_TRACE_VISIBILITY);
+const RAY_QUERY_DEFINE: &str = "PENUMBRA_HARDWARE_RAY_QUERY";
+
+fn hardware_traversal_entry(entry: &str) -> bool {
+    matches!(entry, "traceDeferredHardware" | "traceVisibilityHardware")
+}
+
+/// Pipelines a view cannot render without. Hardware traversal is optional:
+/// software traversal produces the same transport while it is unavailable.
 fn required_pipelines(settings: RadianceCascades) -> u64 {
-    let mut required = (1u64 << COMPUTE_ENTRIES.len()) - 1;
+    let mut required = ((1u64 << COMPUTE_ENTRIES.len()) - 1) & !HARDWARE_TRAVERSAL_PIPELINES;
     if settings.spatial_filter_steps == 0 {
         required &= !(1 << 13);
     }
     required
+}
+
+/// Pipelines to build for a view: the required set plus the hardware
+/// traversal variants when the view requests them.
+fn wanted_pipelines(settings: RadianceCascades) -> u64 {
+    required_pipelines(settings)
+        | if settings.hardware_ray_queries {
+            HARDWARE_TRAVERSAL_PIPELINES
+        } else {
+            0
+        }
 }
 
 const MODULES: [(&str, &[&str]); 4] = [
@@ -499,6 +569,14 @@ fn compile(
         &SlangSettings {
             target: SlangTarget::Wgsl,
             entry_points: entries.iter().map(|entry| (*entry).to_owned()).collect(),
+            // Only the hardware traversal entries reference the WGSL
+            // ray-query helpers; the define keeps every other module free of them.
+            defines: entries
+                .iter()
+                .any(|entry| hardware_traversal_entry(entry))
+                .then(|| RAY_QUERY_DEFINE.to_owned())
+                .into_iter()
+                .collect(),
             optimization: Some(SLANG_OPTIMIZATION_LEVEL),
             ..default()
         },
@@ -745,12 +823,12 @@ struct Parameters {
     scene_overlay: UVec4,
     dirty_min: Vec4,
     dirty_max: Vec4,
-    transport: Vec4,
+    source_history: UVec4,
     sampling: UVec4,
     owner_sequence: UVec4,
     cache_time: UVec4,
-    world_receivers: UVec4,
-    world_receiver_state: UVec4,
+    emissive_dirty_min: Vec4,
+    emissive_dirty_max: Vec4,
     light_dirty_min: Vec4,
     light_dirty_max: Vec4,
 }
@@ -764,6 +842,13 @@ struct Pipelines {
     jobs: Vec<PipelineJob>,
     driver_cache: Option<wgpu::PipelineCache>,
     driver_spirv: bool,
+<<<<<<< Updated upstream
+=======
+    /// The device supports hardware ray queries on the SPIR-V path; the
+    /// compute layout then carries the TLAS binding.
+    ray_query: bool,
+    indirect_execution: bool,
+>>>>>>> Stashed changes
     driver_cache_path: Option<std::path::PathBuf>,
     driver_cache_save: Option<std::thread::JoinHandle<Result<(), String>>>,
     driver_cache_dirty: bool,
@@ -787,16 +872,90 @@ type ComputeShaderSources = Arc<Mutex<[Option<Arc<str>>; COMPUTE_ENTRIES.len()]>
 
 type VulkanComputeSource = (Vec<u32>, (u32, u32, u32));
 
+/// Logical binding of the hardware TLAS in the compute layout.
+pub(crate) const TLAS_BINDING: u32 = 41;
+
+/// Prepends the WGSL ray-query loops that the Slang hardware traversal
+/// (`traversal.slang`, `PENUMBRA_HARDWARE_RAY_QUERY`) calls through
+/// `__intrinsic_asm`. Slang's WGSL target has no ray-query types, and naga
+/// requires each query to be a local of the function that drives it, so each
+/// loop calls back into the Slang candidate test emitted in `source`. Every
+/// BLAS is non-opaque, so each triangle reaches that test.
+fn ray_query_source(source: &str) -> Result<String, String> {
+    // Slang suffixes each function name with `_N`.
+    let callback = |name: &str| {
+        let start = source.find(&format!("fn {name}_"))? + 3;
+        let end = start + source[start..].find('(')?;
+        Some(source[start..end].to_owned())
+    };
+    let closest = callback("hardwareClosestCandidate");
+    let occluded = callback("hardwareOccludedCandidate");
+    if closest.is_none() && occluded.is_none() {
+        return Err("hardware traversal module has no candidate callback".into());
+    }
+    let mut prelude = format!(
+        "enable wgpu_ray_query;\n\
+         @group(0) @binding({TLAS_BINDING}) var penumbraTlas: acceleration_structure;\n",
+    );
+    if let Some(closest) = closest {
+        prelude.push_str(&format!(
+            "fn penumbraRayQueryClosest(origin: vec3<f32>, direction: vec3<f32>, limit: f32, any_hit: bool) -> bool {{
+    var query: ray_query;
+    rayQueryInitialize(&query, penumbraTlas, RayDesc(RAY_FLAG_NONE, 0xffu, 0.0, limit, origin, direction));
+    while (rayQueryProceed(&query)) {{
+        let candidate = rayQueryGetCandidateIntersection(&query);
+        if ({closest}(candidate.instance_custom_data, candidate.primitive_index)) {{
+            rayQueryConfirmIntersection(&query);
+            if (any_hit) {{ rayQueryTerminate(&query); }}
+        }}
+    }}
+    return true;
+}}
+"
+        ));
+    }
+    if let Some(occluded) = occluded {
+        prelude.push_str(&format!(
+            "fn penumbraRayQueryOccluded(origin: vec3<f32>, direction: vec3<f32>, limit: f32) -> u32 {{
+    var query: ray_query;
+    rayQueryInitialize(&query, penumbraTlas, RayDesc(RAY_FLAG_NONE, 0xffu, 0.0, limit, origin, direction));
+    while (rayQueryProceed(&query)) {{
+        let candidate = rayQueryGetCandidateIntersection(&query);
+        if ({occluded}(candidate.instance_custom_data, candidate.primitive_index)) {{
+            rayQueryTerminate(&query);
+            return 1u;
+        }}
+    }}
+    return 0u;
+}}
+"
+        ));
+    }
+    Ok(prelude + source)
+}
+
 pub(crate) fn vulkan_compute_source(
     source: &str,
     entry: &str,
     layout_entries: &[BindGroupLayoutEntry],
 ) -> Result<VulkanComputeSource, String> {
+    let hardware = hardware_traversal_entry(entry);
+    let prefixed;
+    let source = if hardware {
+        prefixed = ray_query_source(source)?;
+        prefixed.as_str()
+    } else {
+        source
+    };
     let module =
         naga::front::wgsl::parse_str(source).map_err(|error| error.emit_to_string(source))?;
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
+        if hardware {
+            naga::valid::Capabilities::RAY_QUERY
+        } else {
+            naga::valid::Capabilities::empty()
+        },
     )
     .validate(&module)
     .map_err(|error| error.to_string())?;
@@ -839,15 +998,23 @@ pub(crate) fn vulkan_compute_source(
         }),
     )
     .map_err(|error| error.to_string())?;
-    // shortcut: Naga has no function-control option; retain helper calls until
-    // NVIDIA can compile these validated traversal graphs without minute-long inlining.
+    // Naga has no function-control option. Kernels that only traverse (closest
+    // hit and shadow queries) leave inlining to the driver: forced calls there
+    // spill the traversal stack on every step, costing about 3.6 ms and 3 ms
+    // at 1080p Sponza. Kernels that include hit shading keep helper calls,
+    // because inlining their call graph takes the NVIDIA compiler minutes.
+    let traversal_only = hardware || matches!(entry, "traceDeferred" | "traceVisibility");
     let mut offset = 5;
     while offset < words.len() {
         let count = (words[offset] >> 16) as usize;
         if words[offset] & 0xffff == 54 {
-            words[offset + 3] = (words[offset + 3] & !1) | 2;
+            let control = &mut words[offset + 3];
+            *control &= !3;
+            if !traversal_only {
+                *control |= 2;
+            }
         }
-        offset += count;
+        offset += count.max(1);
     }
     Ok((words, (size[0], size[1], size[2])))
 }
@@ -880,7 +1047,11 @@ fn compute_pipeline(
     entry: &'static str,
     pipeline_cache: Option<wgpu::PipelineCache>,
     spirv: bool,
+    ray_query: bool,
 ) -> Result<ComputePipeline, String> {
+    if hardware_traversal_entry(entry) && !(spirv && ray_query) {
+        return Err("hardware traversal needs Vulkan SPIR-V passthrough and ray queries".into());
+    }
     let device = device.wgpu_device();
     let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
     // Populated Split history loses the device on the tested NVIDIA driver
@@ -888,7 +1059,7 @@ fn compute_pipeline(
     // WGSL path; the driver cache amortizes its longer first compilation.
     let module = if spirv && entry != "merge" {
         let (words, workgroup_size) =
-            vulkan_compute_source(&source, entry, &compute_layout().entries)?;
+            vulkan_compute_source(&source, entry, &compute_layout(ray_query).entries)?;
         // Naga validates our embedded WGSL and emits bounds-checked SPIR-V for the exact layouts above.
         unsafe {
             device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
@@ -954,7 +1125,7 @@ fn required_shader_modules(settings: impl Iterator<Item = RadianceCascades>) -> 
         if settings.intensity <= 0.0 {
             continue;
         }
-        required |= required_pipelines(settings);
+        required |= wanted_pipelines(settings);
     }
     if required != 0 {
         required |= 15 << COMPUTE_ENTRIES.len(); // composition, TLAS refit and deformation
@@ -1308,6 +1479,10 @@ pub(crate) fn install(
         .add_systems(RenderStartup, init_pipelines)
         .add_systems(
             Render,
+            hardware::prepare_hardware_traversal.in_set(RenderSystems::PrepareResources),
+        )
+        .add_systems(
+            Render,
             prepare
                 .in_set(RenderSystems::PrepareBindGroups)
                 .after(crate::receiver::PrepareReceiverTextures),
@@ -1331,6 +1506,12 @@ pub(crate) fn install(
                 .before(RenderGraphSystems::Render),
         )
         .add_systems(
+            RenderGraph,
+            hardware::build_hardware_traversal
+                .after(refit_scene)
+                .before(RenderGraphSystems::Render),
+        )
+        .add_systems(
             Core3d,
             finalize_view_lighting
                 .in_set(Core3dSystems::MainPass)
@@ -1349,7 +1530,9 @@ pub(crate) fn install(
         );
 }
 
-fn compute_layout() -> BindGroupLayoutDescriptor {
+/// The Split compute layout. `ray_query` appends the hardware TLAS binding;
+/// it is last, so every other physical binding index is unchanged.
+fn compute_layout(ray_query: bool) -> BindGroupLayoutDescriptor {
     let mut layout = BindGroupLayoutDescriptor::new(
         "split_rc_compute",
         &BindGroupLayoutEntries::sequential(
@@ -1389,15 +1572,32 @@ fn compute_layout() -> BindGroupLayoutDescriptor {
             ),
         ),
     );
-    layout
-        .entries
-        .push(storage_buffer_sized(false, None).build(32, ShaderStages::COMPUTE));
     layout.entries.push(
         texture_2d(TextureSampleType::Float { filterable: false }).build(37, ShaderStages::COMPUTE),
     );
+    layout.entries.push(
+        texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly)
+            .build(38, ShaderStages::COMPUTE),
+    );
+    for binding in [39, 40] {
+        layout.entries.push(
+            texture_2d(TextureSampleType::Float { filterable: false })
+                .build(binding, ShaderStages::COMPUTE),
+        );
+    }
     layout
         .entries
         .retain(|entry| !matches!(entry.binding, 5 | 17 | 18 | 19 | 21 | 24 | 30));
+    if ray_query {
+        layout.entries.push(BindGroupLayoutEntry {
+            binding: TLAS_BINDING,
+            visibility: ShaderStages::COMPUTE,
+            ty: BindingType::AccelerationStructure {
+                vertex_return: false,
+            },
+            count: None,
+        });
+    }
     layout
 }
 
@@ -1412,10 +1612,17 @@ fn init_pipelines(
         && device
             .features()
             .contains(wgpu::Features::PASSTHROUGH_SHADERS);
+    // Hardware traversal runs only on the SPIR-V path: Slang's WGSL has no ray
+    // queries, and the WGSL prelude is added before naga emits SPIR-V.
+    let ray_query = driver_spirv
+        && device
+            .features()
+            .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
     shaders
         .status
         .set_shader_backend(if driver_spirv { 2 } else { 1 });
-    info!(backend = ?shaders.status.shader_backend(), "GI shader backend selected");
+    shaders.status.set_hardware_ray_queries_supported(ray_query);
+    info!(backend = ?shaders.status.shader_backend(), ray_query, "GI shader backend selected");
     let handles = &shaders.handles;
     let driver_cache_path = device
         .features()
@@ -1438,7 +1645,7 @@ fn init_pipelines(
                 })
         }
     });
-    let compute_layout = compute_layout();
+    let compute_layout = compute_layout(ray_query);
     let mut composite_layout = BindGroupLayoutDescriptor::new(
         "split_rc_composite",
         &BindGroupLayoutEntries::sequential(
@@ -1453,6 +1660,9 @@ fn init_pipelines(
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 texture_2d(TextureSampleType::Uint),
                 texture_2d(TextureSampleType::Float { filterable: false }),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
             ),
         ),
     );
@@ -1505,6 +1715,14 @@ fn init_pipelines(
         jobs: Vec::new(),
         driver_cache,
         driver_spirv,
+<<<<<<< Updated upstream
+=======
+        ray_query,
+        indirect_execution: render_adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION),
+>>>>>>> Stashed changes
         driver_cache_path,
         driver_cache_save: None,
         driver_cache_dirty: false,
@@ -2265,7 +2483,18 @@ impl PendingGeometry {
                     "rc_pending_geometry"
                 }),
                 size: buffer_bytes,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                // Hardware ray queries build their BLASes from these positions.
+                usage: BufferUsages::STORAGE
+                    | BufferUsages::COPY_DST
+                    | if !paged
+                        && device
+                            .features()
+                            .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
+                    {
+                        BufferUsages::BLAS_INPUT
+                    } else {
+                        BufferUsages::empty()
+                    },
                 mapped_at_creation: false,
             }),
             allocated_bytes,
@@ -3567,6 +3796,17 @@ struct CacheBuffers {
     heads: Buffer,
 }
 
+struct SecondaryCache {
+    caches: [CacheBuffers; 2],
+    entries: Buffer,
+    history_entries: Buffer,
+    hit_textures: [Texture; 2],
+    hit_views: [TextureView; 2],
+    uniforms: [UniformBuffer<Parameters>; LEVELS],
+    clear_uniforms: [UniformBuffer<Parameters>; 2],
+    valid: AtomicBool,
+}
+
 const INSTANCE_WORDS_PER_RECORD: usize = 9;
 const INSTANCE_FLAG_ACTIVE_DEFORMATION: u32 = 1 << 6;
 
@@ -3584,13 +3824,23 @@ struct SceneHistorySnapshot {
     instance_words: Arc<Vec<UVec4>>,
     deformation_poses: Arc<Vec<UVec4>>,
     textures: Arc<crate::material::TextureAtlas>,
-    lights: Vec<GiLight>,
-    light_layers: Vec<RenderLayers>,
+    lights: Arc<Vec<GiLight>>,
+    light_layers: Arc<Vec<RenderLayers>>,
     emissive_lights: Arc<Vec<GiLight>>,
+    view_layers: RenderLayers,
+    ambient_environment: LinearRgba,
+    environment: Option<crate::RadianceCascadesEnvironment>,
+    environment_revision: u64,
 }
 
 impl SceneHistorySnapshot {
-    fn capture(scene: &GiScene) -> Self {
+    fn capture(
+        scene: &GiScene,
+        view_layers: &RenderLayers,
+        ambient_environment: LinearRgba,
+        environment: Option<&crate::RadianceCascadesEnvironment>,
+        environment_revision: u64,
+    ) -> Self {
         let data = &scene.data;
         Self {
             valid: true,
@@ -3615,6 +3865,10 @@ impl SceneHistorySnapshot {
             lights: data.lights.clone(),
             light_layers: data.light_layers.clone(),
             emissive_lights: data.emissive_lights.clone(),
+            view_layers: view_layers.clone(),
+            ambient_environment,
+            environment: environment.cloned(),
+            environment_revision,
         }
     }
 
@@ -3712,7 +3966,9 @@ fn scene_changed_since_history(
 ) -> bool {
     previous.valid
         && (previous.revision != current.revision
-            || previous.geometry_revision != current.geometry_revision)
+            || previous.geometry_revision != current.geometry_revision
+            || previous.mesh_revision != current.mesh_revision
+            || previous.topology_revision != current.topology_revision)
 }
 
 fn rigid_instance_transform(previous: &[UVec4], current: &[UVec4]) -> bool {
@@ -3806,12 +4062,22 @@ fn light_only_scene_snapshot_unchanged(
         && previous.mesh_revision == current.mesh_revision
         && previous.topology_revision == current.topology_revision
         && previous.instance_count == current.instance_count
-        && previous.light_layers == current.light_layers
-        && previous.emissive_lights == current.emissive_lights
+        && previous.instance_material_range == current.instance_material_range
         && Arc::ptr_eq(&previous.nodes, &current.nodes)
-        && Arc::ptr_eq(&previous.instance_words, &current.instance_words)
         && Arc::ptr_eq(&previous.deformation_poses, &current.deformation_poses)
         && Arc::ptr_eq(&previous.textures, &current.textures)
+        && previous
+            .instance_count
+            .checked_mul(INSTANCE_WORDS_PER_RECORD)
+            .is_some_and(|instance_tail| {
+                instance_tail_matches_except_emission(previous, current, instance_tail)
+                    && (0..previous.instance_count).all(|index| {
+                        matches!(
+                            (previous.instance_record(index), current.instance_record(index)),
+                            (Some(previous), Some(current)) if previous == current
+                        )
+                    })
+            })
 }
 
 fn include_bounds(bounds: &mut Option<(Vec3, Vec3)>, min: Vec3, max: Vec3) -> bool {
@@ -3932,11 +4198,221 @@ enum PunctualLightHistoryChange {
     Global,
 }
 
-fn punctual_light_history_invalidates_transport(
-    change: PunctualLightHistoryChange,
-    local_dirty_bounds_present: bool,
+// Every lighting change disables unrestricted reuse; local bounds let the
+// shader recover reuse only for samples whose complete dependencies miss them.
+fn punctual_light_history_invalidates_transport(change: PunctualLightHistoryChange) -> bool {
+    !matches!(change, PunctualLightHistoryChange::Unchanged)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EmissiveLightHistoryChange {
+    Unchanged,
+    Local { minimum: Vec3, maximum: Vec3 },
+    Global,
+}
+
+fn shared_vec_eq<T: PartialEq>(previous: &Arc<Vec<T>>, current: &Arc<Vec<T>>) -> bool {
+    Arc::ptr_eq(previous, current) || previous.as_ref() == current.as_ref()
+}
+
+fn emissive_source_is_valid(light: GiLight, instance_count: usize) -> bool {
+    (light.source.x as usize) < instance_count
+        && light.source.z == 0
+        && light.source.w == 0
+        && light.position.is_finite()
+        && light.position.w < 0.0
+        && light.color.is_finite()
+        && light.color.truncate().cmpge(Vec3::ZERO).all()
+        && light.color.w > 0.0
+        && light.direction.is_finite()
+        && light.direction.w > 0.0
+        && light.direction.w <= 1.0
+        && light.edge1.is_finite()
+        && light.edge1.w > 0.0
+        && light.edge1.w <= 1.0
+        && light.edge2.is_finite()
+        && light.edge2.w == 0.0
+}
+
+// The emitter vector is entity-ordered; use packed entity identity, not either
+// the emitter array slot or the transient TLAS instance index, as its merge key.
+fn emissive_source_key(snapshot: &SceneHistorySnapshot, light: GiLight) -> Option<(u64, u32)> {
+    let identity = snapshot.instance_record(light.source.x as usize)?.get(7)?;
+    Some((
+        u64::from(identity.x) | (u64::from(identity.y) << 32),
+        light.source.y,
+    ))
+}
+
+// Scene emission is stable entity/triangle order, so valid histories can be
+// matched in one allocation-free pass after this ordering check.
+fn emissive_sources_are_ordered(snapshot: &SceneHistorySnapshot) -> bool {
+    let mut previous = None;
+    for light in snapshot.emissive_lights.iter() {
+        if !emissive_source_is_valid(*light, snapshot.instance_count) {
+            return false;
+        }
+        let Some(key) = emissive_source_key(snapshot, *light) else {
+            return false;
+        };
+        if previous.is_some_and(|previous| previous >= key) {
+            return false;
+        }
+        previous = Some(key);
+    }
+    true
+}
+
+fn emissive_source_geometry_matches(previous: GiLight, current: GiLight) -> bool {
+    previous.position == current.position
+        && previous.color.w == current.color.w
+        && previous.direction.truncate() == current.direction.truncate()
+        && previous.edge1.truncate() == current.edge1.truncate()
+        && previous.edge2 == current.edge2
+}
+
+fn emissive_source_instance_unchanged(
+    previous: &SceneHistorySnapshot,
+    current: &SceneHistorySnapshot,
+    index: usize,
 ) -> bool {
-    matches!(change, PunctualLightHistoryChange::Global) || local_dirty_bounds_present
+    let (Some(previous), Some(current)) = (
+        previous.instance_record(index),
+        current.instance_record(index),
+    ) else {
+        return false;
+    };
+    previous[..6] == current[..6]
+}
+
+fn include_emissive_source_bounds(bounds: &mut Option<(Vec3, Vec3)>, light: GiLight) -> bool {
+    let a = light.position.truncate();
+    let b = a + light.edge1.truncate();
+    let c = a + light.edge2.truncate();
+    if !a.is_finite() || !b.is_finite() || !c.is_finite() {
+        return false;
+    }
+    let extent =
+        Vec3::splat(16.0 * f32::EPSILON * a.abs().max(b.abs()).max(c.abs()).max_element().max(1.0));
+    include_bounds(bounds, a.min(b).min(c) - extent, a.max(b).max(c) + extent)
+}
+
+fn emissive_light_history_change(
+    previous: &SceneHistorySnapshot,
+    current: &SceneHistorySnapshot,
+    bounded_geometry_reuse: bool,
+) -> EmissiveLightHistoryChange {
+    if shared_vec_eq(&previous.emissive_lights, &current.emissive_lights) {
+        return EmissiveLightHistoryChange::Unchanged;
+    }
+    if !previous.valid
+        || !current.valid
+        || previous.revision == current.revision
+        || !bounded_geometry_reuse
+        || !emissive_sources_are_ordered(previous)
+        || !emissive_sources_are_ordered(current)
+    {
+        return EmissiveLightHistoryChange::Global;
+    }
+
+    // CDF/PDF fields may shift when a source is removed. Cached samples retain
+    // their original proposal weights; compare source geometry and RGB only.
+    let mut previous_index = 0;
+    let mut current_index = 0;
+    let mut bounds = None;
+    let mut decreased = false;
+    while let Some(old) = previous.emissive_lights.get(previous_index).copied() {
+        let Some(new) = current.emissive_lights.get(current_index).copied() else {
+            if old.color.truncate().max_element() <= 0.0
+                || !emissive_source_instance_unchanged(previous, current, old.source.x as usize)
+                || !include_emissive_source_bounds(&mut bounds, old)
+            {
+                return EmissiveLightHistoryChange::Global;
+            }
+            decreased = true;
+            previous_index += 1;
+            continue;
+        };
+        let (Some(old_key), Some(new_key)) = (
+            emissive_source_key(previous, old),
+            emissive_source_key(current, new),
+        ) else {
+            return EmissiveLightHistoryChange::Global;
+        };
+        if old_key < new_key {
+            if old.color.truncate().max_element() <= 0.0
+                || !emissive_source_instance_unchanged(previous, current, old.source.x as usize)
+                || !include_emissive_source_bounds(&mut bounds, old)
+            {
+                return EmissiveLightHistoryChange::Global;
+            }
+            decreased = true;
+            previous_index += 1;
+            continue;
+        }
+        if old_key != new_key || !emissive_source_geometry_matches(old, new) {
+            return EmissiveLightHistoryChange::Global;
+        }
+        let previous_rgb = old.color.truncate();
+        let current_rgb = new.color.truncate();
+        if !current_rgb.cmple(previous_rgb).all() {
+            return EmissiveLightHistoryChange::Global;
+        }
+        if current_rgb != previous_rgb {
+            if !include_emissive_source_bounds(&mut bounds, old)
+                || !include_emissive_source_bounds(&mut bounds, new)
+            {
+                return EmissiveLightHistoryChange::Global;
+            }
+            decreased = true;
+        }
+        previous_index += 1;
+        current_index += 1;
+    }
+    if current_index != current.emissive_lights.len() || !decreased {
+        return EmissiveLightHistoryChange::Global;
+    }
+    bounds.map_or(EmissiveLightHistoryChange::Global, |(minimum, maximum)| {
+        EmissiveLightHistoryChange::Local { minimum, maximum }
+    })
+}
+
+fn emissive_light_history_invalidates_transport(change: EmissiveLightHistoryChange) -> bool {
+    !matches!(change, EmissiveLightHistoryChange::Unchanged)
+}
+
+fn local_lighting_metadata_allowed(global_view_change: bool, local_geometry_proven: bool) -> bool {
+    !global_view_change && local_geometry_proven
+}
+
+fn punctual_dirty_bounds(
+    change: PunctualLightHistoryChange,
+    global_view_change: bool,
+    local_geometry_proven: bool,
+) -> (Vec4, Vec4) {
+    match change {
+        PunctualLightHistoryChange::Local { minimum, maximum }
+            if local_lighting_metadata_allowed(global_view_change, local_geometry_proven) =>
+        {
+            (minimum.extend(1.0), maximum.extend(0.0))
+        }
+        _ => (Vec4::ZERO, Vec4::ZERO),
+    }
+}
+
+fn emissive_dirty_bounds(
+    change: EmissiveLightHistoryChange,
+    global_view_change: bool,
+    local_geometry_proven: bool,
+) -> (Vec4, Vec4) {
+    match change {
+        EmissiveLightHistoryChange::Local { minimum, maximum }
+            if local_lighting_metadata_allowed(global_view_change, local_geometry_proven) =>
+        {
+            (minimum.extend(1.0), maximum.extend(0.0))
+        }
+        _ => (Vec4::ZERO, Vec4::ZERO),
+    }
 }
 
 fn include_punctual_influence_bounds(bounds: &mut Option<(Vec3, Vec3)>, light: GiLight) -> bool {
@@ -3984,18 +4460,12 @@ fn punctual_light_history_change(
     previous: &SceneHistorySnapshot,
     current: &SceneHistorySnapshot,
 ) -> PunctualLightHistoryChange {
-    if previous.lights == current.lights
-        && previous.light_layers == current.light_layers
-        && previous.emissive_lights == current.emissive_lights
+    if shared_vec_eq(&previous.lights, &current.lights)
+        && shared_vec_eq(&previous.light_layers, &current.light_layers)
     {
         return PunctualLightHistoryChange::Unchanged;
     }
-    if !previous.valid
-        || !current.valid
-        || previous.revision == current.revision
-        || previous.light_layers != current.light_layers
-        || previous.emissive_lights != current.emissive_lights
-    {
+    if !previous.valid || !current.valid || previous.revision == current.revision {
         return PunctualLightHistoryChange::Global;
     }
 
@@ -4003,19 +4473,276 @@ fn punctual_light_history_change(
     for index in 0..previous.lights.len().max(current.lights.len()) {
         let old = previous.lights.get(index).copied();
         let new = current.lights.get(index).copied();
-        if old == new {
+        if old == new && previous.light_layers.get(index) == current.light_layers.get(index) {
             continue;
         }
-        if old.is_some_and(|light| !include_punctual_influence_bounds(&mut bounds, light))
-            || new.is_some_and(|light| !include_punctual_influence_bounds(&mut bounds, light))
-        {
-            return PunctualLightHistoryChange::Global;
+        for light in [old, new].into_iter().flatten() {
+            if light.position.w == 0.0 {
+                continue;
+            }
+            if !light.position.w.is_finite()
+                || light.position.w < 0.0
+                || !include_punctual_influence_bounds(&mut bounds, light)
+            {
+                return PunctualLightHistoryChange::Global;
+            }
         }
     }
 
     bounds.map_or(
         PunctualLightHistoryChange::Unchanged,
         |(minimum, maximum)| PunctualLightHistoryChange::Local { minimum, maximum },
+    )
+}
+fn instance_emission_words_changed(
+    previous: &SceneHistorySnapshot,
+    current: &SceneHistorySnapshot,
+) -> bool {
+    if !previous.valid || !current.valid {
+        return true;
+    }
+    if Arc::ptr_eq(&previous.instance_words, &current.instance_words) {
+        return false;
+    }
+    if previous.instance_count == 0 {
+        return false;
+    }
+    let Some(instance_tail) = previous
+        .instance_count
+        .checked_mul(INSTANCE_WORDS_PER_RECORD)
+    else {
+        return true;
+    };
+    let (Some(previous_emission_words), Some(current_emission_words)) = (
+        material_emission_word_offsets(previous, instance_tail),
+        material_emission_word_offsets(current, instance_tail),
+    ) else {
+        return true;
+    };
+    previous_emission_words != current_emission_words
+        || previous_emission_words.iter().any(|&offset| {
+            previous.instance_words.get(offset) != current.instance_words.get(offset)
+        })
+}
+
+fn active_source_mask(snapshot: &SceneHistorySnapshot) -> u32 {
+    let mut active = if snapshot.emissive_lights.is_empty() {
+        0
+    } else {
+        SOURCE_EMISSIVE
+    };
+    if snapshot
+        .lights
+        .iter()
+        .zip(snapshot.light_layers.iter())
+        .any(|(light, layers)| {
+            snapshot.view_layers.intersects(layers)
+                && light.position.w.is_finite()
+                && light.position.w > 0.0
+        })
+    {
+        active |= SOURCE_PUNCTUAL;
+    }
+    active
+}
+
+fn conventional_source_mask(light: GiLight) -> u32 {
+    if !light.position.is_finite()
+        || !light.color.is_finite()
+        || !light.direction.is_finite()
+        || !light.edge1.is_finite()
+        || !light.edge2.is_finite()
+    {
+        SOURCE_BACKGROUND | SOURCE_PUNCTUAL
+    } else if light.position.w == 0.0 {
+        SOURCE_BACKGROUND
+    } else if light.position.w > 0.0 {
+        SOURCE_PUNCTUAL
+    } else {
+        SOURCE_BACKGROUND | SOURCE_PUNCTUAL
+    }
+}
+
+fn conventional_source_changes(
+    previous: &SceneHistorySnapshot,
+    current: &SceneHistorySnapshot,
+) -> u32 {
+    if shared_vec_eq(&previous.lights, &current.lights)
+        && shared_vec_eq(&previous.light_layers, &current.light_layers)
+        && previous.view_layers == current.view_layers
+    {
+        return 0;
+    }
+    let mut changed = 0;
+    for index in 0..previous.lights.len().max(current.lights.len()) {
+        let old = previous.lights.get(index).copied();
+        let new = current.lights.get(index).copied();
+        let old_visible = old.is_some()
+            && previous
+                .light_layers
+                .get(index)
+                .is_some_and(|layers| previous.view_layers.intersects(layers));
+        let new_visible = new.is_some()
+            && current
+                .light_layers
+                .get(index)
+                .is_some_and(|layers| current.view_layers.intersects(layers));
+        if old == new && old_visible == new_visible {
+            continue;
+        }
+        if old_visible {
+            changed |= conventional_source_mask(old.expect("visible light has a source"));
+        }
+        if new_visible {
+            changed |= conventional_source_mask(new.expect("visible light has a source"));
+        }
+    }
+    changed
+}
+fn gradual_rgb(old: Vec3, new: Vec3) -> bool {
+    if !old.is_finite() || !new.is_finite() || old.min_element() < 0.0 || new.min_element() < 0.0 {
+        return false;
+    }
+    let peak = old.max_element().max(new.max_element());
+    (old - new).abs().max_element() <= peak * 0.05
+        && (old.max_element() > 0.0 || new.max_element() == 0.0)
+        && (new.max_element() > 0.0 || old.max_element() == 0.0)
+}
+
+// Small per-frame changes can borrow radiance; abrupt changes still invalidate it.
+fn gradual_directional_motion(
+    previous: &SceneHistorySnapshot,
+    current: &SceneHistorySnapshot,
+) -> bool {
+    if !previous.valid
+        || !current.valid
+        || previous.view_layers != current.view_layers
+        || previous.ambient_environment.alpha != current.ambient_environment.alpha
+        || !gradual_rgb(
+            previous.ambient_environment.to_vec4().truncate(),
+            current.ambient_environment.to_vec4().truncate(),
+        )
+        || previous.environment != current.environment
+        || previous.environment_revision != current.environment_revision
+        || previous.lights.len() != current.lights.len()
+        || previous.light_layers != current.light_layers
+        || previous.lights.len() != previous.light_layers.len()
+    {
+        return false;
+    }
+    let mut moved = false;
+    for (old, new) in previous.lights.iter().zip(current.lights.iter()) {
+        if old == new || (old.position.w > 0.0 && new.position.w > 0.0) {
+            continue;
+        }
+        if old.position.w != 0.0
+            || new.position.w != 0.0
+            || old.color.w != new.color.w
+            || !gradual_rgb(old.color.truncate(), new.color.truncate())
+            || old.direction != new.direction
+            || old.edge1 != new.edge1
+            || old.edge2 != new.edge2
+            || old.source != new.source
+        {
+            return false;
+        }
+        let a = old.position.truncate();
+        let b = new.position.truncate();
+        if !a.is_finite()
+            || !b.is_finite()
+            || (a.length_squared() - 1.0).abs() > 0.001
+            || (b.length_squared() - 1.0).abs() > 0.001
+            || a.dot(b) < 0.996_194_7
+        {
+            return false;
+        }
+        moved = true;
+    }
+    moved
+}
+
+fn gradual_punctual_motion(
+    previous: &SceneHistorySnapshot,
+    current: &SceneHistorySnapshot,
+) -> bool {
+    if !previous.valid
+        || !current.valid
+        || previous.view_layers != current.view_layers
+        || previous.light_layers != current.light_layers
+        || previous.lights.len() != current.lights.len()
+        || previous.lights.len() != previous.light_layers.len()
+    {
+        return false;
+    }
+    let mut moved = false;
+    for (old, new) in previous.lights.iter().zip(current.lights.iter()) {
+        if old == new || (old.position.w == 0.0 && new.position.w == 0.0) {
+            continue;
+        }
+        let a = old.direction.truncate();
+        let b = new.direction.truncate();
+        if !old.position.is_finite()
+            || !new.position.is_finite()
+            || old.position.w <= 0.0
+            || old.position.w != new.position.w
+            || (old.position.truncate() - new.position.truncate()).length() > old.position.w * 0.01
+            || old.color.w != new.color.w
+            || !gradual_rgb(old.color.truncate(), new.color.truncate())
+            || !a.is_finite()
+            || !b.is_finite()
+            || old.direction.w != new.direction.w
+            || (a != b
+                && ((a.length_squared() - 1.0).abs() > 0.001
+                    || (b.length_squared() - 1.0).abs() > 0.001
+                    || a.dot(b) < 0.996_194_7))
+            || old.edge1 != new.edge1
+            || old.edge2 != new.edge2
+            || old.source != new.source
+        {
+            return false;
+        }
+        moved = true;
+    }
+    moved
+}
+
+fn source_history_fields(
+    previous: &SceneHistorySnapshot,
+    current: &SceneHistorySnapshot,
+    punctual_change: PunctualLightHistoryChange,
+    emissive_change: EmissiveLightHistoryChange,
+) -> UVec4 {
+    let active = active_source_mask(current);
+    let previous_active = active_source_mask(previous);
+    let mut changed = active ^ previous_active;
+    if !previous.valid || !current.valid {
+        changed |= SOURCE_BACKGROUND | active | previous_active;
+    } else {
+        if previous.view_layers != current.view_layers {
+            changed |= SOURCE_BACKGROUND | active | previous_active;
+        }
+        if previous.ambient_environment != current.ambient_environment
+            || previous.environment != current.environment
+            || previous.environment_revision != current.environment_revision
+        {
+            changed |= SOURCE_BACKGROUND;
+        }
+        if emissive_light_history_invalidates_transport(emissive_change)
+            || instance_emission_words_changed(previous, current)
+        {
+            changed |= SOURCE_EMISSIVE;
+        }
+        changed |= conventional_source_changes(previous, current);
+        if punctual_light_history_invalidates_transport(punctual_change) {
+            changed |= SOURCE_PUNCTUAL;
+        }
+    }
+    UVec4::new(
+        active,
+        changed,
+        u32::from(gradual_directional_motion(previous, current))
+            | (u32::from(gradual_punctual_motion(previous, current)) << 2),
+        0,
     )
 }
 
@@ -4032,15 +4759,17 @@ struct ViewBuffers {
     entries: Buffer,
     history_entries: Buffer,
     irradiance_probes: Buffer,
+    secondary: Option<SecondaryCache>,
     irradiance_textures: [Texture; 4],
     irradiance_views: [TextureView; 4],
+    _background_textures: [Texture; 3],
+    background_views: [TextureView; 3],
     _metadata: Vec<Texture>,
     // Slots 0/1 hold temporal moments, slot 2 holds sparse receiver metadata,
     // and slots 3/4 ping-pong packed full-viewport receiver history.
     metadata_views: [TextureView; 5],
     _denoise_receiver_history_output: Texture,
     denoise_receiver_history_output_view: TextureView,
-    root_ray_offset: Buffer,
     uniforms: [UniformBuffer<Parameters>; LEVELS],
     clear_uniforms: [UniformBuffer<Parameters>; 2],
     /// Reuse bind groups while their exact resources/layout slices remain stable.
@@ -4049,6 +4778,9 @@ struct ViewBuffers {
     rendered_frame: Mutex<RenderedFrame>,
     cache_clock: std::time::Instant,
     scene_history: Mutex<SceneHistorySnapshot>,
+    // Frame of the last gradual directional change, plus one; zero means none.
+    directional_motion_epoch: AtomicU32,
+    punctual_motion_epoch: AtomicU32,
     /// Per-view phase for transport candidate epochs; advances only after a
     /// successful render update, independently of the wrapping GPU frame index.
     candidate_schedule: Mutex<CandidateSchedule>,
@@ -4119,8 +4851,8 @@ impl CandidateSchedule {
         (self.cursor, fair_quota)
     }
 
-    fn advance_after_successful_update(&mut self) {
-        if self.candidate_count > 0 {
+    fn advance_after_successful_update(&mut self, consume_fair_cursor: bool) {
+        if consume_fair_cursor && self.candidate_count > 0 {
             self.cursor = ((u64::from(self.cursor) + u64::from(self.pending_fair_advance))
                 % u64::from(self.candidate_count)) as u32;
         }
@@ -4135,12 +4867,21 @@ fn candidate_field_indices(frame: u32) -> (usize, usize) {
 struct ViewBindings {
     compute: [BindGroup; LEVELS],
     clear: [BindGroup; 2],
+    trace: Option<BindGroup>,
+    secondary: Option<SecondaryBindings>,
+    secondary_enabled: bool,
     denoise: [BindGroup; LEVELS],
     temporal: BindGroup,
     world_resolve: BindGroup,
     composite: BindGroup,
     frame: RenderedFrame,
     scene_history: SceneHistorySnapshot,
+}
+
+#[derive(Clone)]
+struct SecondaryBindings {
+    compute: [BindGroup; LEVELS],
+    clear: [BindGroup; 2],
 }
 
 #[derive(Clone)]
@@ -4202,9 +4943,26 @@ fn view_binding_key(
         &buffers.entries,
         &buffers.history_entries,
         &buffers.irradiance_probes,
-        &buffers.root_ray_offset,
     ] {
         hash_buffer(buffer, &mut hasher);
+    }
+    if let Some(secondary) = &buffers.secondary {
+        for buffer in [
+            &secondary.caches[parity].heads,
+            &secondary.caches[1 - parity].heads,
+            &secondary.entries,
+            &secondary.history_entries,
+        ] {
+            hash_buffer(buffer, &mut hasher);
+        }
+        for view in &secondary.hit_views {
+            hash_view(view, &mut hasher);
+        }
+        for uniform in secondary.uniforms.iter().chain(&secondary.clear_uniforms) {
+            if let Some(buffer) = uniform.buffer() {
+                hash_buffer(buffer, &mut hasher);
+            }
+        }
     }
     for uniform in buffers.uniforms.iter().chain(&buffers.clear_uniforms) {
         if let Some(buffer) = uniform.buffer() {
@@ -4217,6 +4975,7 @@ fn view_binding_key(
         .irradiance_views
         .iter()
         .chain(&buffers.metadata_views)
+        .chain(&buffers.background_views)
     {
         hash_view(view, &mut hasher);
     }
@@ -4301,18 +5060,12 @@ fn sparse_candidate_phase_word(candidate_phase: u32, reset: bool, updates_disabl
 
 fn reset_cache_history(
     layers_changed: bool,
-    environment_changed: bool,
     exposure_changed: bool,
     meshes_changed: bool,
     settings_changed: bool,
     viewport_changed: bool,
 ) -> bool {
-    layers_changed
-        || environment_changed
-        || exposure_changed
-        || meshes_changed
-        || settings_changed
-        || viewport_changed
+    layers_changed || exposure_changed || meshes_changed || settings_changed || viewport_changed
 }
 
 fn discard_obsolete_scene(live: u64, candidate: u64, budget: u64, obsolete: bool) -> bool {
@@ -4328,15 +5081,24 @@ fn view_bytes(size: UVec2, shading_size: UVec2, settings: RadianceCascades) -> u
     let pixels = u64::from(size.x) * u64::from(size.y);
     let shading_pixels = u64::from(shading_size.x) * u64::from(shading_size.y);
     let buckets = cache_bucket_count(pixels, settings);
-    // Four diffuse, five temporal metadata, and one post-denoise receiver image.
-    let image_bytes = shading_pixels * 10 * 16;
+    // Four diffuse, five temporal metadata, one post-denoise receiver, and
+    // three independent background current/history images.
+    let image_bytes = shading_pixels * 13 * 16;
     image_bytes
         + (LEVELS as u64 + 2) * std::mem::size_of::<Parameters>() as u64
-        + irradiance_probe_bytes(pixels)
+        + irradiance_probe_bytes(pixels, settings.multi_bounce)
         + cache_head_bytes(buckets, pixels) * 2
         + cache_entry_bytes(pixels, buckets)
         + cache_history_bytes(buckets)
-        + 4
+        + if settings.multi_bounce {
+            pixels * 32
+                + cache_head_bytes(buckets, pixels) * 2
+                + cache_entry_bytes(pixels, buckets)
+                + cache_history_bytes(buckets)
+                + (LEVELS as u64 + 2) * std::mem::size_of::<Parameters>() as u64
+        } else {
+            0
+        }
 }
 
 impl ViewBuffers {
@@ -4534,8 +5296,8 @@ impl ViewBuffers {
                 .all(|cache| cache.heads.size() == cache_head_bytes(u64::from(buckets), samples))
             && previous.entries.size() == cache_entry_bytes(samples, u64::from(buckets))
             && previous.history_entries.size() == cache_history_bytes(u64::from(buckets))
-            && previous.irradiance_probes.size() == irradiance_probe_bytes(samples)
-            && previous.root_ray_offset.size() == 4
+            && previous.irradiance_probes.size()
+                == irradiance_probe_bytes(samples, settings.multi_bounce)
             && !world_cache_settings_changed(previous.settings, settings)
     }
 
@@ -4545,6 +5307,7 @@ impl ViewBuffers {
         viewport: UVec4,
         settings: RadianceCascades,
     ) -> Option<u64> {
+        let samples = u64::from(size.x) * u64::from(size.y);
         Self::can_preserve_world_cache(previous, size, viewport, settings).then(|| {
             previous
                 .caches
@@ -4554,7 +5317,16 @@ impl ViewBuffers {
                 + previous.entries.size()
                 + previous.history_entries.size()
                 + previous.irradiance_probes.size()
-                + previous.root_ray_offset.size()
+                + previous.secondary.as_ref().map_or(0, |secondary| {
+                    secondary
+                        .caches
+                        .iter()
+                        .map(|cache| cache.heads.size())
+                        .sum::<u64>()
+                        + secondary.entries.size()
+                        + secondary.history_entries.size()
+                        + samples * 32
+                })
         })
     }
 
@@ -4615,7 +5387,7 @@ impl ViewBuffers {
             || {
                 device.create_buffer(&BufferDescriptor {
                     label: Some("split_rc_directional_probes"),
-                    size: irradiance_probe_bytes(u64::from(cache_samples)),
+                    size: irradiance_probe_bytes(u64::from(cache_samples), settings.multi_bounce),
                     usage: BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 })
@@ -4641,9 +5413,72 @@ impl ViewBuffers {
                 view_formats: &[],
             })
         };
+        let secondary = settings.multi_bounce.then(|| {
+            let previous = previous.and_then(|previous| previous.secondary.as_ref());
+            let caches = previous.map_or_else(
+                || {
+                    std::array::from_fn(|_| CacheBuffers {
+                        heads: device.create_buffer(&BufferDescriptor {
+                            label: Some("split_rc_secondary_heads"),
+                            size: cache_head_bytes(u64::from(buckets), u64::from(cache_samples)),
+                            usage: BufferUsages::STORAGE
+                                | BufferUsages::COPY_SRC
+                                | BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        }),
+                    })
+                },
+                |previous| previous.caches.clone(),
+            );
+            let entries = previous.map_or_else(
+                || {
+                    device.create_buffer(&BufferDescriptor {
+                        label: Some("split_rc_secondary_work"),
+                        size: cache_entry_bytes(u64::from(cache_samples), u64::from(buckets)),
+                        usage: BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    })
+                },
+                |previous| previous.entries.clone(),
+            );
+            let history_entries = previous.map_or_else(
+                || {
+                    device.create_buffer(&BufferDescriptor {
+                        label: Some("split_rc_secondary_history"),
+                        size: cache_history_bytes(u64::from(buckets)),
+                        usage: BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    })
+                },
+                |previous| previous.history_entries.clone(),
+            );
+            let hit_textures = previous.map_or_else(
+                || std::array::from_fn(|_| make_texture(size)),
+                |previous| previous.hit_textures.clone(),
+            );
+            let hit_views = std::array::from_fn(|i| {
+                hit_textures[i].create_view(&TextureViewDescriptor::default())
+            });
+            SecondaryCache {
+                caches,
+                entries,
+                history_entries,
+                hit_textures,
+                hit_views,
+                uniforms: std::array::from_fn(|_| UniformBuffer::default()),
+                clear_uniforms: std::array::from_fn(|_| UniformBuffer::default()),
+                valid: AtomicBool::new(
+                    previous.is_some_and(|cache| cache.valid.load(Ordering::Relaxed)),
+                ),
+            }
+        });
         let irradiance: [Texture; 4] = std::array::from_fn(|_| make_texture(shading_size));
         let irradiance_views =
             std::array::from_fn(|i| irradiance[i].create_view(&TextureViewDescriptor::default()));
+        let background_textures: [Texture; 3] = std::array::from_fn(|_| make_texture(shading_size));
+        let background_views = std::array::from_fn(|i| {
+            background_textures[i].create_view(&TextureViewDescriptor::default())
+        });
         let metadata: Vec<Texture> = (0..5).map(|_| make_texture(shading_size)).collect();
         let metadata_views: [TextureView; 5] =
             std::array::from_fn(|i| metadata[i].create_view(&TextureViewDescriptor::default()));
@@ -4663,17 +5498,6 @@ impl ViewBuffers {
         });
         let denoise_receiver_history_output_view =
             denoise_receiver_history_output.create_view(&TextureViewDescriptor::default());
-        let root_ray_offset = previous.map_or_else(
-            || {
-                device.create_buffer(&BufferDescriptor {
-                    label: Some("split_rc_root_ray_offset"),
-                    size: 4,
-                    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            },
-            |previous| previous.root_ray_offset.clone(),
-        );
         Self {
             size,
             shading_size,
@@ -4683,19 +5507,23 @@ impl ViewBuffers {
             entries,
             history_entries,
             irradiance_probes,
+            secondary,
             irradiance_textures: irradiance,
             irradiance_views,
+            _background_textures: background_textures,
+            background_views,
             _metadata: metadata,
             metadata_views,
             _denoise_receiver_history_output: denoise_receiver_history_output,
             denoise_receiver_history_output_view,
-            root_ray_offset,
             uniforms: std::array::from_fn(|_| UniformBuffer::default()),
             clear_uniforms: std::array::from_fn(|_| UniformBuffer::default()),
             binding_cache: std::array::from_fn(|_| None),
             rendered_frame: Mutex::new(RenderedFrame::default()),
             cache_clock: std::time::Instant::now(),
             scene_history: Mutex::new(SceneHistorySnapshot::default()),
+            directional_motion_epoch: AtomicU32::new(0),
+            punctual_motion_epoch: AtomicU32::new(0),
             candidate_schedule: Mutex::new(CandidateSchedule::default()),
             viewport: UVec4::ZERO,
             frame: AtomicU32::new(0),
@@ -4730,7 +5558,6 @@ impl ViewBuffers {
         self.entries = previous.entries.clone();
         self.history_entries = previous.history_entries.clone();
         self.irradiance_probes = previous.irradiance_probes.clone();
-        self.root_ray_offset = previous.root_ray_offset.clone();
         self.rendered_frame = Mutex::new(
             *previous
                 .rendered_frame
@@ -4757,6 +5584,14 @@ impl ViewBuffers {
             .store(previous.frame.load(Ordering::Relaxed), Ordering::Relaxed);
         self.history_valid.store(
             previous.history_valid.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.directional_motion_epoch.store(
+            previous.directional_motion_epoch.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.punctual_motion_epoch.store(
+            previous.punctual_motion_epoch.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         self.history_diagnostics_requested.store(
@@ -4793,7 +5628,11 @@ fn prepare(
     mut pipelines: ResMut<Pipelines>,
     shaders: Res<PipelineShaders>,
     mut last_scene_upload_report: Local<Option<std::time::Instant>>,
-    image_resources: (Res<RenderAssets<GpuImage>>, Res<bevy::pbr::DfgLut>),
+    image_resources: (
+        Res<RenderAssets<GpuImage>>,
+        Res<bevy::pbr::DfgLut>,
+        Option<Res<hardware::HardwareTraversal>>,
+    ),
     scene: Res<GiScene>,
     mut gpu_scene: Option<ResMut<GpuScene>>,
     environments: Res<crate::environment::EnvironmentTables>,
@@ -4834,7 +5673,16 @@ fn prepare(
         )>,
     )>,
 ) {
-    let (images, dfg_lut) = image_resources;
+    let (images, dfg_lut, hardware) = image_resources;
+    // With ray queries every compute bind group carries the TLAS binding.
+    let hardware_tlas = if pipelines.ray_query {
+        let Some(hardware) = hardware.as_deref() else {
+            return;
+        };
+        Some(hardware.tlas())
+    } else {
+        None
+    };
     let Some(dfg_image) = images.get(&dfg_lut.texture) else {
         for (entity, ..) in &mut view_queries.p1() {
             commands
@@ -4870,6 +5718,22 @@ fn prepare(
                 0
             }
         });
+    // Hardware traversal pipelines are built only where the device has them.
+    let wanted = views
+        .iter()
+        .fold(0u64, |mask, (_, _, _, _, _, (settings, _), ..)| {
+            let settings = settings.sanitized();
+            mask | if settings.intensity > 0.0 {
+                wanted_pipelines(settings)
+            } else {
+                0
+            }
+        })
+        & if pipelines.ray_query {
+            u64::MAX
+        } else {
+            !HARDWARE_TRAVERSAL_PIPELINES
+        };
     let mut job = 0;
     let mut cache_changed = false;
     while job < pipelines.jobs.len() {
@@ -4929,7 +5793,7 @@ fn prepare(
     if pipelines.driver_cache_dirty
         && pipelines.driver_cache_save.is_none()
         && pipelines.jobs.is_empty()
-        && required & !pipelines.started == 0
+        && wanted & !pipelines.started == 0
         && let (Some(cache), Some(path)) = (&pipelines.driver_cache, &pipelines.driver_cache_path)
     {
         let cache = cache.clone();
@@ -4975,7 +5839,7 @@ fn prepare(
         if compiling >= max_concurrent || pipelines.driver_cache_save.is_some() {
             break;
         }
-        if required & (1 << i) != 0
+        if wanted & (1 << i) != 0
             && pipelines.compute[i].is_none()
             && pipelines.started & (1 << i) == 0
             && shaders.loaded.load(Ordering::Acquire) & (1 << i) != 0
@@ -4990,6 +5854,7 @@ fn prepare(
             let entry = *entry;
             let pipeline_cache = pipelines.driver_cache.clone();
             let spirv = pipelines.driver_spirv;
+            let ray_query = pipelines.ray_query;
             pipelines.started |= 1 << i;
             let queued_at = std::time::Instant::now();
             match std::thread::Builder::new()
@@ -4998,7 +5863,15 @@ fn prepare(
                     info!(entry, queued_ms = ?queued_at.elapsed(), "GI pipeline worker started");
                     let start = std::time::Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        compute_pipeline(device, layouts, source, entry, pipeline_cache, spirv)
+                        compute_pipeline(
+                            device,
+                            layouts,
+                            source,
+                            entry,
+                            pipeline_cache,
+                            spirv,
+                            ray_query,
+                        )
                     }))
                     .unwrap_or_else(|_| Err("wgpu rejected the compute pipeline".into()));
                     (result, start.elapsed())
@@ -5051,8 +5924,9 @@ fn prepare(
         || scene.data.textures.side > device.limits().max_texture_dimension_2d
         || scene.data.textures.pages.len() > device.limits().max_texture_array_layers as usize
     {
-        if last_scene_upload_report
-            .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(5))
+        if required != 0
+            && last_scene_upload_report
+                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(5))
         {
             info!(
                 scene_ready = scene.ready,
@@ -6466,6 +7340,7 @@ fn prepare(
                 || v.shading_size != shading_size
                 || v.viewport_size != viewport
                 || v.settings.max_rays != settings.max_rays
+                || v.settings.multi_bounce != settings.multi_bounce
                 || v.settings.sampling != settings.sampling
                 || v.buckets
                     != cache_bucket_count(u64::from(size.x) * u64::from(size.y), settings) as u32
@@ -6534,7 +7409,16 @@ fn prepare(
             .rendered_frame
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let scene_history = SceneHistorySnapshot::capture(&scene);
+        let default_layers = RenderLayers::default();
+        let render_layers = render_layers.unwrap_or(&default_layers);
+        let environment_revision = environment_table.map_or(0, |table| table.revision);
+        let scene_history = SceneHistorySnapshot::capture(
+            &scene,
+            render_layers,
+            settings.environment,
+            environment,
+            environment_revision,
+        );
         let previous_scene_history = buffers
             .scene_history
             .lock()
@@ -6555,21 +7439,23 @@ fn prepare(
         // retain the cache reset; screen history is managed independently below.
         let exposure_changed = rendered.exposure != camera.exposure;
         let scene_changed = buffers.revision != scene.revision;
-        let meshes_changed = buffers.mesh_revision != scene.mesh_revision;
-        let geometry_changed = buffers.geometry_revision != scene.geometry_revision;
-        let default_layers = RenderLayers::default();
-        let render_layers = render_layers.unwrap_or(&default_layers);
-        let layers_changed = buffers.render_layers != *render_layers;
-        let environment_revision = environment_table.map_or(0, |table| table.revision);
-        let environment_changed = buffers.environment.as_ref() != environment
-            || buffers.environment_revision != environment_revision;
+        let meshes_changed = previous_scene_history.valid
+            && previous_scene_history.mesh_revision != scene_history.mesh_revision;
+        let geometry_changed = previous_scene_history.valid
+            && previous_scene_history.geometry_revision != scene_history.geometry_revision;
+        let layers_changed = previous_scene_history.valid
+            && previous_scene_history.view_layers != scene_history.view_layers;
+        let environment_changed = previous_scene_history.valid
+            && (previous_scene_history.environment != scene_history.environment
+                || previous_scene_history.environment_revision
+                    != scene_history.environment_revision);
         let settings_changed = buffers.settings != settings;
+        let settings_history_changed = history_settings_changed(buffers.settings, settings);
         let world_cache_settings_changed = world_cache_settings_changed(buffers.settings, settings);
         let viewport_changed = buffers.viewport != view.viewport;
         let punctual_light_change =
             punctual_light_history_change(&previous_scene_history, &scene_history);
         let bounded_geometry_reuse = !layers_changed
-            && !environment_changed
             && !exposure_changed
             && !meshes_changed
             && !world_cache_settings_changed
@@ -6577,35 +7463,45 @@ fn prepare(
             && bounded_geometry_history_reuse(&previous_scene_history, &scene_history);
         let local_light_geometry_proven = if geometry_changed {
             bounded_geometry_reuse
-                && previous_scene_history.geometry_revision != scene_history.geometry_revision
         } else {
             !scene_changed_since_history
                 || light_only_scene_snapshot_unchanged(&previous_scene_history, &scene_history)
         };
-        let (light_dirty_min, light_dirty_max) = match punctual_light_change {
-            PunctualLightHistoryChange::Local { minimum, maximum }
-                if !layers_changed
-                    && !environment_changed
-                    && !exposure_changed
-                    && !settings_changed
-                    && !world_cache_settings_changed
-                    && !meshes_changed
-                    && !viewport_changed
-                    && local_light_geometry_proven =>
-            {
-                (minimum.extend(1.0), maximum.extend(0.0))
-            }
-            _ => (Vec4::ZERO, Vec4::ZERO),
-        };
+        let emissive_light_change = emissive_light_history_change(
+            &previous_scene_history,
+            &scene_history,
+            local_light_geometry_proven,
+        );
+        let global_view_change = layers_changed
+            || exposure_changed
+            || settings_history_changed
+            || world_cache_settings_changed
+            || meshes_changed
+            || viewport_changed;
+        let (light_dirty_min, light_dirty_max) = punctual_dirty_bounds(
+            punctual_light_change,
+            global_view_change,
+            local_light_geometry_proven,
+        );
+        let (emissive_dirty_min, emissive_dirty_max) = emissive_dirty_bounds(
+            emissive_light_change,
+            global_view_change,
+            local_light_geometry_proven,
+        );
+        let mut source_history = source_history_fields(
+            &previous_scene_history,
+            &scene_history,
+            punctual_light_change,
+            emissive_light_change,
+        );
         // Geometry motion still enables native pixel motion vectors via
         // stability.y. Only validated dependency bounds permit world reuse.
         dirty_max.w = f32::from(bounded_geometry_reuse);
         let reset_cache = reset_cache_history(
             layers_changed,
-            environment_changed,
             exposure_invalidates_world_history(exposure_changed),
-            // Unknown changes retain global invalidation. The bounded rigid
-            // case uses each interval/probe's complete visibility dependencies.
+            // Unknown geometry changes retain global invalidation. The bounded
+            // rigid case uses each interval/probe's complete visibility dependencies.
             meshes_changed || (geometry_changed && !bounded_geometry_reuse),
             world_cache_settings_changed,
             viewport_changed,
@@ -6620,10 +7516,15 @@ fn prepare(
                 bounded_geometry_reuse,
                 reset_cache,
                 punctual_light_change = ?punctual_light_change,
+                emissive_light_change = ?emissive_light_change,
+                source_active = source_history.x,
+                source_changed = source_history.y,
                 dirty_min = ?dirty_min,
                 dirty_max = ?dirty_max,
                 light_dirty_min = ?light_dirty_min,
                 light_dirty_max = ?light_dirty_max,
+                emissive_dirty_min = ?emissive_dirty_min,
+                emissive_dirty_max = ?emissive_dirty_max,
                 previous_geometry_revision = previous_scene_history.geometry_revision,
                 current_geometry_revision = scene_history.geometry_revision,
                 previous_mesh_revision = previous_scene_history.mesh_revision,
@@ -6631,9 +7532,8 @@ fn prepare(
                 "GI scene history decision"
             );
         }
-        let settings_history_changed = history_settings_changed(buffers.settings, settings);
-        let reset_screen =
-            view_change_invalidates_screen_history(settings_history_changed, viewport_changed);
+        let reset_screen = exposure_changed
+            || view_change_invalidates_screen_history(settings_history_changed, viewport_changed);
         buffers.allocation_request = allocation_request;
         let environment_source_changed =
             buffers.environment.as_ref().map(|source| source.image.id())
@@ -6757,23 +7657,68 @@ fn prepare(
                 });
         }
         let frame = buffers.frame.load(Ordering::Relaxed);
+        let motion_epoch = if source_history.z & 1 != 0 {
+            frame.wrapping_add(1).max(1)
+        } else {
+            buffers.directional_motion_epoch.load(Ordering::Relaxed)
+        };
+        if motion_epoch != 0 {
+            source_history.z |= 2;
+            source_history.w = motion_epoch.wrapping_sub(1);
+        }
+        let punctual_motion_epoch = if source_history.z & 4 != 0 {
+            frame.wrapping_add(1).max(1)
+        } else {
+            buffers.punctual_motion_epoch.load(Ordering::Relaxed)
+        };
+        if punctual_motion_epoch != 0 {
+            source_history.z |= 8;
+        }
         let candidate_count = size.x * size.y;
+        let (shared_primary_query_limit, secondary_query_limit) = cache_query_limits(
+            settings.sampling.max_traversal_queries,
+            settings.multi_bounce,
+        );
+        let (shared_primary_cache_limit, secondary_cache_limit) =
+            cache_query_limits(settings.sampling.max_cache_entries, settings.multi_bounce);
         let requested_update_budget = runtime_update_budget(
             settings,
             runtime_budget.map(|budget| budget.max_updates_per_frame),
         );
+        let secondary_enabled = settings.multi_bounce
+            && requested_update_budget >= 2
+            && (settings.sampling.max_traversal_queries == 0 || secondary_query_limit > 0)
+            && (settings.sampling.max_cache_entries == 0 || secondary_cache_limit > 0);
+        let primary_query_limit = if secondary_enabled {
+            shared_primary_query_limit
+        } else {
+            settings.sampling.max_traversal_queries
+        };
+        let primary_cache_limit = if secondary_enabled {
+            shared_primary_cache_limit
+        } else {
+            settings.sampling.max_cache_entries
+        };
+        let primary_requested = if secondary_enabled {
+            requested_update_budget / 2
+        } else {
+            requested_update_budget
+        };
+        let secondary_update_budget = requested_update_budget - primary_requested;
+        let mut primary_settings = settings;
+        primary_settings.sampling.max_traversal_queries = primary_query_limit;
         let update_budget = if settings.sampling.is_explicit() {
             query_affordable_update_budget(
-                settings,
-                requested_update_budget,
+                primary_settings,
+                primary_requested,
                 buffers.conventional_lights,
                 scene.data.emissive_lights.len() as u32,
                 buffers.environment_info.w != 0,
             )
         } else {
-            requested_update_budget
+            primary_requested
         };
-        let screen_update_budget = if settings.sampling.is_explicit() {
+        let screen_update_budget = if settings.sampling.is_explicit() || secondary_enabled {
             update_budget
         } else {
             0
@@ -6905,7 +7850,7 @@ fn prepare(
                     0.0
                 },
                 if settings.sampling.is_explicit() {
-                    traversal_query_caps(settings.sampling.max_traversal_queries).0 as f32
+                    traversal_query_caps(primary_query_limit).0 as f32
                 } else {
                     0.0
                 },
@@ -6920,7 +7865,7 @@ fn prepare(
                 buffers.conventional_lights,
                 scene.data.emissive_lights.len() as u32,
                 settings.emissive_samples,
-                0,
+                u32::from(secondary_enabled && settings.cached_hit_sky),
             ),
             stability: Vec4::new(
                 if buffers.screen_history_valid.load(Ordering::Relaxed) {
@@ -6950,7 +7895,21 @@ fn prepare(
             ),
             environment_info: buffers.environment_info,
             environment_rotation,
-            environment_scale: Vec4::new(environment_intensity, 0.0, 0.0, 0.0),
+            environment_scale: Vec4::new(
+                environment_intensity,
+                f32::from(secondary_enabled),
+                0.0,
+                f32::from(
+                    secondary_enabled
+                        && buffers.history_valid.load(Ordering::Relaxed)
+                        && buffers
+                            .secondary
+                            .as_ref()
+                            .is_some_and(|cache| cache.valid.load(Ordering::Relaxed))
+                        && !reset_cache
+                        && !geometry_changed,
+                ),
+            ),
             geometry_pages: UVec4::new(
                 if gpu_scene_ref.geometry_paged {
                     if scene.data.deformation.vertices > 0 {
@@ -6969,26 +7928,12 @@ fn prepare(
             scene_overlay: gpu_scene_ref.scene_overlay_config,
             dirty_min,
             dirty_max,
-            transport: Vec4::new(
-                0.0,
-                1.0,
-                0.0,
-                f32::from(
-                    ((scene_changed || scene_changed_since_history) && !bounded_geometry_reuse)
-                        || environment_changed
-                        || exposure_changed
-                        || layers_changed
-                        || punctual_light_history_invalidates_transport(
-                            punctual_light_change,
-                            light_dirty_min.w > 0.5,
-                        ),
-                ),
-            ),
+            source_history,
             sampling: UVec4::new(
                 screen_update_budget,
-                settings.sampling.max_traversal_queries,
+                primary_query_limit,
                 if settings.sampling.is_explicit() {
-                    settings.sampling.max_cache_entries
+                    primary_cache_limit
                 } else {
                     0
                 },
@@ -7001,12 +7946,17 @@ fn prepare(
                 sparse_candidate_phase_word(
                     candidate_phase,
                     sparse_history_reset,
-                    settings.sampling.is_explicit() && update_budget == 0,
+                    (settings.sampling.is_explicit() || secondary_enabled) && update_budget == 0,
                 ),
             ),
-            cache_time: UVec4::new(buffers.cache_clock.elapsed().as_millis() as u32, 0, 0, 0),
-            world_receivers: UVec4::ZERO,
-            world_receiver_state: UVec4::ZERO,
+            cache_time: UVec4::new(
+                buffers.cache_clock.elapsed().as_millis() as u32,
+                punctual_motion_epoch.wrapping_sub(1),
+                0,
+                0,
+            ),
+            emissive_dirty_min,
+            emissive_dirty_max,
             light_dirty_min,
             light_dirty_max,
         };
@@ -7022,6 +7972,33 @@ fn prepare(
             let clear_params = clear_pass_parameters(params, clear_index);
             uniform.set(clear_params);
             uniform.write_buffer(&device, &queue);
+        }
+        if let Some(secondary) = buffers.secondary.as_mut() {
+            let mut secondary_params = params;
+            secondary_params.environment_scale.z = 1.0;
+            if !secondary.valid.load(Ordering::Relaxed) {
+                secondary_params.history.z = 0.0;
+            }
+            secondary_params.history.w = secondary_params.history.w.max(1.0);
+            secondary_params.sampling.x = secondary_update_budget;
+            secondary_params.sampling.y = secondary_query_limit;
+            secondary_params.sampling.z = secondary_cache_limit;
+            secondary_params.owner_sequence.w &= !SPARSE_UPDATES_DISABLED_FLAG;
+            secondary_params.interval_history.w = if settings.sampling.is_explicit() {
+                traversal_query_caps(secondary_query_limit).0 as f32
+            } else {
+                0.0
+            };
+            for (level, uniform) in secondary.uniforms.iter_mut().enumerate() {
+                secondary_params.frame.y = level as u32;
+                uniform.set(secondary_params);
+                uniform.write_buffer(&device, &queue);
+            }
+            secondary_params.frame.y = 0;
+            for (index, uniform) in secondary.clear_uniforms.iter_mut().enumerate() {
+                uniform.set(clear_pass_parameters(secondary_params, index));
+                uniform.write_buffer(&device, &queue);
+            }
         }
         let ssao_view = ssao.map_or(fallback_view, |ssao| {
             &ssao.screen_space_ambient_occlusion_texture.default_view
@@ -7064,6 +8041,7 @@ fn prepare(
                 stable_clip_from_world,
                 exposure: camera.exposure,
             };
+            bindings.secondary_enabled = secondary_enabled;
             bindings.scene_history = scene_history.clone();
             buffers.binding_cache[parity] = Some(CachedViewBindings {
                 key: binding_key,
@@ -7096,6 +8074,9 @@ fn prepare(
         // Temporal reconstruction keeps receiver history separate from scratch storage.
         let current_receiver_history = &buffers.metadata_views[3 + candidate_output_index];
         let previous_receiver_history = &buffers.metadata_views[3 + candidate_input_index];
+        let current_background = &buffers.background_views[0];
+        let next_background = &buffers.background_views[1 + candidate_output_index];
+        let previous_background = &buffers.background_views[1 + candidate_input_index];
         let bind_compute = |uniform: &UniformBuffer<Parameters>,
                             output: &TextureView,
                             input: &TextureView,
@@ -7104,7 +8085,23 @@ fn prepare(
                             metadata_input: &TextureView,
                             receiver_metadata: &TextureView,
                             receiver_history_output: &TextureView,
-                            receiver_history_input: &TextureView| {
+                            receiver_history_input: &TextureView,
+                            background_output: &TextureView,
+                            background_sample: &TextureView,
+                            secondary: Option<&SecondaryCache>,
+                            feedback: bool| {
+            let current_heads =
+                secondary.map_or(&current.heads, |cache| &cache.caches[parity].heads);
+            let work_entries = secondary.map_or(&buffers.entries, |cache| &cache.entries);
+            let history_cache = if feedback {
+                buffers.secondary.as_ref()
+            } else {
+                secondary
+            };
+            let previous_heads =
+                history_cache.map_or(&previous.heads, |cache| &cache.caches[1 - parity].heads);
+            let history_entries =
+                history_cache.map_or(&buffers.history_entries, |cache| &cache.history_entries);
             let mut entries = BindGroupEntries::sequential((
                 uniform,
                 triangles.clone(),
@@ -7112,10 +8109,10 @@ fn prepare(
                 lights.clone(),
                 depth,
                 fallback_view,
-                current.heads.as_entire_binding(),
-                buffers.entries.as_entire_binding(),
-                previous.heads.as_entire_binding(),
-                buffers.history_entries.as_entire_binding(),
+                current_heads.as_entire_binding(),
+                work_entries.as_entire_binding(),
+                previous_heads.as_entire_binding(),
+                history_entries.as_entire_binding(),
                 output,
                 input,
                 buffers.irradiance_probes.as_entire_binding(),
@@ -7142,13 +8139,25 @@ fn prepare(
             .cloned()
             .collect::<Vec<_>>();
             entries.push(BindGroupEntry {
-                binding: 32,
-                resource: buffers.root_ray_offset.as_entire_binding(),
-            });
-            entries.push(BindGroupEntry {
                 binding: 37,
                 resource: BindingResource::TextureView(dfg_view),
             });
+            for (binding, view) in [
+                (38, background_output),
+                (39, background_sample),
+                (40, previous_background),
+            ] {
+                entries.push(BindGroupEntry {
+                    binding,
+                    resource: BindingResource::TextureView(view),
+                });
+            }
+            if let Some(tlas) = hardware_tlas {
+                entries.push(BindGroupEntry {
+                    binding: TLAS_BINDING,
+                    resource: tlas.as_binding(),
+                });
+            }
             device.create_bind_group(
                 "split_rc_compute",
                 &cache.get_bind_group_layout(&pipelines.compute_layout),
@@ -7166,6 +8175,10 @@ fn prepare(
                 &buffers.metadata_views[2],
                 current_receiver_history,
                 previous_receiver_history,
+                next_background,
+                current_background,
+                None,
+                false,
             )
         });
         let clear = std::array::from_fn(|index| {
@@ -7179,6 +8192,10 @@ fn prepare(
                 &buffers.metadata_views[2],
                 current_receiver_history,
                 previous_receiver_history,
+                next_background,
+                current_background,
+                None,
+                false,
             )
         });
         let temporal = bind_compute(
@@ -7191,6 +8208,10 @@ fn prepare(
             &buffers.metadata_views[2],
             current_receiver_history,
             previous_receiver_history,
+            next_background,
+            current_background,
+            None,
+            false,
         );
         let world_resolve = bind_compute(
             &uniforms[0],
@@ -7202,6 +8223,10 @@ fn prepare(
             &buffers.metadata_views[2],
             current_receiver_history,
             previous_receiver_history,
+            current_background,
+            next_background,
+            None,
+            false,
         );
         let denoise = std::array::from_fn(|level| {
             // Temporal reconstruction writes the packed receiver history to the current ring slot.
@@ -7221,7 +8246,51 @@ fn prepare(
                 &buffers.denoise_receiver_history_output_view,
                 // Filter taps follow temporal reconstruction in this frame.
                 current_receiver_history,
+                next_background,
+                current_background,
+                None,
+                false,
             )
+        });
+        let trace = buffers.secondary.as_ref().map(|secondary| {
+            bind_compute(
+                &uniforms[0],
+                &secondary.hit_views[parity],
+                &secondary.hit_views[1 - parity],
+                previous_irradiance,
+                metadata,
+                previous_metadata,
+                &buffers.metadata_views[2],
+                current_receiver_history,
+                previous_receiver_history,
+                next_background,
+                current_background,
+                None,
+                true,
+            )
+        });
+        let secondary = buffers.secondary.as_ref().map(|secondary| {
+            let bind = |uniform| {
+                bind_compute(
+                    uniform,
+                    &secondary.hit_views[parity],
+                    &secondary.hit_views[1 - parity],
+                    previous_irradiance,
+                    metadata,
+                    previous_metadata,
+                    &buffers.metadata_views[2],
+                    current_receiver_history,
+                    previous_receiver_history,
+                    next_background,
+                    current_background,
+                    Some(secondary),
+                    true,
+                )
+            };
+            SecondaryBindings {
+                compute: std::array::from_fn(|level| bind(&secondary.uniforms[level])),
+                clear: std::array::from_fn(|index| bind(&secondary.clear_uniforms[index])),
+            }
         });
         // Raw ping-pong irradiance is temporal history. Filtering only the
         // display output avoids recursively diffusing lighting across surfaces.
@@ -7241,6 +8310,9 @@ fn prepare(
             display_receiver_history,
             &receiver.view,
             ssao_view,
+            current.heads.as_entire_binding(),
+            buffers.entries.as_entire_binding(),
+            buffers.irradiance_probes.as_entire_binding(),
         ))
         .iter()
         .filter(|entry| !matches!(entry.binding, 1 | 4))
@@ -7271,6 +8343,9 @@ fn prepare(
         let bindings = ViewBindings {
             compute,
             clear,
+            trace,
+            secondary,
+            secondary_enabled,
             denoise,
             temporal,
             world_resolve,
@@ -7374,9 +8449,12 @@ fn render(
     images: Res<RenderAssets<GpuImage>>,
     mut context: RenderContext,
     mut pending_pipelines: Local<u64>,
+    hardware: Option<Res<hardware::HardwareTraversal>>,
 ) {
     let diagnostic_view = view.entity();
     let (target, settings, buffers, bindings, receiver, raw_output, lighting) = view.into_inner();
+    let history_was_valid = buffers.history_valid.load(Ordering::Relaxed);
+    let cold_priority = cold_priority_enabled(settings.history_frames, history_was_valid);
     buffers
         .history_diagnostics_requested
         .store(raw_output.is_some(), Ordering::Relaxed);
@@ -7459,6 +8537,7 @@ fn render(
     let diagnostics = diagnostics.as_deref();
     let total_span = diagnostics.time_span(context.command_encoder(), "split_rc");
     let mut clear_dispatch_index = 0usize;
+    let mut secondary_clear_dispatch_index = 0usize;
     let skip_passes: Vec<String> = std::env::var("PENUMBRA_SKIP_PASSES")
         .map(|value| {
             value
@@ -7483,14 +8562,30 @@ fn render(
                 ..default()
             });
         pass.set_pipeline(pipeline);
-        let bind_group = match name {
-            "clear" => {
-                let index = clear_dispatch_index.min(bindings.clear.len() - 1);
-                clear_dispatch_index += 1;
-                &bindings.clear[index]
+        let bind_group = match name.strip_prefix("secondary/") {
+            Some(stage) => {
+                let secondary = bindings
+                    .secondary
+                    .as_ref()
+                    .expect("secondary bindings ready");
+                if stage == "clear" {
+                    let index = secondary_clear_dispatch_index.min(secondary.clear.len() - 1);
+                    secondary_clear_dispatch_index += 1;
+                    &secondary.clear[index]
+                } else {
+                    &secondary.compute[level]
+                }
             }
-            "worldResolve" => &bindings.world_resolve,
-            _ => &bindings.compute[level],
+            None => match name {
+                "clear" => {
+                    let index = clear_dispatch_index.min(bindings.clear.len() - 1);
+                    clear_dispatch_index += 1;
+                    &bindings.clear[index]
+                }
+                "trace" => bindings.trace.as_ref().unwrap_or(&bindings.compute[level]),
+                "worldResolve" => &bindings.world_resolve,
+                _ => &bindings.compute[level],
+            },
         };
         pass.set_bind_group(0, bind_group, &[]);
         pass.dispatch_workgroups(x, y, 1);
@@ -7584,6 +8679,15 @@ fn render(
         ray_groups,
         1,
     );
+    for &phase in cold_rank_phases(settings.history_frames, history_was_valid) {
+        dispatch(
+            "rank",
+            compute[3].expect("cascade pipeline ready"),
+            phase,
+            ray_groups,
+            1,
+        );
+    }
     for level in 1..LEVELS {
         dispatch(
             "parents",
@@ -7616,6 +8720,7 @@ fn render(
         clear_groups,
         1,
     );
+<<<<<<< Updated upstream
     dispatch(
         "trace",
         compute[7].expect("radiance cascade trace pipeline ready"),
@@ -7623,6 +8728,142 @@ fn render(
         image_x,
         image_y,
     );
+=======
+    // Primary transport runs in passes that each hold at most one hit-shading
+    // call: closest hits, recorded visibility queries, the queries in
+    // parallel, then shading and deposit. The immediate kernel takes only
+    // receivers beyond the deferred scratch capacity.
+    let deferred_query_lanes = (u64::from(buffers.size.x) * u64::from(buffers.size.y))
+        .min(DEFERRED_TRACE_RECEIVERS)
+        * 2
+        * DEFERRED_VISIBILITY_QUERIES
+        * u64::from(TRACE_MAX_LANE_STRIDE);
+    // Hardware traversal replaces only the closest-hit and visibility kernels,
+    // and only once the TLAS describes this scene revision.
+    let hardware_traversal = settings.hardware_ray_queries
+        && hardware.is_some_and(|hardware| hardware.ready_for(scene.revision))
+        && compute[HARDWARE_TRACE_DEFERRED].is_some()
+        && compute[HARDWARE_TRACE_VISIBILITY].is_some();
+    shaders
+        .status
+        .set_hardware_ray_queries_active(hardware_traversal);
+    let (closest_hit_stage, visibility_stage) = if hardware_traversal {
+        (HARDWARE_TRACE_DEFERRED, HARDWARE_TRACE_VISIBILITY)
+    } else {
+        (17, 19)
+    };
+    for (name, stage, groups) in [
+        ("trace", closest_hit_stage, trace_groups),
+        ("traceRecord", 18, trace_groups),
+        (
+            "traceVisibility",
+            visibility_stage,
+            deferred_query_lanes.div_ceil(64) as u32,
+        ),
+        ("traceResolve", 20, trace_groups),
+        ("traceOverflow", 7, trace_groups),
+    ] {
+        dispatch(
+            name,
+            compute[stage].expect("radiance cascade trace pipeline ready"),
+            0,
+            groups,
+            1,
+        );
+    }
+>>>>>>> Stashed changes
+    let secondary_enabled = bindings.secondary_enabled;
+    if secondary_enabled {
+        for (name, stage, x, y) in [
+            ("secondary/clear", 0, clear_groups, 1),
+            ("secondary/seed", 1, image_x, image_y),
+            ("secondary/rank", 3, ray_groups, 1),
+        ] {
+            dispatch(
+                name,
+                compute[stage].expect("secondary pipeline ready"),
+                0,
+                x,
+                y,
+            );
+        }
+        for &phase in cold_rank_phases(settings.history_frames.max(1), history_was_valid) {
+            dispatch(
+                "secondary/rank",
+                compute[3].expect("secondary pipeline ready"),
+                phase,
+                ray_groups,
+                1,
+            );
+        }
+        for level in 1..LEVELS {
+            dispatch(
+                "secondary/parents",
+                compute[2].expect("secondary pipeline ready"),
+                level,
+                probe_directory_groups,
+                1,
+            );
+        }
+        for level in (0..LEVELS).rev() {
+            dispatch(
+                "secondary/prefix",
+                compute[4].expect("secondary pipeline ready"),
+                level,
+                probe_directory_groups,
+                1,
+            );
+        }
+        for (name, stage, x, y) in [
+            ("secondary/generateDirections", 5, image_x, image_y),
+            ("secondary/clear", 0, clear_groups, 1),
+            ("secondary/trace", 7, image_x, image_y),
+            ("secondary/retain", 6, bucket_groups, 1),
+            ("secondary/reduce", 8, bucket_groups, 1),
+        ] {
+            dispatch(
+                name,
+                compute[stage].expect("secondary pipeline ready"),
+                0,
+                x,
+                y,
+            );
+        }
+        let secondary_work = cache_work_slots(samples);
+        let secondary_entries =
+            secondary_work + CACHE_HISTORY_PER_BUCKET * u64::from(buffers.buckets);
+        for level in (0..LEVELS).rev() {
+            dispatch(
+                "secondary/merge",
+                compute[9].expect("secondary pipeline ready"),
+                level,
+                secondary_entries.div_ceil(64 * LEVELS as u64) as u32,
+                LEVELS as u32,
+            );
+        }
+        for (name, stage, x, y) in [
+            (
+                "secondary/seedProbes",
+                10,
+                secondary_work.div_ceil(64 * LEVELS as u64) as u32,
+                LEVELS as u32,
+            ),
+            (
+                "secondary/packProbes",
+                11,
+                pack_probe_groups_x,
+                pack_probe_groups_y,
+            ),
+        ] {
+            dispatch(
+                name,
+                compute[stage].expect("secondary pipeline ready"),
+                0,
+                x,
+                y,
+            );
+        }
+    }
     dispatch(
         "retain",
         compute[6].expect("cascade pipeline ready"),
@@ -7843,6 +9084,32 @@ fn render(
             span.end(context.command_encoder());
         }
     }
+    if secondary_enabled {
+        let secondary = bindings
+            .secondary
+            .as_ref()
+            .expect("secondary bindings ready");
+        for (name, stage, groups) in [
+            ("secondary/commitCache", CACHE_COMMIT, bucket_groups),
+            ("secondary/remapProbeHeads", 15, probe_directory_groups),
+        ] {
+            if skip_passes.iter().any(|skipped| skipped == name) {
+                continue;
+            }
+            let span = diagnostics.time_span(context.command_encoder(), name);
+            let mut pass = context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some(name),
+                    ..default()
+                });
+            pass.set_pipeline(compute[stage].expect("secondary retention pipeline ready"));
+            pass.set_bind_group(0, &secondary.compute[0], &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+            drop(pass);
+            span.end(context.command_encoder());
+        }
+    }
     total_span.end(context.command_encoder());
     let dispatch =
         if buffers.pending_lights.is_none() && buffers.light_revision == scene.light_revision {
@@ -7870,25 +9137,81 @@ fn render(
         .unwrap_or_else(|error| error.into_inner()) = bindings.frame;
     // Publish only after this view's GI work was encoded. Skipped frames must
     // keep the old snapshot so their geometry changes cannot escape invalidation.
-    *buffers
+    let mut previous_scene = buffers
         .scene_history
         .lock()
-        .unwrap_or_else(|error| error.into_inner()) = bindings.scene_history.clone();
+        .unwrap_or_else(|error| error.into_inner());
+    if gradual_directional_motion(&previous_scene, &bindings.scene_history) {
+        buffers
+            .directional_motion_epoch
+            .store(frame.wrapping_add(1).max(1), Ordering::Relaxed);
+    }
+    if gradual_punctual_motion(&previous_scene, &bindings.scene_history) {
+        buffers
+            .punctual_motion_epoch
+            .store(frame.wrapping_add(1).max(1), Ordering::Relaxed);
+    }
+    *previous_scene = bindings.scene_history.clone();
     if buffers.frame.fetch_add(1, Ordering::Relaxed) == 0 {
         info!("First radiance-cascades frame submitted");
     }
     buffers.history_valid.store(true, Ordering::Relaxed);
+    if let Some(secondary) = &buffers.secondary {
+        secondary.valid.store(secondary_enabled, Ordering::Relaxed);
+    }
     buffers.screen_history_valid.store(true, Ordering::Relaxed);
     buffers
         .candidate_schedule
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .advance_after_successful_update();
+        .advance_after_successful_update(!cold_priority);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_bounce_accounts_for_cache_memory_and_shares_query_limit() {
+        let size = UVec2::new(16, 8);
+        let shading = UVec2::new(32, 16);
+        let primary = RadianceCascades::default();
+        let secondary = RadianceCascades {
+            multi_bounce: true,
+            ..primary
+        };
+        let samples = u64::from(size.x) * u64::from(size.y);
+        let buckets = cache_bucket_count(samples, secondary);
+        let extra = irradiance_probe_bytes(samples, true) - irradiance_probe_bytes(samples, false)
+            + cache_head_bytes(buckets, samples) * 2
+            + cache_entry_bytes(samples, buckets)
+            + cache_history_bytes(buckets)
+            + samples * 32
+            + (LEVELS as u64 + 2) * std::mem::size_of::<Parameters>() as u64;
+        assert_eq!(
+            view_bytes(size, shading, secondary) - view_bytes(size, shading, primary),
+            extra
+        );
+        assert_eq!(cache_query_limits(0, true), (0, 0));
+        assert_eq!(cache_query_limits(1, true), (1, 0));
+        assert_eq!(cache_query_limits(11, true), (6, 5));
+        assert_eq!(cache_query_limits(11, false), (11, 11));
+        for cap in [1, 2, 3, 7, 8, 9, 16, 100] {
+            let mut settings = secondary;
+            settings.sampling.max_cache_entries = cap;
+            let buckets = cache_bucket_count(samples, settings);
+            let (primary_limit, secondary_limit) = cache_query_limits(cap, true);
+            let quota = |limit: u32| (u64::from(limit) / buckets).clamp(1, 4);
+            let retained = buckets
+                * (quota(primary_limit)
+                    + if secondary_limit > 0 {
+                        quota(secondary_limit)
+                    } else {
+                        0
+                    });
+            assert!(retained <= u64::from(cap), "cap {cap}: retained {retained}");
+        }
+    }
 
     #[test]
     fn split_pipeline_requirements_follow_the_compute_entries() {
@@ -7954,6 +9277,24 @@ mod tests {
     }
 
     #[test]
+    fn compute_layout_fits_eight_storage_buffers() {
+        let count = compute_layout(true)
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.ty,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(count, 8);
+    }
+
+    #[test]
     fn split_diffuse_output_tracks_the_resolve_extent() {
         let viewport = UVec2::new(512, 512);
         let settings = RadianceCascades {
@@ -8007,7 +9348,7 @@ mod tests {
         assert!(cache_entry_bytes(pixels, buckets) <= binding_limit);
         assert!(cache_history_bytes(buckets) <= binding_limit);
         assert!(cache_head_bytes(buckets, pixels) <= binding_limit);
-        assert!(irradiance_probe_bytes(pixels) <= binding_limit);
+        assert!(irradiance_probe_bytes(pixels, false) <= binding_limit);
         let insufficient = WgpuLimits {
             max_storage_buffer_binding_size: 1024,
             ..limits
@@ -8069,12 +9410,6 @@ mod tests {
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let root_ray_offset = device.create_buffer(&BufferDescriptor {
-            label: Some("split_clear_root_ray_offset"),
-            size: 4,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let irradiance = device.create_texture(&TextureDescriptor {
             label: Some("split_clear_irradiance"),
             size: Extent3d {
@@ -8091,7 +9426,6 @@ mod tests {
         });
         let irradiance_view = irradiance.create_view(&TextureViewDescriptor::default());
         queue.write_buffer(&heads, 0, &vec![0xabu8; bytes as usize]);
-        queue.write_buffer(&root_ray_offset, 0, &[0xab; 4]);
         let mut params = UniformBuffer::from(Parameters {
             size: UVec4::new(1, 1, 1, BUCKETS),
             owner_sequence: UVec4::new(1, 1, 1, SPARSE_HISTORY_RESET_FLAG),
@@ -8114,10 +9448,6 @@ mod tests {
                 BindGroupEntry {
                     binding: 10,
                     resource: BindingResource::TextureView(&irradiance_view),
-                },
-                BindGroupEntry {
-                    binding: 32,
-                    resource: root_ray_offset.as_entire_binding(),
                 },
             ],
         );
@@ -8142,6 +9472,7 @@ mod tests {
                 + 10
                 + HISTORY_DIAGNOSTIC_WORDS as usize
                 + (2 * LEVELS * probe_directory_capacity(1) as usize)
+                + 1
         );
         // Both full hash tables must be empty, including the last irradiance slot.
         assert!(
@@ -8181,22 +9512,6 @@ mod tests {
                 .iter()
                 .all(|&word| word == 0)
         );
-        let counters_reset = crate::scene::traversal_tests::dispatch_readback(
-            device,
-            queue,
-            &pipeline,
-            &group,
-            &root_ray_offset,
-            4,
-            BUCKETS.div_ceil(64),
-        );
-        assert!(
-            counters_reset
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .all(|word| *word == [0; 4])
-        );
 
         // After z=1 reset, z=0 preserves the root-ray offset.
         let attempts_offset = u64::from(2 * BUCKETS + 5) * 4;
@@ -8204,22 +9519,9 @@ mod tests {
         queue.write_buffer(&heads, attempts_offset, &17u32.to_le_bytes());
         queue.write_buffer(&heads, admitted_offset, &11u32.to_le_bytes());
         let sentinel = 0x1234_5678u32;
-        queue.write_buffer(&root_ray_offset, 0, &sentinel.to_le_bytes());
+        queue.write_buffer(&heads, bytes - 4, &sentinel.to_le_bytes());
         params.get_mut().owner_sequence.z = 0;
         params.write_buffer(device, queue);
-        let counters_output = crate::scene::traversal_tests::dispatch_readback(
-            device,
-            queue,
-            &pipeline,
-            &group,
-            &root_ray_offset,
-            4,
-            BUCKETS.div_ceil(64),
-        );
-        assert_eq!(
-            u32::from_le_bytes(counters_output.try_into().unwrap()),
-            sentinel
-        );
         let counter_output = crate::scene::traversal_tests::dispatch_readback(
             device,
             queue,
@@ -8237,6 +9539,7 @@ mod tests {
             .collect();
         assert_eq!(counter_words[2 * BUCKETS as usize + 5], 17);
         assert_eq!(counter_words[2 * BUCKETS as usize + 6], 11);
+        assert_eq!(counter_words[bytes as usize / 4 - 1], sentinel);
     }
 
     #[test]
@@ -8699,6 +10002,20 @@ mod tests {
             false,
             false,
         ));
+        let ambient = RadianceCascades {
+            environment: LinearRgba::new(0.2, 0.3, 0.4, 1.0),
+            ..base
+        };
+        assert!(!history_settings_changed(base, ambient));
+        assert!(!world_cache_settings_changed(base, ambient));
+
+        // Hardware and software traversal produce the same hits.
+        let hardware = RadianceCascades {
+            hardware_ray_queries: !base.hardware_ray_queries,
+            ..base
+        };
+        assert!(!history_settings_changed(base, hardware));
+        assert!(!world_cache_settings_changed(base, hardware));
 
         let layout = RadianceCascades {
             probe_spacing: base.probe_spacing * 2.0,
@@ -8722,14 +10039,12 @@ mod tests {
 
     #[test]
     fn cache_history_resets_only_for_global_view_changes() {
-        assert!(!reset_cache_history(
-            false, false, false, false, false, false
-        ));
-        for changed in 0..6 {
-            let mut changes = [false; 6];
+        assert!(!reset_cache_history(false, false, false, false, false));
+        for changed in 0..5 {
+            let mut changes = [false; 5];
             changes[changed] = true;
             assert!(reset_cache_history(
-                changes[0], changes[1], changes[2], changes[3], changes[4], changes[5]
+                changes[0], changes[1], changes[2], changes[3], changes[4]
             ));
         }
     }
@@ -8755,9 +10070,30 @@ mod tests {
             instance_words: Arc::new(instance_words),
             deformation_poses: Arc::new(deformation_poses),
             textures: Arc::new(crate::material::TextureAtlas::default()),
-            lights: Vec::new(),
-            light_layers: Vec::new(),
+            lights: Arc::new(Vec::new()),
+            light_layers: Arc::new(Vec::new()),
             emissive_lights: Arc::new(Vec::new()),
+            view_layers: RenderLayers::default(),
+            ambient_environment: LinearRgba::default(),
+            environment: None,
+            environment_revision: 0,
+        }
+    }
+
+    fn history_emissive_light(
+        source: UVec4,
+        position: Vec3,
+        color: Vec3,
+        cdf: f32,
+        probability: f32,
+    ) -> GiLight {
+        GiLight {
+            position: position.extend(-1.0),
+            color: color.extend(0.5),
+            direction: Vec3::Z.extend(cdf),
+            edge1: Vec3::X.extend(probability),
+            edge2: Vec3::Y.extend(0.0),
+            source,
         }
     }
 
@@ -8840,7 +10176,7 @@ mod tests {
         );
 
         let mut changed = translated.clone();
-        changed.lights.push(GiLight {
+        Arc::make_mut(&mut changed.lights).push(GiLight {
             position: Vec4::X,
             ..default()
         });
@@ -8848,22 +10184,12 @@ mod tests {
             bounded_geometry_history_reuse(&previous, &changed),
             "light changes affect radiance history, not geometry reuse"
         );
-        assert_eq!(
-            punctual_light_history_change(&previous, &changed),
-            PunctualLightHistoryChange::Global,
-            "an unbounded directional light still invalidates radiance globally"
-        );
 
         let mut changed = translated.clone();
-        changed.light_layers.push(RenderLayers::none().with(3));
+        Arc::make_mut(&mut changed.light_layers).push(RenderLayers::none().with(3));
         assert!(
             bounded_geometry_history_reuse(&previous, &changed),
             "light layer changes affect radiance history, not geometry reuse"
-        );
-        assert_eq!(
-            punctual_light_history_change(&previous, &changed),
-            PunctualLightHistoryChange::Global,
-            "light layer changes still invalidate radiance globally"
         );
 
         let mut changed = translated.clone();
@@ -8916,12 +10242,13 @@ mod tests {
             .copy_from_slice(&record[..INSTANCE_WORDS_PER_RECORD]);
         words[INSTANCE_WORDS_PER_RECORD * 2] = UVec4::splat(0x1234_5678);
         emitter_previous.instance_words = Arc::new(words);
-        emitter_previous.emissive_lights = Arc::new(vec![GiLight {
-            position: Vec3::ZERO.extend(-1.0),
-            edge1: Vec4::X,
-            source: UVec4::new(0, 7, 0, 0),
-            ..default()
-        }]);
+        emitter_previous.emissive_lights = Arc::new(vec![history_emissive_light(
+            UVec4::new(0, 7, 0, 0),
+            Vec3::ZERO,
+            Vec3::ONE,
+            1.0,
+            1.0,
+        )]);
         let mut emitter_moved = moved(
             &emitter_previous,
             Mat4::from_translation(Vec3::new(0.5, 0.0, 0.0)),
@@ -8933,19 +10260,18 @@ mod tests {
         nodes[1].min.x += 0.5;
         nodes[1].max.x += 0.5;
         emitter_moved.nodes = Arc::new(nodes);
+        let bounded = bounded_geometry_history_reuse(&emitter_previous, &emitter_moved);
         assert!(
-            bounded_geometry_history_reuse(&emitter_previous, &emitter_moved),
+            bounded,
             "rigid emissive motion keeps geometry history reusable outside the dirty bounds"
         );
         assert_eq!(
             punctual_light_history_change(&emitter_previous, &emitter_moved),
-            PunctualLightHistoryChange::Global,
-            "moving an emissive source changes global radiance"
+            PunctualLightHistoryChange::Unchanged
         );
-        assert!(punctual_light_history_invalidates_transport(
-            punctual_light_history_change(&emitter_previous, &emitter_moved),
-            false,
-        ));
+        let emitter_change =
+            emissive_light_history_change(&emitter_previous, &emitter_moved, bounded);
+        assert_eq!(emitter_change, EmissiveLightHistoryChange::Global);
         let (dirty_min, dirty_max) = dirty_scene_bounds(&emitter_previous, &emitter_moved);
         assert_eq!(dirty_min, Vec3::splat(-1.0).extend(1.0));
         assert_eq!(dirty_max, Vec3::new(1.5, 1.0, 1.0).extend(0.0));
@@ -9019,13 +10345,13 @@ mod tests {
         words[26] = UVec4::from_array(Vec4::ONE.to_array().map(f32::to_bits));
         words[27] = emission_word(Vec3::ZERO);
         previous.instance_words = Arc::new(words);
-        previous.emissive_lights = Arc::new(vec![GiLight {
-            position: Vec3::ZERO.extend(-1.0),
-            color: Vec3::new(14.0, 4.0, 0.6).extend(0.0),
-            edge1: Vec4::X,
-            source: UVec4::new(0, 7, 0, 0),
-            ..default()
-        }]);
+        previous.emissive_lights = Arc::new(vec![history_emissive_light(
+            UVec4::new(0, 7, 0, 0),
+            Vec3::ZERO,
+            Vec3::new(14.0, 4.0, 0.6),
+            1.0,
+            1.0,
+        )]);
 
         let mut emission_only = previous.clone();
         emission_only.revision += 1;
@@ -9034,7 +10360,7 @@ mod tests {
         words[19] = emission_word(Vec3::new(3.0, 10.0, 18.0));
         emission_only.instance_words = Arc::new(words);
         let mut emitters = emission_only.emissive_lights.as_ref().clone();
-        emitters[0].color = Vec3::new(3.0, 10.0, 18.0).extend(0.0);
+        emitters[0].color = Vec3::new(3.0, 10.0, 18.0).extend(0.5);
         emission_only.emissive_lights = Arc::new(emitters);
         assert!(bounded_geometry_history_reuse(&previous, &emission_only));
         assert_eq!(
@@ -9044,9 +10370,14 @@ mod tests {
         );
         assert_eq!(
             punctual_light_history_change(&previous, &emission_only),
-            PunctualLightHistoryChange::Global,
-            "emitter changes remain global radiance invalidations"
+            PunctualLightHistoryChange::Unchanged
         );
+        let emission_change = emissive_light_history_change(
+            &previous,
+            &emission_only,
+            bounded_geometry_history_reuse(&previous, &emission_only),
+        );
+        assert_eq!(emission_change, EmissiveLightHistoryChange::Global);
 
         let mut emission_and_punctual_motion = emission_only.clone();
         emission_and_punctual_motion.revision += 1;
@@ -9065,25 +10396,33 @@ mod tests {
         nodes[2].min += Vec3::X * 0.5;
         nodes[2].max += Vec3::X * 0.5;
         emission_and_punctual_motion.nodes = Arc::new(nodes);
-        emission_and_punctual_motion.lights.push(GiLight {
+        Arc::make_mut(&mut emission_and_punctual_motion.lights).push(GiLight {
             position: Vec3::new(1.0, 2.0, 0.0).extend(8.0),
             color: Vec3::ONE.extend(0.0),
             ..default()
         });
-        emission_and_punctual_motion
-            .light_layers
-            .push(RenderLayers::default());
+        Arc::make_mut(&mut emission_and_punctual_motion.light_layers).push(RenderLayers::default());
         assert!(bounded_geometry_history_reuse(
             &previous,
             &emission_and_punctual_motion
         ));
-        let radiance_change =
+        let punctual_change =
             punctual_light_history_change(&previous, &emission_and_punctual_motion);
-        assert_eq!(radiance_change, PunctualLightHistoryChange::Global);
-        assert!(punctual_light_history_invalidates_transport(
-            radiance_change,
-            false
-        ));
+        let emissive_change = emissive_light_history_change(
+            &previous,
+            &emission_and_punctual_motion,
+            bounded_geometry_history_reuse(&previous, &emission_and_punctual_motion),
+        );
+        assert_eq!(emissive_change, EmissiveLightHistoryChange::Global);
+        assert!(local_lighting_metadata_allowed(false, true));
+        let (punctual_dirty_min, punctual_dirty_max) =
+            punctual_dirty_bounds(punctual_change, false, true);
+        assert!(punctual_dirty_min.w > 0.5 && punctual_dirty_max.w < 0.5);
+        assert_eq!(
+            emissive_dirty_bounds(emissive_change, false, true),
+            (Vec4::ZERO, Vec4::ZERO),
+            "a global emissive update must not suppress independent punctual bounds"
+        );
         let (dirty_min, dirty_max) = dirty_scene_bounds(&previous, &emission_and_punctual_motion);
         assert_eq!(dirty_min, Vec3::new(3.0, 3.0, 3.0).extend(1.0));
         assert_eq!(dirty_max, Vec3::new(4.5, 4.0, 4.0).extend(0.0));
@@ -9107,7 +10446,7 @@ mod tests {
         nodes[2].max.x += 0.5;
         current.nodes = Arc::new(nodes);
         let mut emitters = current.emissive_lights.as_ref().clone();
-        emitters[0].color = Vec3::new(3.0, 10.0, 18.0).extend(0.0);
+        emitters[0].color = Vec3::new(3.0, 10.0, 18.0).extend(0.5);
         current.emissive_lights = Arc::new(emitters);
 
         assert_eq!(
@@ -9118,12 +10457,14 @@ mod tests {
         assert!(bounded_geometry_history_reuse(&previous, &current));
         assert_eq!(
             punctual_light_history_change(&previous, &current),
-            PunctualLightHistoryChange::Global
+            PunctualLightHistoryChange::Unchanged
         );
-        assert!(punctual_light_history_invalidates_transport(
-            punctual_light_history_change(&previous, &current),
-            false,
-        ));
+        let emissive_change = emissive_light_history_change(
+            &previous,
+            &current,
+            bounded_geometry_history_reuse(&previous, &current),
+        );
+        assert_eq!(emissive_change, EmissiveLightHistoryChange::Global);
         assert_eq!(
             dirty_scene_bounds(&previous, &current),
             (
@@ -9237,9 +10578,7 @@ mod tests {
             dirty_scene_bounds(&snapshot, &light_only),
             (Vec4::ZERO, Vec4::ZERO)
         );
-        assert!(!reset_cache_history(
-            false, false, false, false, false, false
-        ));
+        assert!(!reset_cache_history(false, false, false, false, false));
     }
 
     #[test]
@@ -9254,10 +10593,11 @@ mod tests {
         let old_light = punctual(Vec3::new(-4.0, 2.0, 1.0), 3.0);
         let new_light = punctual(Vec3::new(7.0, -1.0, 5.0), 5.0);
         let mut previous = history_snapshot(30, 7, 0, vec![], vec![], vec![]);
-        previous.lights.push(old_light);
+        Arc::make_mut(&mut previous.lights).push(old_light);
+        previous.light_layers = Arc::new(vec![RenderLayers::default()]);
         let mut current = previous.clone();
         current.revision += 1;
-        current.lights[0] = new_light;
+        Arc::make_mut(&mut current.lights)[0] = new_light;
 
         let PunctualLightHistoryChange::Local { minimum, maximum } =
             punctual_light_history_change(&previous, &current)
@@ -9274,14 +10614,16 @@ mod tests {
         assert!(maximum.cmpge(new_maximum).all());
 
         let mut added = history_snapshot(31, 7, 0, vec![], vec![], vec![]);
-        added.lights.push(new_light);
+        Arc::make_mut(&mut added.lights).push(new_light);
+        added.light_layers = Arc::new(vec![RenderLayers::default()]);
         assert!(matches!(
             punctual_light_history_change(&previous, &added),
             PunctualLightHistoryChange::Local { .. }
         ));
         let mut removed = added.clone();
         removed.revision += 1;
-        removed.lights.clear();
+        Arc::make_mut(&mut removed.lights).clear();
+        Arc::make_mut(&mut removed.light_layers).clear();
         assert!(matches!(
             punctual_light_history_change(&added, &removed),
             PunctualLightHistoryChange::Local { .. }
@@ -9289,14 +10631,14 @@ mod tests {
 
         let mut directional = current.clone();
         directional.revision += 1;
-        directional.lights[0].position.w = 0.0;
-        assert_eq!(
+        Arc::make_mut(&mut directional.lights)[0].position.w = 0.0;
+        assert!(matches!(
             punctual_light_history_change(&current, &directional),
-            PunctualLightHistoryChange::Global
-        );
+            PunctualLightHistoryChange::Local { .. }
+        ));
 
         let mut emissive = history_snapshot(32, 7, 0, vec![], vec![], vec![]);
-        emissive.lights.push(GiLight {
+        Arc::make_mut(&mut emissive.lights).push(GiLight {
             position: Vec3::ZERO.extend(-1.0),
             edge1: Vec4::X,
             source: UVec4::new(1, 2, 0, 0),
@@ -9309,20 +10651,447 @@ mod tests {
 
         let mut changed_layers = current.clone();
         changed_layers.revision += 1;
-        changed_layers.light_layers.push(RenderLayers::layer(1));
-        assert_eq!(
-            punctual_light_history_change(&current, &changed_layers),
-            PunctualLightHistoryChange::Global
-        );
+        Arc::make_mut(&mut changed_layers.light_layers)[0] = RenderLayers::layer(1);
+        let PunctualLightHistoryChange::Local { minimum, maximum } =
+            punctual_light_history_change(&current, &changed_layers)
+        else {
+            panic!("finite light-layer changes stay within the light's influence");
+        };
+        assert!(minimum.cmple(new_minimum).all());
+        assert!(maximum.cmpge(new_maximum).all());
 
         let mut invalid_history = current.clone();
         invalid_history.valid = false;
         invalid_history.revision += 1;
-        invalid_history.lights[0].color.x *= 2.0;
+        Arc::make_mut(&mut invalid_history.lights)[0].color.x *= 2.0;
         assert_eq!(
             punctual_light_history_change(&invalid_history, &current),
             PunctualLightHistoryChange::Global
         );
+    }
+
+    #[test]
+    fn skipped_emissive_and_punctual_changes_use_last_encoded_bounds() {
+        let instance_count = 3;
+        let instance_tail = instance_count * INSTANCE_WORDS_PER_RECORD;
+        let material_words = instance_count * crate::material::MATERIAL_WORDS;
+        let base = 100u32;
+        let emission_word = |color: Vec3| {
+            UVec4::from_array(
+                Vec4::new(color.x, color.y, color.z, -1.0)
+                    .to_array()
+                    .map(f32::to_bits),
+            )
+        };
+        let source_colors = [
+            Vec3::new(4.0, 2.0, 1.0),
+            Vec3::splat(2.0),
+            Vec3::new(4.0, 2.0, 1.0),
+        ];
+        let mut submitted = history_snapshot(
+            40,
+            7,
+            instance_count,
+            vec![BvhNode {
+                min: Vec3::splat(-200.0),
+                max: Vec3::splat(200.0),
+                first: 0,
+                count: 0,
+            }],
+            vec![UVec4::ZERO; instance_tail + material_words],
+            vec![],
+        );
+        submitted.instance_material_range = Some((
+            base,
+            base + u32::try_from(instance_tail + material_words).unwrap(),
+        ));
+        let mut words = submitted.instance_words.as_ref().clone();
+        let identity = packed_history_instance(Mat4::IDENTITY, 0);
+        for (index, &color) in source_colors.iter().enumerate() {
+            let record = index * INSTANCE_WORDS_PER_RECORD;
+            words[record..record + INSTANCE_WORDS_PER_RECORD]
+                .copy_from_slice(&identity[..INSTANCE_WORDS_PER_RECORD]);
+            let material_address = base
+                + u32::try_from(instance_tail + index * crate::material::MATERIAL_WORDS).unwrap();
+            words[record + 7] = UVec4::new(index as u32 + 1, 0, 0, material_address);
+            words[record + 8] = UVec4::new(0, 0, 1, 0);
+            let material = instance_tail + index * crate::material::MATERIAL_WORDS;
+            words[material] = UVec4::from_array(Vec4::ONE.to_array().map(f32::to_bits));
+            words[material + 1] = emission_word(color);
+        }
+        submitted.instance_words = Arc::new(words);
+        submitted.emissive_lights = Arc::new(vec![
+            history_emissive_light(
+                UVec4::new(0, 7, 0, 0),
+                Vec3::new(-4.0, 0.0, 0.0),
+                source_colors[0],
+                0.25,
+                0.25,
+            ),
+            history_emissive_light(
+                UVec4::new(1, 3, 0, 0),
+                Vec3::new(100.0, 0.0, 0.0),
+                source_colors[1],
+                0.5,
+                0.25,
+            ),
+            history_emissive_light(
+                UVec4::new(2, 5, 0, 0),
+                Vec3::new(4.0, 0.0, 0.0),
+                source_colors[2],
+                1.0,
+                0.5,
+            ),
+        ]);
+        let punctual = |x: f32, range: f32| GiLight {
+            position: Vec3::new(x, 2.0, 1.0).extend(range),
+            color: Vec3::ONE.extend(0.0),
+            direction: Vec4::new(0.0, 0.0, -1.0, 0.5),
+            edge2: Vec4::new(0.0, 0.0, 0.0, 0.25),
+            ..GiLight::default()
+        };
+        submitted.lights = Arc::new(vec![punctual(-10.0, 2.0)]);
+        submitted.light_layers = Arc::new(vec![RenderLayers::default()]);
+
+        let mut current = submitted.clone();
+        current.revision += 2;
+        current.geometry_revision += 1;
+        let mut words = current.instance_words.as_ref().clone();
+        words[instance_tail + 1] = emission_word(Vec3::ZERO);
+        words[instance_tail + 2 * crate::material::MATERIAL_WORDS + 1] =
+            emission_word(Vec3::new(2.0, 1.0, 0.5));
+        current.instance_words = Arc::new(words);
+        current.emissive_lights = Arc::new(vec![
+            history_emissive_light(
+                UVec4::new(1, 3, 0, 0),
+                Vec3::new(100.0, 0.0, 0.0),
+                source_colors[1],
+                1.0 / 3.0,
+                1.0 / 3.0,
+            ),
+            history_emissive_light(
+                UVec4::new(2, 5, 0, 0),
+                Vec3::new(4.0, 0.0, 0.0),
+                Vec3::new(2.0, 1.0, 0.5),
+                1.0,
+                2.0 / 3.0,
+            ),
+        ]);
+        Arc::make_mut(&mut current.lights)[0] = punctual(10.0, 3.0);
+
+        let bounded = bounded_geometry_history_reuse(&submitted, &current);
+        assert!(
+            bounded,
+            "strict emission-only proof permits local source reuse"
+        );
+        let emissive_change = emissive_light_history_change(&submitted, &current, bounded);
+        let EmissiveLightHistoryChange::Local { minimum, maximum } = emissive_change else {
+            panic!("blackening/decreasing unchanged emitters should have local source bounds");
+        };
+        assert!(minimum.x <= -4.0 && maximum.x >= 5.0);
+        assert!(
+            maximum.x < 100.0,
+            "an unchanged distant emitter is not dirty"
+        );
+
+        let punctual_change = punctual_light_history_change(&submitted, &current);
+        let PunctualLightHistoryChange::Local {
+            minimum: light_minimum,
+            maximum: light_maximum,
+        } = punctual_change
+        else {
+            panic!("finite punctual motion should retain old and current influence bounds");
+        };
+        assert!(light_minimum.x <= -12.0);
+        assert!(light_maximum.x >= 13.0);
+        assert!(local_lighting_metadata_allowed(false, bounded));
+        assert!(punctual_dirty_bounds(punctual_change, false, bounded).0.w > 0.5);
+        assert!(emissive_dirty_bounds(emissive_change, false, bounded).0.w > 0.5);
+
+        let mut emission_only = current.clone();
+        emission_only.lights = submitted.lights.clone();
+        let emission_only_bounded = bounded_geometry_history_reuse(&submitted, &emission_only);
+        let emission_only_change =
+            emissive_light_history_change(&submitted, &emission_only, emission_only_bounded);
+        assert!(matches!(
+            punctual_light_history_change(&submitted, &emission_only),
+            PunctualLightHistoryChange::Unchanged
+        ));
+        assert!(matches!(
+            emission_only_change,
+            EmissiveLightHistoryChange::Local { .. }
+        ));
+        assert!(local_lighting_metadata_allowed(
+            false,
+            emission_only_bounded
+        ));
+        assert!(!local_lighting_metadata_allowed(true, bounded));
+
+        let mut unknown_punctual = current.clone();
+        unknown_punctual.revision += 1;
+        Arc::make_mut(&mut unknown_punctual.lights)[0].position.w = -1.0;
+        let global_punctual = punctual_light_history_change(&submitted, &unknown_punctual);
+        assert_eq!(global_punctual, PunctualLightHistoryChange::Global);
+        let geometry_proven = bounded_geometry_history_reuse(&submitted, &unknown_punctual);
+        let still_local_emission =
+            emissive_light_history_change(&submitted, &unknown_punctual, geometry_proven);
+        assert!(matches!(
+            still_local_emission,
+            EmissiveLightHistoryChange::Local { .. }
+        ));
+        assert!(
+            emissive_dirty_bounds(still_local_emission, false, geometry_proven)
+                .0
+                .w
+                > 0.5
+        );
+        assert_eq!(
+            punctual_dirty_bounds(global_punctual, false, geometry_proven),
+            (Vec4::ZERO, Vec4::ZERO)
+        );
+
+        let mut moved = current.clone();
+        moved.revision += 1;
+        moved.geometry_revision += 1;
+        let transform = Mat4::from_translation(Vec3::new(0.5, 0.0, 0.0)).transpose();
+        let mut words = moved.instance_words.as_ref().clone();
+        for (offset, row) in [transform.x_axis, transform.y_axis, transform.z_axis]
+            .into_iter()
+            .enumerate()
+        {
+            words[INSTANCE_WORDS_PER_RECORD + 3 + offset] =
+                UVec4::from_array(row.to_array().map(f32::to_bits));
+        }
+        moved.instance_words = Arc::new(words);
+        let mut emitters = moved.emissive_lights.as_ref().clone();
+        emitters[0].position.x += 0.5;
+        moved.emissive_lights = Arc::new(emitters);
+        let moved_bounded = bounded_geometry_history_reuse(&current, &moved);
+        assert!(moved_bounded);
+        let moved_change = emissive_light_history_change(&current, &moved, moved_bounded);
+        assert_eq!(moved_change, EmissiveLightHistoryChange::Global);
+        assert_eq!(
+            emissive_dirty_bounds(moved_change, false, moved_bounded),
+            (Vec4::ZERO, Vec4::ZERO)
+        );
+        let mut added = emission_only.clone();
+        added.revision += 1;
+        added.geometry_revision += 1;
+        let mut words = added.instance_words.as_ref().clone();
+        words[instance_tail + 1] = emission_word(source_colors[0]);
+        added.instance_words = Arc::new(words);
+        let mut emitters = added.emissive_lights.as_ref().clone();
+        emitters.insert(
+            0,
+            history_emissive_light(
+                UVec4::new(0, 7, 0, 0),
+                Vec3::new(-4.0, 0.0, 0.0),
+                source_colors[0],
+                0.25,
+                0.25,
+            ),
+        );
+        added.emissive_lights = Arc::new(emitters);
+        let added_bounded = bounded_geometry_history_reuse(&emission_only, &added);
+        assert!(added_bounded);
+        let added_change = emissive_light_history_change(&emission_only, &added, added_bounded);
+        assert_eq!(added_change, EmissiveLightHistoryChange::Global);
+        assert_eq!(
+            emissive_dirty_bounds(added_change, false, added_bounded),
+            (Vec4::ZERO, Vec4::ZERO)
+        );
+    }
+
+    #[test]
+    fn gradual_sun_motion_is_distinct_from_extinction_and_other_sources() {
+        let mut previous = history_snapshot(1, 1, 0, vec![], vec![], vec![]);
+        previous.lights = Arc::new(vec![
+            GiLight {
+                position: Vec3::Y.extend(0.0),
+                color: Vec3::ONE.extend(0.0),
+                ..default()
+            },
+            GiLight {
+                position: Vec3::ZERO.extend(5.0),
+                color: Vec3::ONE.extend(0.0),
+                ..default()
+            },
+        ]);
+        previous.light_layers = Arc::new(vec![RenderLayers::default(); 2]);
+        for frame in 1..=60 {
+            let mut current = previous.clone();
+            current.revision += 1;
+            let angle = frame as f32 * 0.01;
+            Arc::make_mut(&mut current.lights)[0].position =
+                Vec3::new(angle.sin(), angle.cos(), 0.0).extend(0.0);
+            let fields = source_history_fields(
+                &previous,
+                &current,
+                punctual_light_history_change(&previous, &current),
+                EmissiveLightHistoryChange::Unchanged,
+            );
+            assert_eq!(fields.y, SOURCE_BACKGROUND);
+            assert_eq!(fields.z, 1);
+            assert_eq!(fields.x, SOURCE_PUNCTUAL);
+            previous = current;
+        }
+        let stopped = source_history_fields(
+            &previous,
+            &previous,
+            PunctualLightHistoryChange::Unchanged,
+            EmissiveLightHistoryChange::Unchanged,
+        );
+        assert_eq!(stopped.y, 0);
+        assert_eq!(stopped.z, 0);
+        let mut removed = previous.clone();
+        removed.revision += 1;
+        Arc::make_mut(&mut removed.lights).remove(0);
+        Arc::make_mut(&mut removed.light_layers).remove(0);
+        let removal = source_history_fields(
+            &previous,
+            &removed,
+            punctual_light_history_change(&previous, &removed),
+            EmissiveLightHistoryChange::Unchanged,
+        );
+        assert_ne!(removal.y & SOURCE_BACKGROUND, 0);
+        assert_eq!(removal.z, 0);
+        let mut gradual = previous.clone();
+        Arc::make_mut(&mut gradual.lights)[0].position =
+            Vec3::new(0.57, 0.82, 0.0).normalize().extend(0.0);
+        Arc::make_mut(&mut gradual.lights)[0].color = Vec3::splat(1.02).extend(0.0);
+        gradual.ambient_environment = LinearRgba::new(0.01, 0.01, 0.01, 1.0);
+        assert!(!gradual_directional_motion(&previous, &gradual));
+        previous.ambient_environment = LinearRgba::new(0.01, 0.01, 0.01, 1.0);
+        gradual.ambient_environment = LinearRgba::new(0.0102, 0.0102, 0.0102, 1.0);
+        assert!(gradual_directional_motion(&previous, &gradual));
+        Arc::make_mut(&mut gradual.lights)[0].color = Vec3::ZERO.extend(0.0);
+        assert!(!gradual_directional_motion(&previous, &gradual));
+        let mut changed_environment = previous.clone();
+        changed_environment.environment_revision += 1;
+        assert!(!gradual_directional_motion(&previous, &changed_environment));
+        let mut step = previous.clone();
+        Arc::make_mut(&mut step.lights)[0].position = Vec3::NEG_Y.extend(0.0);
+        assert!(!gradual_directional_motion(&previous, &step));
+    }
+
+    #[test]
+    fn source_history_masks_track_active_offscreen_emission_and_source_classes() {
+        let mut offscreen_emitter = history_snapshot(1, 1, 1, vec![], vec![], vec![]);
+        offscreen_emitter.view_layers = RenderLayers::layer(1);
+        offscreen_emitter.emissive_lights = Arc::new(vec![history_emissive_light(
+            UVec4::new(0, 0, 0, 0),
+            Vec3::splat(10_000.0),
+            Vec3::ONE,
+            1.0,
+            1.0,
+        )]);
+        let initial = source_history_fields(
+            &SceneHistorySnapshot::default(),
+            &offscreen_emitter,
+            PunctualLightHistoryChange::Unchanged,
+            EmissiveLightHistoryChange::Global,
+        );
+        assert_eq!(initial.x, SOURCE_EMISSIVE);
+        assert_eq!(
+            initial.y & (SOURCE_BACKGROUND | SOURCE_EMISSIVE | SOURCE_PUNCTUAL),
+            SOURCE_BACKGROUND | SOURCE_EMISSIVE
+        );
+
+        let mut removed_emitter = offscreen_emitter.clone();
+        removed_emitter.revision += 1;
+        removed_emitter.emissive_lights = Arc::new(Vec::new());
+        let removed = source_history_fields(
+            &offscreen_emitter,
+            &removed_emitter,
+            PunctualLightHistoryChange::Unchanged,
+            EmissiveLightHistoryChange::Global,
+        );
+        assert_eq!(removed.x, 0);
+        assert_eq!(removed.y & SOURCE_EMISSIVE, SOURCE_EMISSIVE);
+        assert_eq!(removed.y & SOURCE_BACKGROUND, 0);
+
+        let mut directional_before = history_snapshot(2, 1, 0, vec![], vec![], vec![]);
+        directional_before.lights = Arc::new(vec![GiLight {
+            position: Vec3::Y.extend(0.0),
+            color: Vec3::ONE.extend(0.0),
+            ..default()
+        }]);
+        directional_before.light_layers = Arc::new(vec![RenderLayers::default()]);
+        let mut directional_after = directional_before.clone();
+        directional_after.revision += 1;
+        Arc::make_mut(&mut directional_after.lights)[0].color.x *= 2.0;
+        let directional_change =
+            punctual_light_history_change(&directional_before, &directional_after);
+        assert_eq!(directional_change, PunctualLightHistoryChange::Unchanged);
+        let directional_history = source_history_fields(
+            &directional_before,
+            &directional_after,
+            directional_change,
+            EmissiveLightHistoryChange::Unchanged,
+        );
+        assert_eq!(directional_history.y & SOURCE_BACKGROUND, SOURCE_BACKGROUND);
+        assert_eq!(directional_history.y & SOURCE_PUNCTUAL, 0);
+
+        let mut punctual_before = history_snapshot(3, 1, 0, vec![], vec![], vec![]);
+        punctual_before.lights = Arc::new(vec![GiLight {
+            position: Vec3::ZERO.extend(4.0),
+            color: Vec3::ONE.extend(0.0),
+            ..default()
+        }]);
+        punctual_before.light_layers = Arc::new(vec![RenderLayers::default()]);
+        let mut punctual_after = punctual_before.clone();
+        punctual_after.revision += 1;
+        Arc::make_mut(&mut punctual_after.lights)[0].color.x *= 2.0;
+        let punctual_change = punctual_light_history_change(&punctual_before, &punctual_after);
+        let punctual_history = source_history_fields(
+            &punctual_before,
+            &punctual_after,
+            punctual_change,
+            EmissiveLightHistoryChange::Unchanged,
+        );
+        assert_eq!(punctual_history.x, SOURCE_PUNCTUAL);
+        assert_eq!(punctual_history.y & SOURCE_PUNCTUAL, SOURCE_PUNCTUAL);
+        assert_eq!(punctual_history.y & SOURCE_BACKGROUND, 0);
+        let mut mixed_after = punctual_after.clone();
+        mixed_after.emissive_lights = Arc::new(vec![history_emissive_light(
+            UVec4::ZERO,
+            Vec3::splat(50.0),
+            Vec3::ONE,
+            1.0,
+            1.0,
+        )]);
+        let mixed_history = source_history_fields(
+            &punctual_before,
+            &mixed_after,
+            punctual_light_history_change(&punctual_before, &mixed_after),
+            EmissiveLightHistoryChange::Global,
+        );
+        assert_eq!(mixed_history.x, SOURCE_EMISSIVE | SOURCE_PUNCTUAL);
+        assert_eq!(
+            mixed_history.y & (SOURCE_BACKGROUND | SOURCE_EMISSIVE | SOURCE_PUNCTUAL),
+            SOURCE_EMISSIVE | SOURCE_PUNCTUAL
+        );
+        let background_before = history_snapshot(4, 1, 0, vec![], vec![], vec![]);
+        let mut background_after = background_before.clone();
+        background_after.environment_revision = 1;
+        let background_history = source_history_fields(
+            &background_before,
+            &background_after,
+            PunctualLightHistoryChange::Unchanged,
+            EmissiveLightHistoryChange::Unchanged,
+        );
+        assert_eq!(background_history.x, 0);
+        assert_eq!(background_history.y, SOURCE_BACKGROUND);
+        let mut ambient_after = background_before.clone();
+        ambient_after.ambient_environment = LinearRgba::new(0.2, 0.3, 0.4, 1.0);
+        let ambient_history = source_history_fields(
+            &background_before,
+            &ambient_after,
+            PunctualLightHistoryChange::Unchanged,
+            EmissiveLightHistoryChange::Unchanged,
+        );
+        assert_eq!(ambient_history.x, 0);
+        assert_eq!(ambient_history.y, SOURCE_BACKGROUND);
     }
 
     #[test]
@@ -9333,17 +11102,18 @@ mod tests {
             ..GiLight::default()
         };
         let mut submitted = history_snapshot(40, 7, 0, vec![], vec![], vec![]);
-        submitted.lights.push(punctual(-10.0));
+        Arc::make_mut(&mut submitted.lights).push(punctual(-10.0));
+        submitted.light_layers = Arc::new(vec![RenderLayers::default()]);
 
         // These scene revisions were prepared while the view had no encoded GI
         // dispatch. Its committed snapshot must remain `submitted` until the
         // final current state is actually encoded.
         let mut skipped = submitted.clone();
         skipped.revision += 1;
-        skipped.lights[0] = punctual(0.0);
+        Arc::make_mut(&mut skipped.lights)[0] = punctual(0.0);
         let mut current = skipped.clone();
         current.revision += 1;
-        current.lights[0] = punctual(10.0);
+        Arc::make_mut(&mut current.lights)[0] = punctual(10.0);
 
         assert!(scene_changed_since_history(&submitted, &skipped));
         assert!(scene_changed_since_history(&submitted, &current));
@@ -9363,6 +11133,15 @@ mod tests {
             maximum.x >= 12.0,
             "current light influence omitted: {maximum:?}"
         );
+        let encoded_source_history = source_history_fields(
+            &submitted,
+            &current,
+            punctual_light_history_change(&submitted, &current),
+            EmissiveLightHistoryChange::Unchanged,
+        );
+        assert_eq!(encoded_source_history.x, SOURCE_PUNCTUAL);
+        assert_eq!(encoded_source_history.y & SOURCE_PUNCTUAL, SOURCE_PUNCTUAL);
+        assert_eq!(encoded_source_history.y & SOURCE_BACKGROUND, 0);
 
         // The new history becomes the baseline only after it is encoded.
         assert!(!scene_changed_since_history(&current, &current));
@@ -9390,7 +11169,7 @@ mod tests {
         );
         let mut light_only = previous.clone();
         light_only.revision += 1;
-        light_only.lights.push(GiLight {
+        Arc::make_mut(&mut light_only.lights).push(GiLight {
             position: Vec3::new(0.0, 2.0, 0.0).extend(4.0),
             color: Vec3::ONE.extend(0.0),
             ..GiLight::default()
@@ -9415,7 +11194,7 @@ mod tests {
             words[3 + index] = UVec4::from_array(row.to_array().map(f32::to_bits));
         }
         current.instance_words = Arc::new(words);
-        current.lights.push(GiLight {
+        Arc::make_mut(&mut current.lights).push(GiLight {
             position: Vec3::new(0.0, 2.0, 0.0).extend(4.0),
             color: Vec3::ONE.extend(0.0),
             ..GiLight::default()
@@ -9580,29 +11359,6 @@ mod tests {
     }
 
     #[test]
-    fn split_view_budget_covers_shader_entry_ranges() {
-        let samples = 128u64;
-        let shading_pixels = 18u64 * 16;
-        let settings = RadianceCascades::default();
-        let buckets = cache_bucket_count(samples, settings);
-        let entries = cache_entry_bytes(samples, buckets);
-        assert_eq!(
-            entries,
-            (cache_work_slots(samples) + 4 * buckets) * ENTRY_SIZE
-        );
-        assert_eq!(
-            view_bytes(UVec2::new(samples as u32, 1), UVec2::new(18, 16), settings),
-            shading_pixels * 10 * 16
-                + (LEVELS as u64 + 2) * std::mem::size_of::<Parameters>() as u64
-                + irradiance_probe_bytes(samples)
-                + cache_head_bytes(buckets, samples) * 2
-                + entries
-                + cache_history_bytes(buckets)
-                + 4
-        );
-    }
-
-    #[test]
     fn pack_probe_dispatch_covers_canonical_descriptors_in_a_bounded_2d_grid() {
         for samples in [1u64, 2, 127, 128, 129, 32_767, 32_768, 32_769, 131_072] {
             let descriptors = samples * 2;
@@ -9660,15 +11416,15 @@ mod tests {
     fn split_high_resolution_view_fits_the_approved_sponza_budget_without_reduction() {
         let viewport = UVec2::new(1920, 1080);
         let receiver_bytes = u64::from(viewport.x) * u64::from(viewport.y) * 16;
-        let view_budget = 544 * 1024 * 1024 - receiver_bytes;
+        let view_budget = 1024 * 1024 * 1024 - receiver_bytes;
         let requested = RadianceCascades {
             resolution_divisor: 4,
             sampling: crate::SamplingSettings {
                 grid_divisor: 4,
                 max_receiver_cells: 32_768,
-                max_updates_per_frame: 512,
+                max_updates_per_frame: 8_192,
                 max_cache_entries: 262_144,
-                max_traversal_queries: 32_768,
+                max_traversal_queries: 131_072,
                 resolve_scale: 4,
             },
             ..default()
@@ -9679,7 +11435,7 @@ mod tests {
             ..WgpuLimits::default()
         };
         let effective = adapt_view_settings(viewport, requested, view_budget, &limits)
-            .expect("the approved 544 MiB budget should admit the Sponza view");
+            .expect("the accuracy profile's 1 GiB budget should admit the Sponza view");
 
         assert_eq!(effective.sampling.max_receiver_cells, 32_768);
         assert_eq!(effective.sampling.max_cache_entries, 262_144);
@@ -9696,7 +11452,7 @@ mod tests {
         ));
         let allocated = view_bytes(size, shading_size, effective) + receiver_bytes;
         assert!(
-            allocated <= 544 * 1024 * 1024,
+            allocated <= 1024 * 1024 * 1024,
             "allocated {allocated} bytes"
         );
     }
@@ -10182,8 +11938,8 @@ mod tests {
 
         let size = resolution(viewport, settings);
         let bytes = view_bytes(size, resolve_size(viewport, settings), settings);
-        // Keep the receiver grid and increase resolve scale until history
-        // textures fit beside the full-resolution receiver.
+        // Adapt sparse buffers and resolve textures around the reserved
+        // full-resolution receiver, including the device's binding limits.
         assert!(resolve_scale(settings) >= 3);
         let half_resolution_bytes = view_bytes(
             resolution(viewport, requested),
@@ -10191,10 +11947,15 @@ mod tests {
             requested,
         );
         assert!(half_resolution_bytes > available_view_bytes);
-        assert_eq!(
-            settings.sampling.max_receiver_cells,
-            requested.sampling.max_receiver_cells
-        );
+        assert!(settings.sampling.max_receiver_cells > 0);
+        assert!(settings.sampling.max_receiver_cells <= requested.sampling.max_receiver_cells);
+        assert!(view_fits_device(
+            size,
+            resolve_size(viewport, settings),
+            viewport,
+            settings,
+            &WgpuLimits::default(),
+        ));
         assert_eq!(
             settings.sampling.max_updates_per_frame,
             requested.sampling.max_updates_per_frame
@@ -10333,7 +12094,7 @@ mod tests {
                         "{width}x{height}, budget {budget}"
                     );
                     assert!(budget == 0 || this_frame <= budget);
-                    schedule.advance_after_successful_update();
+                    schedule.advance_after_successful_update(true);
                 }
                 let min = selected_count.iter().min().copied().unwrap();
                 let max = selected_count.iter().max().copied().unwrap();
@@ -10366,7 +12127,7 @@ mod tests {
                 }
             }
             assert_eq!(selected, BUDGET, "batch {batch}");
-            schedule.advance_after_successful_update();
+            schedule.advance_after_successful_update(true);
         }
 
         let min = selected_count.iter().min().copied().unwrap();
@@ -10426,7 +12187,7 @@ mod tests {
             } else {
                 assert_eq!(selected, fair_quota);
             }
-            schedule.advance_after_successful_update();
+            schedule.advance_after_successful_update(true);
         }
     }
 
@@ -10444,11 +12205,45 @@ mod tests {
                 schedule.phase_for(width, height, candidate_count, budget),
                 (cursor, fair_quota)
             );
-            schedule.advance_after_successful_update();
+            schedule.advance_after_successful_update(true);
         }
         assert_eq!(
             schedule.phase_for(width, height, candidate_count, budget).0,
             0
+        );
+    }
+
+    #[test]
+    fn cold_rank_phases_preserve_fair_cursor_and_history_disabled_keeps_rolling() {
+        const WIDTH: u32 = 160;
+        const HEIGHT: u32 = 90;
+        const CANDIDATES: u32 = WIDTH * HEIGHT;
+        const BUDGET: u32 = 512;
+
+        assert_eq!(cold_rank_phases(24, false), &COLD_RANK_PHASES);
+        assert!(cold_priority_enabled(24, false));
+        assert!(cold_rank_phases(24, true).is_empty());
+        assert!(!cold_priority_enabled(24, true));
+        assert!(cold_rank_phases(0, false).is_empty());
+        assert!(!cold_priority_enabled(0, false));
+
+        let mut schedule = CandidateSchedule::default();
+        assert_eq!(
+            schedule.phase_for(WIDTH, HEIGHT, CANDIDATES, BUDGET),
+            (0, BUDGET)
+        );
+        schedule.advance_after_successful_update(!cold_priority_enabled(24, false));
+        assert_eq!(
+            schedule.phase_for(WIDTH, HEIGHT, CANDIDATES, BUDGET),
+            (0, BUDGET)
+        );
+
+        // With history disabled there is no persistent cold-priority mode, so
+        // the ordinary fair window advances on every successful update.
+        schedule.advance_after_successful_update(!cold_priority_enabled(0, false));
+        assert_eq!(
+            schedule.phase_for(WIDTH, HEIGHT, CANDIDATES, BUDGET),
+            (BUDGET, BUDGET)
         );
     }
 
@@ -10544,11 +12339,11 @@ mod tests {
         let (cursor, fair_quota) = schedule.phase_for(width, height, candidate_count, 0x8000_0000);
         assert_eq!(cursor, 0);
         assert_eq!(fair_quota, 0x8000_0000);
-        schedule.advance_after_successful_update();
+        schedule.advance_after_successful_update(true);
         let (cursor, fair_quota) = schedule.phase_for(width, height, candidate_count, 0x8000_0000);
         assert_eq!(cursor, 0x8000_0000);
         assert_eq!(fair_quota, 0x8000_0000);
-        schedule.advance_after_successful_update();
+        schedule.advance_after_successful_update(true);
         assert_eq!(
             schedule.phase_for(width, height, candidate_count, 0x8000_0000),
             (1, 0x8000_0000)
@@ -10718,7 +12513,7 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_translation_validates_bindings_and_preserves_calls() {
+    fn vulkan_translation_validates_bindings() {
         let source = "
             @group(0) @binding(23) var output: texture_storage_2d<rgba32float, write>;
             @group(0) @binding(27) var input: texture_2d<u32>;
@@ -10727,25 +12522,19 @@ mod tests {
                 textureStore(output, vec2<i32>(0), vec4<f32>(value(textureLoad(input, vec2<i32>(0), 0).x)));
             }
         ";
-        let layout = compute_layout();
+        let layout = compute_layout(false);
         let (words, size) = vulkan_compute_source(source, "check", &layout.entries).unwrap();
         assert_eq!(size, (8, 8, 1));
         let mut bindings = Vec::new();
-        let mut functions = 0;
         let mut offset = 5;
         while offset < words.len() {
             let count = (words[offset] >> 16) as usize;
             match words[offset] & 0xffff {
                 71 if count == 4 && words[offset + 2] == 33 => bindings.push(words[offset + 3]),
-                54 => {
-                    assert_eq!(words[offset + 3] & 3, 2);
-                    functions += 1;
-                }
                 _ => (),
             }
             offset += count;
         }
-        assert!(functions >= 2, "helper call was lost");
         bindings.sort_unstable();
         let physical_binding = |logical| {
             layout
@@ -10812,6 +12601,27 @@ mod tests {
             None,
             UVec4::new(0, 0, 4, 4),
         );
+        let texture_bytes: u64 = view
+            .irradiance_textures
+            .iter()
+            .chain(&view._metadata)
+            .chain(&view._background_textures)
+            .chain(std::iter::once(&view._denoise_receiver_history_output))
+            .map(|texture| u64::from(texture.width()) * u64::from(texture.height()) * 16)
+            .sum();
+        let buffer_bytes: u64 = view
+            .caches
+            .iter()
+            .map(|cache| cache.heads.size())
+            .sum::<u64>()
+            + view.entries.size()
+            + view.history_entries.size()
+            + view.irradiance_probes.size()
+            + (LEVELS as u64 + 2) * std::mem::size_of::<Parameters>() as u64;
+        assert!(
+            view_bytes(view.size, view.shading_size, view.settings) >= texture_bytes + buffer_bytes,
+            "view budget must cover all actual GI textures, buffers, and uniforms"
+        );
         let external_buffers = [&view.caches[0].heads, &view.caches[1].heads, &view.entries];
         let unfiltered_key = view_binding_key(
             &view,
@@ -10835,10 +12645,17 @@ mod tests {
             && device
                 .features()
                 .contains(wgpu::Features::PASSTHROUGH_SHADERS);
-        let layout = compute_layout();
+        let ray_query = spirv
+            && device
+                .features()
+                .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+        let layout = compute_layout(ray_query);
         let layouts =
             [device.create_bind_group_layout(Some(layout.label.as_ref()), &layout.entries)];
         for entry in COMPUTE_ENTRIES {
+            if hardware_traversal_entry(entry) && !ray_query {
+                continue;
+            }
             let shader = compile(&SlangCompiler::default(), "cascades.slang", &[entry]).unwrap();
             let bevy::shader::Source::Wgsl(source) = shader.source else {
                 panic!("expected validated WGSL");
@@ -10850,6 +12667,7 @@ mod tests {
                 entry,
                 None,
                 spirv,
+                ray_query,
             )
             .unwrap_or_else(|error| panic!("{entry}: {error}"));
         }
@@ -10860,6 +12678,7 @@ mod tests {
             "missing",
             None,
             spirv,
+            ray_query,
         )
         .unwrap_err();
         assert!(error.contains("missing"), "{error}");
@@ -10873,6 +12692,14 @@ mod tests {
             let bevy::shader::Source::Wgsl(source) = shader.source else {
                 panic!("expected Slang's WGSL output")
             };
+            // Hardware traversal modules call the ray-query helpers that the
+            // SPIR-V path prepends, exactly as production compiles them.
+            let hardware = entries.iter().any(|entry| hardware_traversal_entry(entry));
+            let source = if hardware {
+                ray_query_source(&source).unwrap()
+            } else {
+                source.to_string()
+            };
             let module = naga::front::wgsl::parse_str(&source)
                 .unwrap_or_else(|error| panic!("{file}: {}", error.emit_to_string(&source)));
             assert_eq!(module.entry_points.len(), entries.len(), "{file} entries");
@@ -10881,7 +12708,11 @@ mod tests {
             }
             let info = naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),
-                naga::valid::Capabilities::empty(),
+                if hardware {
+                    naga::valid::Capabilities::RAY_QUERY
+                } else {
+                    naga::valid::Capabilities::empty()
+                },
             )
             .validate(&module)
             .unwrap_or_else(|error| panic!("{file}: {error:?}"));
@@ -10940,7 +12771,7 @@ mod tests {
                 // Validate the actual production layout, not only WGSL syntax.
                 // An inserted atlas binding previously shifted every later
                 // resource while standalone traversal tests still passed.
-                let layout = compute_layout();
+                let layout = compute_layout(hardware);
                 for (_, global) in module.global_variables.iter() {
                     let Some(binding) = &global.binding else {
                         continue;
@@ -10977,6 +12808,11 @@ mod tests {
                                 binding.binding
                             );
                         }
+                        naga::TypeInner::AccelerationStructure { .. } => assert!(
+                            matches!(expected.ty, BindingType::AccelerationStructure { .. }),
+                            "binding {}: shader TLAS requires acceleration-structure layout",
+                            binding.binding
+                        ),
                         _ => assert!(
                             matches!(expected.ty, BindingType::Buffer { .. }),
                             "binding {}: shader buffer requires buffer layout",

@@ -8,6 +8,38 @@
 [[vk::binding(6, 0)]] Texture2D<float4> receiverHistory;
 [[vk::binding(7, 0)]] Texture2D<uint4> rasterReceiver;
 [[vk::binding(8, 0)]] Texture2D<float> screenSpaceOcclusion;
+[[vk::binding(9, 0)]] StructuredBuffer<uint> probeHeads;
+[[vk::binding(10, 0)]] StructuredBuffer<Entry> probeEntries;
+[[vk::binding(11, 0)]] StructuredBuffer<DirectionalProbe> directionalProbes;
+
+void splitLodBlend(float3 position, out uint lowLod, out uint highLod, out float blend) {
+    splitLodBlendForParameters(position, params, lowLod, highLod, blend);
+}
+
+uint findIrradianceProbe(int4 key, bool previous) {
+    if (previous) return EMPTY;
+    uint capacity = probeDirectoryCapacity(params);
+    uint slot = probeDirectoryBucket(key, params);
+    uint count, stride;
+    probeEntries.GetDimensions(count, stride);
+    [loop] for (uint attempt = 0u; attempt < capacity; ++attempt) {
+        uint index = probeHeads[probeDirectoryHead(0u, slot, params)];
+        if (index == EMPTY) return EMPTY;
+        if (index != TOMBSTONE) {
+            if (index >= count) return EMPTY;
+            int4 candidate = probeEntries[index].key;
+            if (all(candidate.xyz == key.xyz)
+                && (uint(candidate.w) & PROBE_LOD) == (uint(key.w) & PROBE_LOD))
+                return slot;
+        }
+        slot = (slot + 1u) & (capacity - 1u);
+    }
+    return EMPTY;
+}
+
+#define GI_COMPOSITE_RESOLVE
+#include "world_resolve.slang"
+#undef GI_COMPOSITE_RESOLVE
 
 struct VertexOutput { float4 position : SV_Position; };
 
@@ -56,10 +88,8 @@ bool compositeCompatibleCandidate(int2 samplePixel, uint2 targetIdentity,
     return true;
 }
 
-float3 reconstructCompositeGi(uint2 pixel) {
-    float depth = depthTexture.Load(int3(pixel, 0));
+float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
     uint4 targetRaster = rasterReceiver.Load(int3(pixel, 0));
-    uint4 deferred = gbuffer.Load(int3(pixel, 0));
     if (!(depth > 0.0) || !isfinite(depth)
         || (targetRaster.z & 0x80000000u) == 0u
         || (deferred.w & (1u << 24u)) != 0u) return 0.0;
@@ -122,7 +152,17 @@ float3 reconstructCompositeGi(uint2 pixel) {
             support = 1.0;
         }
     }
-    return support > 1e-6 ? sum / support : 0.0;
+    if (support > 1e-6) return sum / support;
+    // A facet smaller than the resolve grid can have no compatible anchor at
+    // all. Resolve its actual shading normal from the live world probes.
+    float3 shadingNormal = deferredShadingNormal(deferred);
+    if (!all(isfinite(shadingNormal)) || dot(shadingNormal, shadingNormal) <= 0.01)
+        return 0.0;
+    float coverage, backgroundCoverage, anyCoverage;
+    float3 background;
+    float3 fallback = resolveSplitDiffuse(position, normalize(shadingNormal),
+        coverage, background, backgroundCoverage, anyCoverage);
+    return anyCoverage > 0.0 && all(isfinite(fallback)) ? fallback : 0.0;
 }
 
 [shader("fragment")]
@@ -134,7 +174,7 @@ float4 fragment(VertexOutput input) : SV_Target {
     uint4 deferred = gbuffer.Load(int3(pixel, 0));
     if (!(depth > 0.0) || (deferred.w & (1u << 24u)) != 0u) return 0.0;
 
-    float3 diffuseGi = reconstructCompositeGi(pixel);
+    float3 diffuseGi = reconstructCompositeGi(pixel, depth, deferred);
     float3 diffuseOcclusion = 1.0;
     if ((params.layers.z & 1u) != 0u) {
         diffuseOcclusion = float((deferred.z >> 16u) & 255u) / 255.0;

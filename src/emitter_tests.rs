@@ -12,17 +12,34 @@ const EMITTER_FIXTURE: &str = r#"
 [numthreads(64, 1, 1)]
 void fixtureEmitter(uint3 thread : SV_DispatchThreadID) {
     uint sample = thread.x;
-    // Uniform hemisphere quadrature at the actual diffuse receiver. The
-    // receiver's albedo is deliberately absent from this E/pi response.
+    // Uniform-hemisphere quadrature hits the emitter or a diffuse receiver.
     float2 uv = r2(sample + 1u);
     float z = uv.x;
     float radius = sqrt(max(0.0, 1.0-z*z));
     float angle = 2.0*PI*uv.y;
     float3 direction = float3(radius*cos(angle), radius*sin(angle), z);
-    Hit hit = traceRay(float3(0,0,0.005), direction, 100.0, false, 0.0, 0.0, params.sampling.y);
-    bool supported;
-    float3 value = outgoingRadiance(float3(0,0,0.005), direction, hit, supported, params.sampling.y);
-    fixtureResults[sample] = float4(value*(2.0*z), supported ? 1.0 : 0.0);
+    bool receiverMode = params.sourceHistory.z != 0u;
+    float3 origin = receiverMode ? float3(0,0,1.005) : float3(0,0,0.005);
+    if (receiverMode) direction.z = -direction.z;
+    Hit hit = traceRay(origin, direction, 100.0, false, 0.0, 0.0, params.sampling.y);
+    bool querySupported;
+    DependencyContext dependency = dependencyEmpty();
+    TransportRadiance radiance = outgoingTransportRadianceTracked(
+        origin, direction, hit, querySupported, dependency, params.sampling.y);
+    float weight = 2.0*z;
+    fixtureResults[sample * 6u] = float4(radiance.emissive * weight,
+        querySupported ? 1.0 : 0.0);
+    fixtureResults[sample * 6u + 1u] = float4(radiance.background * weight,
+        querySupported ? 1.0 : 0.0);
+    fixtureResults[sample * 6u + 2u] = float4(radiance.punctual * weight,
+        querySupported ? 1.0 : 0.0);
+    fixtureResults[sample * 6u + 3u] = float4(
+        (radiance.emissive + radiance.background + radiance.punctual) * weight,
+        querySupported ? 1.0 : 0.0);
+    fixtureResults[sample * 6u + 4u] = float4(dependency.minimum,
+        dependency.hasBounds ? 1.0 : 0.0);
+    fixtureResults[sample * 6u + 5u] = float4(dependency.maximum,
+        dependency.known ? 1.0 : 0.0);
 }
 "#;
 
@@ -91,6 +108,9 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
             (2, storage_buffer_read_only_sized(false, None)),
             (3, storage_buffer_read_only_sized(false, None)),
             (6, storage_buffer_sized(false, None)),
+            (8, storage_buffer_read_only_sized(false, None)),
+            (9, storage_buffer_sized(false, None)),
+            (12, storage_buffer_sized(false, None)),
             (
                 16,
                 texture_2d_array(TextureSampleType::Float { filterable: false }),
@@ -152,8 +172,8 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
         cache: None,
     });
     let bits = |values: [f32; 4]| UVec4::from_array(values.map(f32::to_bits));
-    // One facing emitter triangle, plus a separate broad black blocker. All
-    // geometry, materials, instances, BVHs, and query admission are production.
+    // One facing emitter triangle and a separate broad diffuse receiver/blocker.
+    // Geometry, materials, instances, BVHs, and query admission are production.
     let vertices = [
         [-3.0, -3.0, 2.0, 1.0],
         [0.0, 3.0, 2.0, 1.0],
@@ -165,12 +185,17 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
     let mut geometry_words = vec![
         UVec4::new(1, 3, 5, 6),
         UVec4::new(0, 1, 2, 0),
-        UVec4::new(3, 4, 5, 0),
+        UVec4::new(3, 5, 4, 0),
     ];
     for position in vertices {
+        let normal = if position[2] == 1.0 {
+            [0.0, 0.0, 1.0, 0.0]
+        } else {
+            [0.0, 0.0, -1.0, 0.0]
+        };
         geometry_words.extend([
             bits(position),
-            bits([0.0, 0.0, -1.0, 0.0]),
+            bits(normal),
             bits([1.0, 0.0, 0.0, 1.0]),
             UVec4::ZERO,
             bits([1.0; 4]),
@@ -209,11 +234,11 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
     });
     let output = device.create_buffer(&BufferDescriptor {
         label: Some("emitter_fixture_output"),
-        size: (SAMPLES * 16) as u64,
+        size: (SAMPLES * 6 * 16) as u64,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    let run = |emission: f32, blocked: bool, denied: bool| {
+    let run = |emission: f32, blocked: bool, denied: bool, receiver_mode: bool| {
         let mut words = vec![
             UVec4::new(3, 7, 0, 9),
             bits([-100.0, -100.0, 0.9, 0.0]),
@@ -224,7 +249,7 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
             bits([100.0, 100.0, 1.0, 0.0]),
         ];
         words[1].w = 0;
-        words[2].w = if blocked { 2 } else { 1 };
+        words[2].w = if blocked || receiver_mode { 2 } else { 1 };
         words[3].w = 0;
         words[4].w = 1;
         words[5].w = 1;
@@ -247,7 +272,7 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
         }
         for value in [emission, 0.0] {
             words.extend([
-                bits([0.0, 0.0, 0.0, 1.0]),
+                bits([1.0, 1.0, 1.0, 1.0]),
                 bits([value, value, value, -1.0]),
                 bits([0.0, 1.0, 0.5, 0.0]),
                 UVec4::ZERO,
@@ -260,10 +285,30 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
         words.push(UVec4::new(1, 0, 0, 0));
         let mut scene = StorageBuffer::from(words);
         scene.write_buffer(device, queue);
-        let mut lights = StorageBuffer::from(vec![crate::scene::GiLight {
-            source: UVec4::new(1, 0, 0, 0),
-            ..default()
-        }]);
+        let light_records = if receiver_mode {
+            vec![
+                crate::scene::GiLight {
+                    position: Vec4::new(8.0, 0.0, 3.0, 20.0),
+                    color: Vec4::new(4.0, 4.0, 4.0, 0.0),
+                    source: UVec4::new(1, 0, 0, 0),
+                    ..default()
+                },
+                crate::scene::GiLight {
+                    position: Vec4::new(-3.0, -3.0, 2.0, -2.0),
+                    color: Vec4::new(emission, emission, emission, 18.0),
+                    direction: Vec4::new(0.0, 0.0, -1.0, 1.0),
+                    edge1: Vec4::new(3.0, 6.0, 0.0, 1.0),
+                    edge2: Vec4::new(6.0, 0.0, 0.0, 0.0),
+                    source: UVec4::ZERO,
+                },
+            ]
+        } else {
+            vec![crate::scene::GiLight {
+                source: UVec4::new(1, 0, 0, 0),
+                ..default()
+            }]
+        };
+        let mut lights = StorageBuffer::from(light_records);
         lights.write_buffer(device, queue);
         let mut head_words = vec![0u32; 68];
         if denied {
@@ -277,8 +322,42 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
                 .collect::<Vec<_>>(),
             usage: BufferUsages::STORAGE,
         });
+        let secondary_heads = device.create_buffer(&BufferDescriptor {
+            label: Some("emitter_fixture_secondary_heads"),
+            size: 4,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let secondary_entries = device.create_buffer(&BufferDescriptor {
+            label: Some("emitter_fixture_secondary_entries"),
+            size: 272,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let secondary_probes = device.create_buffer(&BufferDescriptor {
+            label: Some("emitter_fixture_secondary_probes"),
+            size: crate::render::PROBE_SIZE,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let mut parameters = temporal_test_parameters(0);
-        parameters.frame = UVec4::new(0, 0, if blocked { 2 } else { 1 }, 0);
+        parameters.frame = UVec4::new(
+            0,
+            0,
+            if blocked || receiver_mode { 2 } else { 1 },
+            receiver_mode as u32,
+        );
+        parameters.light_counts = if receiver_mode {
+            UVec4::new(1, 1, 2, 0)
+        } else {
+            UVec4::ZERO
+        };
+        parameters.environment = if receiver_mode {
+            Vec4::new(1.0, 1.0, 1.0, 1.0)
+        } else {
+            Vec4::W
+        };
+        parameters.source_history = UVec4::new(6, 0, receiver_mode as u32, 0);
         parameters.size = UVec4::new(1, 1, 1, 16);
         parameters.layers = UVec4::new(0, 1, 0, 0);
         parameters.sampling.y = if denied { 1 } else { 0 };
@@ -309,6 +388,18 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
                     resource: heads.as_entire_binding(),
                 },
                 BindGroupEntry {
+                    binding: 8,
+                    resource: secondary_heads.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 9,
+                    resource: secondary_entries.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 12,
+                    resource: secondary_probes.as_entire_binding(),
+                },
+                BindGroupEntry {
                     binding: 16,
                     resource: BindingResource::TextureView(&atlas_array_view),
                 },
@@ -336,7 +427,7 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
         );
         let readback = device.create_buffer(&BufferDescriptor {
             label: Some("emitter_fixture_readback"),
-            size: (SAMPLES * 16) as u64,
+            size: (SAMPLES * 6 * 16) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -347,7 +438,7 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups((SAMPLES as u32).div_ceil(64), 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, (SAMPLES * 16) as u64);
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, (SAMPLES * 6 * 16) as u64);
         let submission = queue.submit([encoder.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
         readback
@@ -361,16 +452,28 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
             .unwrap();
         rx.recv().unwrap().unwrap();
         let bytes = readback.slice(..).get_mapped_range().unwrap();
-        let values = (0..SAMPLES)
+        let values = (0..SAMPLES * 6)
             .map(|index| output_vec4(&bytes, index))
             .collect::<Vec<_>>();
         drop(bytes);
         readback.unmap();
         values
     };
-    let visible = run(4.0, false, false);
-    let energy = visible.iter().map(|sample| sample[0]).sum::<f32>() / SAMPLES as f32;
-    assert!(visible.iter().all(|sample| sample[3] == 1.0));
+    let visible = run(4.0, false, false, false);
+    let energy = visible
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|sample| sample[0][0])
+        .sum::<f32>()
+        / SAMPLES as f32;
+    assert!(
+        visible
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .all(|sample| sample[3][3] == 1.0)
+    );
     assert!(
         energy > 0.1,
         "an unclassified emissive mesh must contribute when a primary GI ray hits it: {energy}"
@@ -396,16 +499,54 @@ fn gpu_emissive_mesh_first_hits_illuminate_diffuse_receivers() {
         (f64::from(energy) - reference).abs() < reference * 0.04,
         "hemisphere and area estimates disagree: {energy} vs {reference}"
     );
-    for samples in [run(4.0, true, false), run(0.0, false, false)] {
+    let additive = run(4.0, false, false, true);
+    let mut source_energy = [0.0f32; 3];
+    for sample in additive.as_chunks::<6>().0 {
+        let emitted = sample[0];
+        let background = sample[1];
+        let punctual = sample[2];
+        let combined = sample[3];
+        assert_eq!(combined[3], 1.0);
+        if emitted[..3].iter().any(|value| *value > 0.0) {
+            assert_eq!(
+                sample[4][3], 1.0,
+                "sampled emitter endpoint must be bounded"
+            );
+            assert!(
+                sample[4][2] <= 2.001 && sample[5][2] >= 2.0,
+                "emissive visibility dependency must include its sampled endpoint"
+            );
+        }
+        assert_eq!(
+            sample[5][3], 1.0,
+            "supported dependencies must stay known, including measured-empty escapes"
+        );
+        for component in 0..3 {
+            source_energy[0] += emitted[component];
+            source_energy[1] += background[component];
+            source_energy[2] += punctual[component];
+            let expected = emitted[component] + background[component] + punctual[component];
+            assert!((combined[component] - expected).abs() < 1e-5);
+        }
+    }
+    assert!(
+        source_energy.iter().all(|energy| *energy > 0.0),
+        "emissive, background, and punctual groups must each contribute: {source_energy:?}"
+    );
+    for samples in [run(4.0, true, false, false), run(0.0, false, false, false)] {
         assert!(
-            samples.iter().all(
-                |sample| sample[3] == 1.0 && sample[..3].iter().all(|value| value.abs() < 1e-6)
-            ),
+            samples.as_chunks::<6>().0.iter().all(|sample| {
+                sample[3][3] == 1.0 && sample[3][..3].iter().all(|value| value.abs() < 1e-6)
+            }),
             "blocker and zero emission must produce supported black"
         );
     }
     assert!(
-        run(4.0, false, true).iter().all(|sample| sample[3] == 0.0),
+        run(4.0, false, true, false)
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .all(|sample| sample[3][3] == 0.0),
         "denied production traversal is unavailable, never a supported black observation"
     );
 }

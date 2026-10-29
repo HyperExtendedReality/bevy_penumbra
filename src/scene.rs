@@ -19,11 +19,11 @@ use bevy::{
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
 };
 
-use crate::RadianceCascadesGeometry;
 use crate::material::{
     MATERIAL_WORDS, TextureAtlas, TextureCache, TextureOptions, material_support, material_words,
     texture_handles,
 };
+use crate::{RadianceCascades, RadianceCascadesGeometry};
 
 // CPU build/oracle snapshot. GPU traversal loads indexed positions/attributes.
 #[derive(Clone, Copy, Default)]
@@ -147,8 +147,9 @@ pub(crate) struct SceneData {
     // ponytail: 64-bit signatures keep residency metadata small; retain full
     // geometry/material keys only if hash collisions become a practical risk.
     pub instance_residency: Arc<HashMap<Entity, u64>>,
-    pub lights: Vec<GiLight>,
-    pub light_layers: Vec<RenderLayers>,
+    /// Shared by per-view last-encoded snapshots without copying light data.
+    pub lights: Arc<Vec<GiLight>>,
+    pub light_layers: Arc<Vec<RenderLayers>>,
     pub emissive_lights: Arc<Vec<GiLight>>,
 }
 
@@ -207,7 +208,7 @@ pub(crate) fn view_lights(data: &SceneData, layers: &RenderLayers) -> (Vec<GiLig
     let mut lights: Vec<_> = data
         .lights
         .iter()
-        .zip(&data.light_layers)
+        .zip(data.light_layers.iter())
         .filter(|(_, light_layers)| layers.intersects(light_layers))
         .map(|(light, _)| *light)
         .collect();
@@ -314,6 +315,7 @@ struct MeshSpan {
 pub(crate) struct MeshCache {
     meshes: HashMap<AssetId<Mesh>, MeshBlas>,
     pending_blas: HashMap<AssetId<Mesh>, PendingBlas>,
+    needs_validation: HashSet<AssetId<Mesh>>,
     support: HashMap<AssetId<Mesh>, Result<(), &'static str>>,
     packed_keys: Vec<(AssetId<Mesh>, u64)>,
     packed_geometry_keys: Vec<(AssetId<Mesh>, u64)>,
@@ -798,15 +800,23 @@ fn has_usable_triangle(mesh: &Mesh, positions: &[[f32; 3]]) -> bool {
     })
 }
 
+/// Words per packed vertex. The vertex region starts on a multiple of this
+/// stride so hardware acceleration structures can address positions as
+/// `first_vertex * stride` bytes into the same buffer.
+pub(crate) const VERTEX_WORDS: u32 = 5;
+
 fn geometry_words(triangles: &[Triangle], vertices: &[MeshVertex]) -> Vec<UVec4> {
-    let mut words = Vec::with_capacity(1 + triangles.len() + vertices.len() * 5);
+    let vertex_base = (1 + triangles.len() as u32).next_multiple_of(VERTEX_WORDS);
+    let mut words =
+        Vec::with_capacity(vertex_base as usize + vertices.len() * VERTEX_WORDS as usize);
     words.push(UVec4::new(
         1,
-        1 + triangles.len() as u32,
-        5,
+        vertex_base,
+        VERTEX_WORDS,
         vertices.len() as u32,
     ));
     words.extend(triangles.iter().map(|triangle| triangle.indices.extend(0)));
+    words.resize(vertex_base as usize, UVec4::ZERO);
     words.extend(vertices.iter().flat_map(|vertex| vertex.words()));
     words
 }
@@ -870,6 +880,19 @@ impl MeshCache {
         keys.sort();
         keys.dedup();
         self.meshes.retain(|id, _| keys.binary_search(id).is_ok());
+        self.needs_validation
+            .retain(|id| self.meshes.contains_key(id) || self.pending_blas.contains_key(id));
+        if keys
+            .iter()
+            .map(|&id| (id, self.meshes[&id].signature))
+            .eq(self.packed_keys.iter().copied())
+            && animated
+                .iter()
+                .map(|&(entity, id)| (entity, id, self.meshes[&id].signature))
+                .eq(self.animated_keys.iter().copied())
+        {
+            return;
+        }
         let keys: Vec<_> = keys
             .into_iter()
             .map(|id| (id, self.meshes[&id].signature))
@@ -878,7 +901,23 @@ impl MeshCache {
             .iter()
             .map(|&(entity, id)| (entity, id, self.meshes[&id].signature))
             .collect();
-        if keys == self.packed_keys && animated_keys == self.animated_keys {
+        let geometry_keys: Vec<_> = keys
+            .iter()
+            .map(|&(id, _)| (id, self.meshes[&id].geometry_signature))
+            .collect();
+        if geometry_keys == self.packed_geometry_keys && animated_keys == self.animated_keys {
+            // Attribute-only changes do not alter triangle indices, spans or BLAS
+            // nodes. Repack vertices without expanding and copying those arrays.
+            let mut vertices = Vec::with_capacity(self.vertices.len());
+            for &(id, _) in &keys {
+                vertices.extend_from_slice(&self.meshes[&id].vertices);
+            }
+            for &(_, id) in &animated {
+                vertices.extend_from_slice(&self.meshes[&id].vertices);
+            }
+            self.geometry_words = Arc::new(geometry_words(&self.triangles, &vertices));
+            self.vertices = Arc::new(vertices);
+            self.packed_keys = keys;
             return;
         }
         // Known counts avoid geometric capacity growth and simultaneous large
@@ -910,10 +949,6 @@ impl MeshCache {
                     .map(|(_, id)| self.meshes[id].nodes.len())
                     .sum::<usize>(),
         );
-        let geometry_keys: Vec<_> = keys
-            .iter()
-            .map(|&(id, _)| (id, self.meshes[&id].geometry_signature))
-            .collect();
         self.spans.clear();
         self.animated_spans.clear();
         for &(id, _) in &keys {
@@ -1140,6 +1175,7 @@ pub(crate) fn update_scene(
         (mesh_events, mut mesh_event_cursor),
         (image_events, mut image_event_cursor),
         (material_events, mut material_event_cursor),
+        (cameras, mut suspended),
     ): (
         Local<Vec<GiLight>>,
         Local<Vec<RenderLayers>>,
@@ -1171,8 +1207,34 @@ pub(crate) fn update_scene(
             Option<Res<Messages<AssetEvent<StandardMaterial>>>>,
             Local<MessageCursor<AssetEvent<StandardMaterial>>>,
         ),
+        (Query<(&Camera, &RadianceCascades)>, Local<bool>),
     ),
 ) {
+    if !cameras
+        .iter()
+        .any(|(camera, settings)| camera.is_active && settings.sanitized().intensity > 0.0)
+    {
+        *suspended = true;
+        if scene.ready {
+            scene.ready = false;
+            scene.revision = scene.revision.wrapping_add(1);
+        }
+        return;
+    }
+    // Messages and removals can expire while suspended. Revalidate all cached
+    // assets on resume instead of relying on the surviving event window.
+    let resumed = std::mem::take(&mut *suspended);
+    if resumed {
+        mesh_cache.support.clear();
+        let cache = &mut *mesh_cache;
+        cache.needs_validation.extend(
+            cache
+                .meshes
+                .keys()
+                .chain(cache.pending_blas.keys())
+                .copied(),
+        );
+    }
     warned_unsupported_materials.retain(|entity| unsupported_materials.contains(*entity));
     for entity in &unsupported_materials {
         if warned_unsupported_materials.insert(entity) {
@@ -1194,7 +1256,8 @@ pub(crate) fn update_scene(
             .copied(),
     );
     let poses_changed = !pose_dirty_entities.is_empty();
-    *previous_poses = poses.clone();
+    *previous_poses = poses;
+    let poses = &*previous_poses;
     let mut rebuilt = mesh_cache
         .tlas_rebuild
         .as_mut()
@@ -1257,26 +1320,27 @@ pub(crate) fn update_scene(
             })
             .collect()
     });
-    let images_changed = changed_images.as_ref().map_or_else(
-        || images_resource_changed,
-        |changed| {
-            !changed.is_empty()
-                && geometry.iter().any(|(_, _, material, _, visible, ..)| {
-                    if visible.as_ref().is_some_and(|visible| !visible.get()) {
-                        return false;
-                    }
-                    materials
-                        .get(&material.0)
-                        .filter(|material| material_support(material).is_ok())
-                        .is_some_and(|material| {
-                            texture_handles(material)
-                                .into_iter()
-                                .flatten()
-                                .any(|handle| changed.contains(&handle.id()))
-                        })
-                })
-        },
-    );
+    let images_changed = resumed
+        || changed_images.as_ref().map_or_else(
+            || images_resource_changed,
+            |changed| {
+                !changed.is_empty()
+                    && geometry.iter().any(|(_, _, material, _, visible, ..)| {
+                        if visible.as_ref().is_some_and(|visible| !visible.get()) {
+                            return false;
+                        }
+                        materials
+                            .get(&material.0)
+                            .filter(|material| material_support(material).is_ok())
+                            .is_some_and(|material| {
+                                texture_handles(material)
+                                    .into_iter()
+                                    .flatten()
+                                    .any(|handle| changed.contains(&handle.id()))
+                            })
+                    })
+            },
+        );
     let texture_options_changed = texture_options
         .as_ref()
         .is_some_and(|options| options.is_changed());
@@ -1507,15 +1571,18 @@ pub(crate) fn update_scene(
             }
         }
     }
-    if !dirty && scene.data.lights == lights && scene.data.light_layers == light_layers {
+    if !dirty
+        && scene.data.lights.as_ref() == &lights
+        && scene.data.light_layers.as_ref() == &light_layers
+    {
         *light_scratch = lights;
         *light_layers_scratch = light_layers;
         return;
     }
     if !dirty {
         scene.data = Arc::new(SceneData {
-            lights,
-            light_layers,
+            lights: Arc::new(lights),
+            light_layers: Arc::new(light_layers),
             ..scene.data.as_ref().clone()
         });
         scene.revision = scene.revision.wrapping_add(1);
@@ -1595,10 +1662,12 @@ pub(crate) fn update_scene(
         // events may have been consumed before the failed texture update.
         if checked.insert(id)
             && (mesh_changed
+                || mesh_cache.needs_validation.contains(&id)
                 || !scene.ready
                 || !mesh_cache.meshes.contains_key(&id)
                 || rebuilt_blas.contains(&id))
         {
+            mesh_cache.needs_validation.remove(&id);
             let vertices = match mesh_vertices(mesh, positions) {
                 Ok(vertices) => vertices,
                 Err(reason) => {
@@ -1981,12 +2050,12 @@ pub(crate) fn update_scene(
     let instance_indices = if scene.data.instance_indices.as_ref() == &instance_index_map {
         scene.data.instance_indices.clone()
     } else {
-        Arc::new(instance_index_map.clone())
+        Arc::new(instance_index_map)
     };
     for (entity, residency) in &mut instance_residency {
         let mut indexed_residency = std::collections::hash_map::DefaultHasher::new();
         residency.hash(&mut indexed_residency);
-        instance_index_map[entity].hash(&mut indexed_residency);
+        instance_indices[entity].hash(&mut indexed_residency);
         *residency = indexed_residency.finish();
     }
     let instance_residency = if scene.data.instance_residency.as_ref() == &instance_residency {
@@ -1996,7 +2065,7 @@ pub(crate) fn update_scene(
     };
     for light in &mut emissive_lights {
         let (entity, _, triangle) = emitter_keys[light.source.y as usize];
-        light.source = UVec4::new(instance_index_map[&entity], triangle, 0, 0);
+        light.source = UVec4::new(instance_indices[&entity], triangle, 0, 0);
     }
     let emissive_lights = Arc::new(emissive_lights);
     let cost = tree_cost(&nodes);
@@ -2115,8 +2184,8 @@ pub(crate) fn update_scene(
     {
         scene.mesh_revision = scene.mesh_revision.wrapping_add(1);
     }
-    let lighting_changed = scene.data.lights != lights
-        || scene.data.light_layers != light_layers
+    let lighting_changed = scene.data.lights.as_ref() != &lights
+        || scene.data.light_layers.as_ref() != &light_layers
         || scene.data.emissive_lights.as_ref() != emissive_lights.as_ref();
     scene.data = Arc::new(SceneData {
         deformation: Arc::new(deformation),
@@ -2134,8 +2203,8 @@ pub(crate) fn update_scene(
         instance_words,
         instance_indices,
         instance_residency,
-        lights,
-        light_layers,
+        lights: Arc::new(lights),
+        light_layers: Arc::new(light_layers),
         emissive_lights,
     });
     scene.revision = scene.revision.wrapping_add(1);
@@ -2164,7 +2233,7 @@ fn emitter_mask_coverage(
         return 1.0;
     };
     let cutoff = f32::from_bits(words[1].w);
-    if cutoff < 0.0 {
+    if cutoff == -1.0 {
         return 1.0;
     }
     let [Some(a), Some(b), Some(c)] = indices
@@ -2201,9 +2270,9 @@ fn emitter_mask_coverage(
     ];
     let base_alpha = f32::from_bits(words[0].w);
     let texture = words[6].x;
-    let visible = SAMPLES
+    let coverage: f32 = SAMPLES
         .into_iter()
-        .filter(|bary| {
+        .map(|bary| {
             let uv = uvs[0] * bary[0] + uvs[1] * bary[1] + uvs[2] * bary[2];
             let alpha = (alphas[0] * bary[0] + alphas[1] * bary[1] + alphas[2] * bary[2])
                 * base_alpha
@@ -2214,10 +2283,16 @@ fn emitter_mask_coverage(
                         uv_y.x * uv.x + uv_y.y * uv.y + uv_y.z,
                     ),
                 );
-            alpha >= cutoff
+            if cutoff == -2.0 {
+                alpha.clamp(0.0, 1.0)
+            } else if alpha >= cutoff {
+                1.0
+            } else {
+                0.0
+            }
         })
-        .count();
-    visible as f32 / SAMPLES.len() as f32
+        .sum();
+    coverage / SAMPLES.len() as f32
 }
 
 fn build_emissive_lights(triangles: &mut [Triangle]) -> Result<Vec<GiLight>, &'static str> {
@@ -2525,6 +2600,8 @@ mod tests {
                     .chain()
                     .after(bevy::transform::TransformSystems::Propagate),
             );
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
         let mesh = app
             .world_mut()
             .resource_mut::<Assets<Mesh>>()
@@ -2721,6 +2798,8 @@ mod tests {
             .add_message::<AssetEvent<Image>>()
             .add_message::<AssetEvent<StandardMaterial>>()
             .add_systems(Update, update_scene);
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
         let mesh = app
             .world_mut()
             .resource_mut::<Assets<Mesh>>()
@@ -2789,6 +2868,8 @@ mod tests {
             .add_message::<AssetEvent<Image>>()
             .add_message::<AssetEvent<StandardMaterial>>()
             .add_systems(Update, update_scene);
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
         let mesh = app
             .world_mut()
             .resource_mut::<Assets<Mesh>>()
@@ -2875,6 +2956,256 @@ mod tests {
         assert_eq!(instance.albedo, Vec3::ZERO);
     }
 
+    #[test]
+    fn suspended_scene_revalidates_expired_asset_events_and_motion() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<GiScene>()
+            .add_message::<AssetEvent<Mesh>>()
+            .add_message::<AssetEvent<Image>>()
+            .add_message::<AssetEvent<StandardMaterial>>()
+            .add_systems(Update, update_scene);
+        let first = app
+            .world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()))
+            .id();
+        let second = app
+            .world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()))
+            .id();
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::default());
+        let image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(rgba8_image([255, 0, 0, 255]));
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                base_color_texture: Some(image.clone()),
+                ..default()
+            });
+        let entity = app
+            .world_mut()
+            .spawn((
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material.clone()),
+                RadianceCascadesGeometry,
+                GlobalTransform::IDENTITY,
+            ))
+            .id();
+        let removed = app
+            .world_mut()
+            .spawn((
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material.clone()),
+                RadianceCascadesGeometry,
+                GlobalTransform::IDENTITY,
+            ))
+            .id();
+        wait_for_blas_builds(&mut app, 1);
+        app.world_mut()
+            .entity_mut(first)
+            .get_mut::<Camera>()
+            .unwrap()
+            .is_active = false;
+        app.update();
+        assert!(app.world().resource::<GiScene>().ready);
+
+        app.world_mut()
+            .entity_mut(second)
+            .get_mut::<RadianceCascades>()
+            .unwrap()
+            .intensity = 0.0;
+        app.update();
+        let (revision, textures) = {
+            let scene = app.world().resource::<GiScene>();
+            assert!(!scene.ready);
+            (scene.revision, scene.data.textures.clone())
+        };
+        *app.world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .get_mut_untracked(mesh.id())
+            .unwrap() = Cuboid::new(2.0, 2.0, 2.0).into();
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .get_mut_untracked(image.id())
+            .unwrap()
+            .data
+            .as_mut()
+            .unwrap()[0] = 0;
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut_untracked(material.id())
+            .unwrap()
+            .base_color = Color::BLACK;
+        app.world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Modified { id: mesh.id() });
+        app.world_mut()
+            .resource_mut::<Messages<AssetEvent<Image>>>()
+            .write(AssetEvent::Modified { id: image.id() });
+        app.world_mut()
+            .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+            .write(AssetEvent::Modified { id: material.id() });
+        app.world_mut()
+            .entity_mut(removed)
+            .remove::<RadianceCascadesGeometry>();
+        *app.world_mut()
+            .entity_mut(entity)
+            .get_mut::<GlobalTransform>()
+            .unwrap() = GlobalTransform::from(Transform::from_translation(Vec3::X * 5.0));
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(app.world().resource::<GiScene>().revision, revision);
+
+        app.world_mut()
+            .entity_mut(first)
+            .get_mut::<Camera>()
+            .unwrap()
+            .is_active = true;
+        wait_for_blas_builds(&mut app, 2);
+        let scene = app.world().resource::<GiScene>();
+        assert!(scene.ready);
+        assert!(!Arc::ptr_eq(&scene.data.textures, &textures));
+        assert!(!scene.data.instance_indices.contains_key(&removed));
+        let instance = scene
+            .data
+            .instances
+            .iter()
+            .find(|item| item.entity == entity)
+            .unwrap();
+        assert_eq!(instance.albedo, Vec3::ZERO);
+        assert!(instance.min.x < 4.01 && instance.max.x > 5.99);
+    }
+
+    #[test]
+    fn pending_blas_survives_a_period_without_gi_cameras() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<GiScene>()
+            .add_systems(Update, update_scene);
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::default());
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let entity = app
+            .world_mut()
+            .spawn((
+                Mesh3d(mesh),
+                MeshMaterial3d(material),
+                RadianceCascadesGeometry,
+                GlobalTransform::IDENTITY,
+            ))
+            .id();
+        app.update();
+        assert_eq!(app.world().resource::<GiScene>().blas_builds, 0);
+        let camera = app
+            .world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()))
+            .id();
+        app.update();
+        app.world_mut().despawn(camera);
+        app.update();
+        assert!(!app.world().resource::<GiScene>().ready);
+        let camera = app
+            .world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()))
+            .id();
+        wait_for_blas_builds(&mut app, 1);
+        let scene = app.world().resource::<GiScene>();
+        assert!(scene.ready);
+        assert!(scene.data.instance_indices.contains_key(&entity));
+        assert!(app.world().get::<Camera>(camera).is_some());
+    }
+
+    #[test]
+    fn reintroduced_mesh_does_not_publish_a_stale_pending_blas() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<GiScene>()
+            .add_message::<AssetEvent<Mesh>>()
+            .add_systems(Update, update_scene);
+        let camera = app
+            .world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()))
+            .id();
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::default());
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let entity = app
+            .world_mut()
+            .spawn((
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material),
+                RadianceCascadesGeometry,
+                GlobalTransform::IDENTITY,
+            ))
+            .id();
+        // The first update starts a BLAS task, without polling its output.
+        app.update();
+        app.world_mut().despawn(camera);
+        app.update();
+        app.world_mut()
+            .entity_mut(entity)
+            .remove::<RadianceCascadesGeometry>();
+        *app.world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .get_mut_untracked(mesh.id())
+            .unwrap() = Cuboid::new(4.0, 4.0, 4.0).into();
+        app.world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Modified { id: mesh.id() });
+        for _ in 0..5 {
+            app.update();
+        }
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
+        app.update();
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(RadianceCascadesGeometry);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.update();
+            let scene = app.world().resource::<GiScene>();
+            if let Some(instance) = scene
+                .data
+                .instances
+                .iter()
+                .find(|item| item.entity == entity)
+            {
+                assert!(instance.min.x < -1.99 && instance.max.x > 1.99);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "updated BLAS did not finish"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn blas_disk_cache_round_trips_and_rejects_corruption() {
@@ -2915,6 +3246,8 @@ mod tests {
             .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<GiScene>()
             .add_systems(Update, update_scene);
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
         let mesh = app
             .world_mut()
             .resource_mut::<Assets<Mesh>>()
@@ -2974,6 +3307,8 @@ mod tests {
             .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<GiScene>()
             .add_systems(Update, update_scene);
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
         let mesh = app
             .world_mut()
             .resource_mut::<Assets<Mesh>>()
@@ -3034,7 +3369,7 @@ mod tests {
                     .data
                     .lights
                     .iter()
-                    .zip(&scene.data.light_layers)
+                    .zip(scene.data.light_layers.iter())
                     .filter(|(_, layers)| view_mask.intersects(layers))
                     .map(|(light, _)| *light)
                     .collect();
@@ -3081,6 +3416,8 @@ mod tests {
             .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<GiScene>()
             .add_systems(Update, update_scene);
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
         let mut indexed: Mesh = Rectangle::new(2.0, 2.0).into();
         indexed.insert_indices(Indices::U16(vec![0, 1, 2, 0, 2, 3]));
         indexed.insert_attribute(Mesh::ATTRIBUTE_UV_1, vec![[0.25, 0.75]; 4]);
@@ -3116,7 +3453,9 @@ mod tests {
         assert_eq!(scene.data.vertices.len(), 7);
         assert_eq!(scene.data.triangles.len(), 3);
         assert_eq!(scene.blas_builds, 2);
-        assert_eq!(scene.data.geometry_words.len(), 1 + 3 + 7 * 5);
+        // Header and three triangles, padded so vertices start on a vertex stride.
+        assert_eq!(scene.data.geometry_words.len(), 5 + 7 * 5);
+        assert_eq!(scene.data.geometry_words[0].y, 5);
         for triangle in scene.data.triangles.iter() {
             for (index, position) in triangle
                 .indices
@@ -3187,6 +3526,8 @@ mod tests {
             .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<GiScene>()
             .add_systems(Update, update_scene);
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
         let mesh = app
             .world_mut()
             .resource_mut::<Assets<Mesh>>()
@@ -3328,6 +3669,8 @@ mod tests {
             .init_resource::<GiScene>()
             .add_message::<AssetEvent<Mesh>>()
             .add_systems(Update, update_scene);
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
         let mesh = app
             .world_mut()
             .resource_mut::<Assets<Mesh>>()
@@ -3566,6 +3909,8 @@ mod tests {
             .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<GiScene>()
             .add_systems(Update, update_scene);
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
 
         let mut morphs = vec![bevy::mesh::morph::MorphAttributes::default(); 6];
         morphs[1].position = Vec3::X * 2.0;
@@ -3702,6 +4047,8 @@ mod tests {
             .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<GiScene>()
             .add_systems(Update, update_scene);
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
         let mesh = app
             .world_mut()
             .resource_mut::<Assets<Mesh>>()
@@ -3912,6 +4259,8 @@ mod tests {
             .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<GiScene>()
             .add_systems(Update, update_scene);
+        app.world_mut()
+            .spawn((Camera::default(), RadianceCascades::default()));
         let point = app
             .world_mut()
             .spawn((
