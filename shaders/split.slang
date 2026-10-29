@@ -82,6 +82,10 @@ float4 dependencySegmentSphere(float3 start, float3 end, float padding) {
     return float4(center, radius);
 }
 
+bool sameBits(float4 left, float4 right) {
+    return all(asuint(left) == asuint(right));
+}
+
 float4 unionConservativeSpheres(float4 left, float4 right) {
     bool leftFinite = all(isfinite(left));
     bool rightFinite = all(isfinite(right));
@@ -411,6 +415,13 @@ void interpolateMergedChildSources(int3 base, float3 fraction, uint direction,
             if (index == EMPTY) continue;
             float4 childLightHitBounds = entries[index].boundaryMerged;
             bool supported = false;
+            // The sources usually accumulate the same corners, so their
+            // bounds stay bit-identical. Reuse a union already computed from
+            // an identical accumulator this corner instead of repeating it.
+            float4 backgroundBefore = backgroundBounds;
+            float4 emissiveBefore = emissiveBounds;
+            bool backgroundUnited = false;
+            bool emissiveUnited = false;
             // RGB is conditional per source; support stays independent until packing.
             if ((active & BACKGROUND_SOURCE) != 0u) {
                 float4 sample = entries[index].merged;
@@ -419,6 +430,7 @@ void interpolateMergedChildSources(int3 base, float3 fraction, uint direction,
                     backgroundSum += sample.xyz * supportedWeight;
                     backgroundTotal += supportedWeight;
                     backgroundBounds = unionConservativeSpheres(backgroundBounds, childLightHitBounds);
+                    backgroundUnited = true;
                     supported = true;
                 }
             }
@@ -428,7 +440,10 @@ void interpolateMergedChildSources(int3 base, float3 fraction, uint direction,
                     float supportedWeight = weight * saturate(sample.w);
                     emissiveSum += sample.xyz * supportedWeight;
                     emissiveTotal += supportedWeight;
-                    emissiveBounds = unionConservativeSpheres(emissiveBounds, childLightHitBounds);
+                    emissiveBounds = backgroundUnited && sameBits(emissiveBounds, backgroundBefore)
+                        ? backgroundBounds
+                        : unionConservativeSpheres(emissiveBounds, childLightHitBounds);
+                    emissiveUnited = true;
                     supported = true;
                 }
             }
@@ -438,7 +453,11 @@ void interpolateMergedChildSources(int3 base, float3 fraction, uint direction,
                     float supportedWeight = weight * saturate(sample.w);
                     punctualSum += sample.xyz * supportedWeight;
                     punctualTotal += supportedWeight;
-                    punctualBounds = unionConservativeSpheres(punctualBounds, childLightHitBounds);
+                    punctualBounds = backgroundUnited && sameBits(punctualBounds, backgroundBefore)
+                        ? backgroundBounds
+                        : emissiveUnited && sameBits(punctualBounds, emissiveBefore)
+                            ? emissiveBounds
+                            : unionConservativeSpheres(punctualBounds, childLightHitBounds);
                     supported = true;
                 }
             }
