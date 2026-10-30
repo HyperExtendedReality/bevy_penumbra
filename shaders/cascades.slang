@@ -187,6 +187,11 @@ TransportRadiance clampOutgoingTransportRadiance(TransportRadiance radiance) {
     return radiance;
 }
 
+// Ray-traced GI cache shading takes indirect light from the cell's stored
+// bounce instead of the cascades' secondary cache.
+static bool rtgiBounceActive = false;
+static TransportRadiance rtgiBounce;
+
 TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 direction, Hit hit,
                                out bool querySupported,
                                inout DependencyContext dependency,
@@ -229,9 +234,9 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     // light from the cache and skips the environment visibility rays. The
     // lookup reads only the previous frame's cache, so deferred recording and
     // replay make the same choice and issue the same query sequence.
-    float indirectBackgroundCoverage;
-    TransportRadiance indirect = secondaryFeedback(position, normal, dependency,
-        indirectBackgroundCoverage);
+    float indirectBackgroundCoverage = 0.0;
+    TransportRadiance indirect = rtgiBounceActive ? rtgiBounce
+        : secondaryFeedback(position, normal, dependency, indirectBackgroundCoverage);
     bool skyFromCache = cachedHitSky(params) && indirectBackgroundCoverage > 0.0;
     bool emissiveSupported, environmentSupported = true, conventionalSupported;
     float3 emissiveNee = emissiveResponseTracked(position, normal, geometricNormal, view,
@@ -775,7 +780,7 @@ struct RtgiCacheCell {
     float4 origin;    // xyz: recorded ray origin; w: hit distance
     float4 direction; // xyz: recorded ray direction; w: hit footprint
     uint4 hit;        // x: triangle; y: instance; z: barycentric yz (2 x unorm16); w: last used frame
-    float4 extra;     // x: background fraction of the radiance
+    float4 extra;     // x: background fraction of the radiance; yzw: bounce radiance
 };
 [[vk::binding(42, 0)]] RWStructuredBuffer<RtgiReservoir> rtgiReservoirs;
 [[vk::binding(43, 0)]] StructuredBuffer<RtgiReservoir> rtgiPreviousReservoirs;
@@ -868,6 +873,51 @@ void rtgiCacheStoreHit(uint slot, float3 origin, float3 direction, Hit hit) {
         barycentric.x | (barycentric.y << 16u), params.frame.x);
 }
 
+float3 rtgiCosineDirection(float3 normal, inout uint state) {
+    float u = rtgiRandom(state);
+    float phi = 2.0 * PI * rtgiRandom(state);
+    float3 tangent = normalize(abs(normal.y) < 0.999
+        ? cross(float3(0.0, 1.0, 0.0), normal)
+        : cross(float3(1.0, 0.0, 0.0), normal));
+    float3 bitangent = cross(normal, tangent);
+    return normalize(tangent * (cos(phi) * sqrt(u))
+        + bitangent * (sin(phi) * sqrt(u)) + normal * sqrt(1.0 - u));
+}
+
+// Reads the cache cell at a gather ray's hit, claiming one and queueing it
+// for shading on `parity`'s queue when missing. Returns the cell's radiance
+// (w: background fraction), zero until the cell is first shaded.
+float4 rtgiCacheGather(float3 origin, float3 direction, Hit hit, float3 position,
+                       float3 normal, uint parity, inout uint state) {
+    bool inserted;
+    uint slot = rtgiCacheFind(position, normal, true, inserted);
+    if (slot == EMPTY) return 0.0;
+    if (inserted) {
+        rtgiCacheStoreHit(slot, origin, direction, hit);
+        rtgiCacheCells[slot].extra = 0.0;
+        uint queued = rtgiCacheQueue[parity].add(1u);
+        if (queued < RTGI_CACHE_QUEUE)
+            rtgiCacheQueue[2u + parity * RTGI_CACHE_QUEUE + queued].store(slot);
+    } else {
+        // Keep the cell alive; occasionally move its shading point so the
+        // cell averages over its area.
+        rtgiCacheCells[slot].hit.w = params.frame.x;
+        if (rtgiRandom(state) < 0.125)
+            rtgiCacheStoreHit(slot, origin, direction, hit);
+    }
+    RtgiCacheCell cell = rtgiCacheCells[slot];
+    return cell.radiance.w > 0.0 ? float4(max(cell.radiance.rgb, 0.0), cell.extra.x)
+        : 0.0;
+}
+
+// shortcut: splits the bounce by the cell's own background fraction; store the bounce's own split if sky tint looks off.
+void rtgiUseCellBounce(RtgiCacheCell cell) {
+    rtgiBounceActive = true;
+    rtgiBounce = (TransportRadiance)0;
+    rtgiBounce.background = cell.extra.yzw * cell.extra.x;
+    rtgiBounce.punctual = cell.extra.yzw * (1.0 - cell.extra.x);
+}
+
 // Cache cells are shaded like the cascades' deferred primary trace: hit
 // shading never shares a kernel with a ray-query loop, which hung the driver.
 // rtgiCacheRecord shades with visibility recorded, rtgiCacheVisibility traces
@@ -928,6 +978,7 @@ void rtgiCacheRecord(uint3 thread : SV_DispatchThreadID) {
     visibilitySlot = lane;
     visibilityQueries = 0u;
     RtgiCacheCell cell = rtgiCacheCells[slot];
+    rtgiUseCellBounce(cell);
     bool supported;
     DependencyContext dependency = dependencyEmpty();
     outgoingTransportRadianceTracked(cell.origin.xyz, cell.direction.xyz, rtgiCellHit(cell),
@@ -951,6 +1002,7 @@ void rtgiCacheShade(uint3 thread : SV_DispatchThreadID) {
     visibilitySlot = lane;
     visibilityQueries = 0u;
     RtgiCacheCell cell = rtgiCacheCells[slot];
+    rtgiUseCellBounce(cell);
     bool supported;
     DependencyContext dependency = dependencyEmpty();
     TransportRadiance radiance = outgoingTransportRadianceTracked(cell.origin.xyz,
@@ -976,6 +1028,41 @@ void rtgiCacheVisibility(uint3 thread : SV_DispatchThreadID) {
     if (thread.x >= heads[deferredQueryCountHead(params)].load()) return;
     transportAdmissionBypass = true;
     traceVisibilityQuery(heads[deferredQueryListHead(params) + thread.x].load());
+}
+
+// Multi-bounce: traces one cosine-weighted ray from each cell shaded this
+// frame and stores the radiance of the cell it hits. The cell's next shading
+// adds that as indirect light, so light gains a bounce per cache update.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void rtgiCacheBounce(uint3 thread : SV_DispatchThreadID) {
+    uint lane = thread.x;
+    if (lane >= RTGI_CACHE_WORK) return;
+    uint slot = rtgiCacheQueue[rtgiCacheWorkHead(lane)].load();
+    if (slot == EMPTY || slot >= RTGI_CACHE_CAPACITY) return;
+    transportAdmissionBypass = true;
+    RtgiCacheCell cell = rtgiCacheCells[slot];
+    float3 position = cell.origin.xyz + cell.direction.xyz * cell.origin.w;
+    float3 normal = hitAttributes(rtgiCellHit(cell)).geometricNormal;
+    if (dot(normal, cell.direction.xyz) > 0.0) normal = -normal;
+    uint state = rtgiHash(slot * 6271u ^ rtgiHash(params.frame.x * 9781u + 3u));
+    float3 direction = rtgiCosineDirection(normal, state);
+    float3 origin = rayOffset(position, normal, params.tuning.z);
+    DependencyContext traceDependency;
+    float dependencyStart, dependencyDistance, dependencyPadding;
+    Hit hit = traceRayTracked(origin, direction, 1e20, traceDependency,
+        dependencyStart, dependencyDistance, dependencyPadding);
+    // Escaped rays add nothing: cell shading takes the sky through NEE.
+    float3 bounce = 0.0;
+    if ((hit.errors & HIT_QUERY_UNSUPPORTED) == 0u && hit.triangle != EMPTY) {
+        float3 hitPosition = origin + direction * hit.distance;
+        float3 hitNormal = hitAttributes(hit).geometricNormal;
+        if (dot(hitNormal, direction) > 0.0) hitNormal = -hitNormal;
+        // Queued for the next frame: this frame's queue is already drained.
+        bounce = rtgiCacheGather(origin, direction, hit, hitPosition, hitNormal,
+            1u - (params.frame.x & 1u), state).rgb;
+    }
+    rtgiCacheCells[slot].extra.yzw = bounce;
 }
 
 struct RtgiReceiver {
@@ -1067,14 +1154,7 @@ void rtgiSample(uint3 thread : SV_DispatchThreadID) {
     uint state = rtgiHash(index * 9781u ^ rtgiHash(params.frame.x * 6271u + 1u));
 
     // Initial candidate: one cosine-weighted path vertex.
-    float u = rtgiRandom(state);
-    float phi = 2.0 * PI * rtgiRandom(state);
-    float3 tangent = normalize(abs(receiver.normal.y) < 0.999
-        ? cross(float3(0.0, 1.0, 0.0), receiver.normal)
-        : cross(float3(1.0, 0.0, 0.0), receiver.normal));
-    float3 bitangent = cross(receiver.normal, tangent);
-    float3 direction = normalize(tangent * (cos(phi) * sqrt(u))
-        + bitangent * (sin(phi) * sqrt(u)) + receiver.normal * sqrt(1.0 - u));
+    float3 direction = rtgiCosineDirection(receiver.normal, state);
     RtgiReservoir candidate = (RtgiReservoir)0;
     float candidateWeight = 0.0;
     if (dot(direction, receiver.geometricNormal) > 0.0) {
@@ -1095,26 +1175,8 @@ void rtgiSample(uint3 thread : SV_DispatchThreadID) {
                 if (dot(normal, direction) > 0.0) normal = -normal;
                 candidate.sample.xyz = position;
                 candidate.normal.xyz = normal;
-                bool inserted;
-                uint slot = rtgiCacheFind(position, normal, true, inserted);
-                if (slot != EMPTY) {
-                    uint parity = params.frame.x & 1u;
-                    if (inserted) {
-                        rtgiCacheStoreHit(slot, origin, direction, hit);
-                        uint queued = rtgiCacheQueue[parity].add(1u);
-                        if (queued < RTGI_CACHE_QUEUE)
-                            rtgiCacheQueue[2u + parity * RTGI_CACHE_QUEUE + queued].store(slot);
-                    } else {
-                        // Keep the cell alive; occasionally move its shading
-                        // point so the cell averages over its area.
-                        rtgiCacheCells[slot].hit.w = params.frame.x;
-                        if (rtgiRandom(state) < 0.125)
-                            rtgiCacheStoreHit(slot, origin, direction, hit);
-                    }
-                    RtgiCacheCell cell = rtgiCacheCells[slot];
-                    if (cell.radiance.w > 0.0)
-                        candidate.radiance = float4(max(cell.radiance.rgb, 0.0), cell.extra.x);
-                }
+                candidate.radiance = rtgiCacheGather(origin, direction, hit, position, normal,
+                    params.frame.x & 1u, state);
             }
             // Source pdf cos/pi, target luminance*cos: weight pi*luminance.
             candidateWeight = PI * rtgiLuminance(candidate.radiance.rgb);

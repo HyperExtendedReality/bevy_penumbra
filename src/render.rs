@@ -68,7 +68,7 @@ const COLD_RANK_PHASES: [usize; 3] = [1, 2, 3];
 pub(crate) const PROBE_SIZE: u64 = 1792;
 const PACK_PROBE_GROUPS_PER_ROW: u64 = 256;
 const CACHE_COMMIT: usize = 14;
-const COMPUTE_ENTRIES: [&str; 29] = [
+const COMPUTE_ENTRIES: [&str; 30] = [
     "clear",
     "seed",
     "parents",
@@ -98,6 +98,7 @@ const COMPUTE_ENTRIES: [&str; 29] = [
     "rtgiCacheRecord",
     "rtgiCacheVisibility",
     "rtgiCacheShade",
+    "rtgiCacheBounce",
 ];
 const SLANG_OPTIMIZATION_LEVEL: u8 = 2;
 const HISTORY_DIAGNOSTIC_WORDS: u64 = 26;
@@ -452,6 +453,8 @@ const RTGI_RESOLVE: usize = 25;
 const RTGI_CACHE_RECORD: usize = 26;
 const RTGI_CACHE_VISIBILITY: usize = 27;
 const RTGI_CACHE_SHADE: usize = 28;
+/// Multi-bounce: one gather ray per shaded cell, read by its next shading.
+const RTGI_CACHE_BOUNCE: usize = 29;
 /// Bytes of one `RtgiReservoir` in cascades.slang.
 const RTGI_RESERVOIR_BYTES: u64 = 64;
 // Mirror RTGI_CACHE_* in cascades.slang.
@@ -464,7 +467,8 @@ const HARDWARE_TRAVERSAL_PIPELINES: u64 = (1 << HARDWARE_TRACE_DEFERRED)
     | (1 << SUN_SHADOWS_HARDWARE)
     | (1 << RTGI_SAMPLE)
     | (1 << RTGI_RESOLVE)
-    | (1 << RTGI_CACHE_VISIBILITY);
+    | (1 << RTGI_CACHE_VISIBILITY)
+    | (1 << RTGI_CACHE_BOUNCE);
 const RAY_QUERY_DEFINE: &str = "PENUMBRA_HARDWARE_RAY_QUERY";
 
 fn hardware_traversal_entry(entry: &str) -> bool {
@@ -476,6 +480,7 @@ fn hardware_traversal_entry(entry: &str) -> bool {
             | "rtgiSample"
             | "rtgiResolve"
             | "rtgiCacheVisibility"
+            | "rtgiCacheBounce"
     )
 }
 
@@ -9035,7 +9040,7 @@ fn render(
                 }
                 // Ray-traced GI writes worldResolve's outputs.
                 "worldResolve" | "rtgiSample" | "rtgiResolve" | "rtgiCacheRecord"
-                | "rtgiCacheVisibility" | "rtgiCacheShade" => {
+                | "rtgiCacheVisibility" | "rtgiCacheShade" | "rtgiCacheBounce" => {
                     &bindings.world_resolve
                 }
                 _ => &bindings.compute[level],
@@ -9129,7 +9134,8 @@ fn render(
         && compute[RTGI_RESOLVE].is_some()
         && compute[RTGI_CACHE_RECORD].is_some()
         && compute[RTGI_CACHE_VISIBILITY].is_some()
-        && compute[RTGI_CACHE_SHADE].is_some();
+        && compute[RTGI_CACHE_SHADE].is_some()
+        && compute[RTGI_CACHE_BOUNCE].is_some();
     // The multi-bounce secondary cache belongs to the cascades.
     let secondary_enabled = bindings.secondary_enabled && !ray_traced;
     shaders.status.set_active_method(if ray_traced {
@@ -9153,7 +9159,8 @@ fn render(
         for (name, stage) in [("rtgiSample", RTGI_SAMPLE), ("rtgiResolve", RTGI_RESOLVE)] {
             dispatch(name, compute[stage].expect("checked"), 0, shading_x, shading_y);
         }
-        // Shades cells queued by this frame's gather; the next gather reads them.
+        // Shades cells queued by this frame's gather, then traces their bounce rays;
+        // the next gather reads the cells.
         let work_groups = (RTGI_CACHE_QUEUE + RTGI_CACHE_REFRESH).div_ceil(64) as u32;
         for (name, stage, groups) in [
             ("rtgiCacheRecord", RTGI_CACHE_RECORD, work_groups),
@@ -9163,6 +9170,7 @@ fn render(
                 work_groups * DEFERRED_VISIBILITY_QUERIES as u32,
             ),
             ("rtgiCacheShade", RTGI_CACHE_SHADE, work_groups),
+            ("rtgiCacheBounce", RTGI_CACHE_BOUNCE, work_groups),
         ] {
             dispatch(name, compute[stage].expect("checked"), 0, groups, 1);
         }
