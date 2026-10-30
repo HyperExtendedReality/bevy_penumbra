@@ -19,6 +19,8 @@ mod environment;
 mod frame_timing;
 pub use frame_timing::FrameTimingPlugin;
 mod material;
+#[cfg(feature = "pxtgi")]
+pub mod pxtgi;
 pub use environment::RadianceCascadesEnvironment;
 mod receiver;
 mod render;
