@@ -484,25 +484,100 @@ fn hardware_traversal_entry(entry: &str) -> bool {
     )
 }
 
-/// Pipelines a view cannot render without. Hardware traversal is optional:
-/// software traversal produces the same transport while it is unavailable.
+/// Ray-traced GI's own passes.
+const RTGI_PIPELINES: u64 = (1 << RTGI_SAMPLE)
+    | (1 << RTGI_RESOLVE)
+    | (1 << RTGI_CACHE_RECORD)
+    | (1 << RTGI_CACHE_VISIBILITY)
+    | (1 << RTGI_CACHE_SHADE)
+    | (1 << RTGI_CACHE_BOUNCE);
+
+/// The deferred primary trace: closest hits, record, visibility, resolve.
+/// Optional: until all four are built, the immediate `trace` kernel takes
+/// every receiver. `traceDeferred` alone can take the driver most of a minute
+/// to compile cold, and `trace` about ten seconds.
+const DEFERRED_TRACE_PIPELINES: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+
+/// The cascades' pipelines, which every view can fall back to. Hardware
+/// traversal and the deferred trace are optional: software traversal and the
+/// immediate trace produce the same transport while they are unavailable.
 fn required_pipelines(settings: RadianceCascades) -> u64 {
-    let mut required = ((1u64 << COMPUTE_ENTRIES.len()) - 1) & !HARDWARE_TRAVERSAL_PIPELINES;
+    let mut required = ((1u64 << COMPUTE_ENTRIES.len()) - 1)
+        & !HARDWARE_TRAVERSAL_PIPELINES
+        & !RTGI_PIPELINES
+        & !DEFERRED_TRACE_PIPELINES;
     if settings.spatial_filter_steps == 0 {
         required &= !(1 << 13);
     }
     required
 }
 
-/// Pipelines to build for a view: the required set plus the hardware
-/// traversal variants when the view requests them.
+/// Ray-traced GI's pipelines: its own passes plus clear, temporal and denoise.
+fn ray_traced_pipelines(settings: RadianceCascades) -> u64 {
+    let mut required = RTGI_PIPELINES | 1 | (1 << 12) | (1 << 13);
+    if settings.spatial_filter_steps == 0 {
+        required &= !(1 << 13);
+    }
+    required
+}
+
+fn ray_traced_requested(settings: RadianceCascades) -> bool {
+    settings.method == crate::GiMethod::RayTraced && settings.hardware_ray_queries
+}
+
+/// Whether the pipelines in `ready` let a view render: the cascades', or
+/// ray-traced GI's when the view selects it, so neither method waits for
+/// the other's kernels to compile.
+fn view_pipelines_ready(settings: RadianceCascades, ready: u64) -> bool {
+    required_pipelines(settings) & !ready == 0
+        || ray_traced_requested(settings) && ray_traced_pipelines(settings) & !ready == 0
+}
+
+/// Pipelines to build for a view: the cascades with their deferred trace,
+/// their hardware traversal variants when requested, and ray-traced GI when
+/// selected.
 fn wanted_pipelines(settings: RadianceCascades) -> u64 {
     required_pipelines(settings)
+        | DEFERRED_TRACE_PIPELINES
         | if settings.hardware_ray_queries {
-            HARDWARE_TRAVERSAL_PIPELINES
+            HARDWARE_TRAVERSAL_PIPELINES & !RTGI_PIPELINES
         } else {
             0
         }
+        | if ray_traced_requested(settings) {
+            ray_traced_pipelines(settings)
+        } else {
+            0
+        }
+}
+
+/// Compile order: ray-traced GI's kernels first when any view selects it,
+/// then the long ray-tracing kernels, so their pipeline creation overlaps
+/// the smaller stages instead of extending the end of startup.
+fn compile_priority(ray_traced_first: bool) -> impl Iterator<Item = usize> {
+    const RTGI: [usize; 9] = [
+        RTGI_CACHE_SHADE,
+        RTGI_CACHE_RECORD,
+        RTGI_SAMPLE,
+        RTGI_CACHE_BOUNCE,
+        RTGI_RESOLVE,
+        RTGI_CACHE_VISIBILITY,
+        12,
+        0,
+        13,
+    ];
+    // The immediate trace first: the cascades can start on it alone.
+    const SPLIT: [usize; 6] = [7, 12, 16, 17, 18, 20];
+    let (first, second) = if ray_traced_first {
+        (&RTGI[..], &SPLIT[..])
+    } else {
+        (&SPLIT[..], &RTGI[..])
+    };
+    first
+        .iter()
+        .chain(second)
+        .copied()
+        .chain(0..COMPUTE_ENTRIES.len())
 }
 
 const MODULES: [(&str, &[&str]); 4] = [
@@ -838,6 +913,8 @@ struct Parameters {
     emissive_dirty_max: Vec4,
     light_dirty_min: Vec4,
     light_dirty_max: Vec4,
+    /// Ray-traced GI: multi-bounce, spatial samples, reservoir history, reserved.
+    ray_traced: UVec4,
 }
 
 #[derive(Resource)]
@@ -872,6 +949,13 @@ impl Pipelines {
     fn pipeline(&self, index: usize) -> Option<&ComputePipeline> {
         self.compute[index].as_ref()
     }
+
+    /// Bit `i` set when compute pipeline `i` is built.
+    fn ready_mask(&self) -> u64 {
+        (0..COMPUTE_ENTRIES.len())
+            .filter(|&i| self.compute[i].is_some())
+            .fold(0, |mask, i| mask | (1 << i))
+    }
 }
 
 type ComputeShaderSources = Arc<Mutex<[Option<Arc<str>>; COMPUTE_ENTRIES.len()]>>;
@@ -895,7 +979,7 @@ fn ray_query_source(source: &str) -> Result<String, String> {
         let end = start + source[start..].find('(')?;
         Some(source[start..end].to_owned())
     };
-    let closest = callback("hardwareClosestCandidate");
+    let closest = callback("hardwareClosestCandidate").zip(callback("hardwareCommittedHit"));
     let occluded = callback("hardwareOccludedCandidate");
     if closest.is_none() && occluded.is_none() {
         return Err("hardware traversal module has no candidate callback".into());
@@ -904,7 +988,7 @@ fn ray_query_source(source: &str) -> Result<String, String> {
         "enable wgpu_ray_query;\n\
          @group(0) @binding({TLAS_BINDING}) var penumbraTlas: acceleration_structure;\n",
     );
-    if let Some(closest) = closest {
+    if let Some((closest, committed_hit)) = closest {
         prelude.push_str(&format!(
             "fn penumbraRayQueryClosest(origin: vec3<f32>, direction: vec3<f32>, limit: f32, any_hit: bool, mask: u32) -> bool {{
     var query: ray_query;
@@ -917,12 +1001,12 @@ fn ray_query_source(source: &str) -> Result<String, String> {
             if (any_hit) {{ rayQueryTerminate(&query); }}
         }}
     }}
-    // A hardware-opaque hit commits without the candidate test. Run it once
-    // here so its hit record matches the shader's triangle test; a hit already
-    // confirmed above is not closer than itself and is kept unchanged.
+    // A hardware-opaque hit commits without the candidate test; record it from
+    // the hardware intersection. A confirmed hit is kept.
     let committed = rayQueryGetCommittedIntersection(&query);
     if (committed.kind != RAY_QUERY_INTERSECTION_NONE) {{
-        {closest}(committed.instance_custom_data, committed.primitive_index);
+        {committed_hit}(committed.instance_custom_data, committed.primitive_index, committed.t,
+            committed.barycentrics);
     }}
     return true;
 }}
@@ -1196,20 +1280,10 @@ fn compile_view_shaders(
             .map(|(_, settings)| settings.sanitized()),
     );
     let modules: Vec<_> = shader_modules().collect();
-    // Start the long ray-tracing kernels first, so their pipeline creation can
-    // overlap the smaller stages instead of extending the end of startup.
-    for index in [
-        17,
-        18,
-        20,
-        7,
-        12,
-        15,
-        COMPUTE_ENTRIES.len(),
-        COMPUTE_ENTRIES.len() + 1,
-    ]
-    .into_iter()
-    .chain(0..modules.len())
+    for index in [COMPUTE_ENTRIES.len(), COMPUTE_ENTRIES.len() + 1]
+        .into_iter()
+        .chain(compile_priority(required & RTGI_PIPELINES != 0))
+        .chain(0..modules.len())
     {
         if compilation.jobs.len() >= 4 {
             break;
@@ -1342,14 +1416,18 @@ fn finalize_view_lighting(
         return;
     };
     commands.entity(entity).insert(GiLightingState(false));
-    let required = required_pipelines(settings);
-    let pending: Vec<_> = (0..COMPUTE_ENTRIES.len())
-        .filter_map(|i| {
-            (required & (1 << i) != 0 && pipelines.pipeline(i).is_none())
-                .then_some(COMPUTE_ENTRIES[i])
-        })
-        .collect();
-    if !pending.is_empty() {
+    if !view_pipelines_ready(settings, pipelines.ready_mask()) {
+        let required = if ray_traced_requested(settings) {
+            ray_traced_pipelines(settings)
+        } else {
+            required_pipelines(settings)
+        };
+        let pending: Vec<_> = (0..COMPUTE_ENTRIES.len())
+            .filter_map(|i| {
+                (required & (1 << i) != 0 && pipelines.pipeline(i).is_none())
+                    .then_some(COMPUTE_ENTRIES[i])
+            })
+            .collect();
         report(&format!(
             "waiting for GPU compute pipelines: {}",
             pending.join(", ")
@@ -1407,9 +1485,7 @@ fn finalize_view_lighting(
         report("waiting for current scene snapshot");
         return;
     }
-    let required = required_pipelines(buffers.settings);
-    if (0..COMPUTE_ENTRIES.len())
-        .any(|i| required & (1 << i) != 0 && pipelines.pipeline(i).is_none())
+    if !view_pipelines_ready(buffers.settings, pipelines.ready_mask())
         || cache.get_render_pipeline(pipelines.composite).is_none()
         || cache.get_compute_pipeline(pipelines.composite_anchors).is_none()
     {
@@ -1633,6 +1709,10 @@ fn compute_layout(ray_query: bool) -> BindGroupLayoutDescriptor {
             .entries
             .push(storage_buffer_sized(false, None).build(binding, ShaderStages::COMPUTE));
     }
+    // Ray-traced GI's screen-space cache: last frame's lit image.
+    layout.entries.push(
+        texture_2d(TextureSampleType::Float { filterable: false }).build(47, ShaderStages::COMPUTE),
+    );
     layout
         .entries
         .retain(|entry| !matches!(entry.binding, 5 | 17 | 18 | 19 | 21 | 24 | 30));
@@ -4896,6 +4976,12 @@ struct ViewBuffers {
     rtgi_reservoirs: [Buffer; 2],
     /// Ray-traced GI world radiance cache keys, cells and shading queue.
     rtgi_cache: [Buffer; 3],
+    /// Last frame's composed image over the viewport, read by ray-traced GI
+    /// for on-screen hits; one texel unless the view uses `GiMethod::RayTraced`.
+    _rtgi_lit_history: Texture,
+    rtgi_lit_history_view: TextureView,
+    /// The lit history holds the previous ray-traced frame.
+    rtgi_lit_history_valid: AtomicBool,
     /// Packed hard sun-shadow bits; see `sun_shadow_mask_size`.
     _sun_shadow_mask: Texture,
     sun_shadow_mask_view: TextureView,
@@ -5083,6 +5169,7 @@ fn view_binding_key(
     ] {
         hash_buffer(buffer, &mut hasher);
     }
+    hash_view(&buffers.rtgi_lit_history_view, &mut hasher);
     if let Some(secondary) = &buffers.secondary {
         for buffer in [
             &secondary.caches[parity].heads,
@@ -5839,6 +5926,27 @@ impl ViewBuffers {
                 mapped_at_creation: false,
             })
         });
+        let lit_history_size = if settings.method == crate::GiMethod::RayTraced {
+            viewport_size.max(UVec2::ONE)
+        } else {
+            UVec2::ONE
+        };
+        let rtgi_lit_history = device.create_texture(&TextureDescriptor {
+            label: Some("split_rc_rtgi_lit_history"),
+            size: Extent3d {
+                width: lit_history_size.x,
+                height: lit_history_size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba16Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let rtgi_lit_history_view =
+            rtgi_lit_history.create_view(&TextureViewDescriptor::default());
         let sun_shadow_mask = make_texture(sun_shadow_mask_size(viewport_size));
         let sun_shadow_mask_view = sun_shadow_mask.create_view(&TextureViewDescriptor::default());
         Self {
@@ -5870,6 +5978,9 @@ impl ViewBuffers {
             composite_anchor_views,
             rtgi_reservoirs,
             rtgi_cache,
+            _rtgi_lit_history: rtgi_lit_history,
+            rtgi_lit_history_view,
+            rtgi_lit_history_valid: AtomicBool::new(false),
             _sun_shadow_mask: sun_shadow_mask,
             sun_shadow_mask_view,
             uniforms: std::array::from_fn(|_| UniformBuffer::default()),
@@ -6187,10 +6298,7 @@ fn prepare(
     // Trace and gather dominate cold Vulkan compilation. Queue them before the
     // short kernels so they can compile while the rest of the frame pipeline is
     // being prepared.
-    for i in [17, 18, 20, 7, 12, 16]
-        .into_iter()
-        .chain((0..COMPUTE_ENTRIES.len()).filter(|i| !matches!(i, 17 | 18 | 20 | 7 | 12 | 16)))
-    {
+    for i in compile_priority(wanted & RTGI_PIPELINES != 0) {
         let entry = &COMPUTE_ENTRIES[i];
         if compiling >= max_concurrent || pipelines.driver_cache_save.is_some() {
             break;
@@ -8178,7 +8286,9 @@ fn prepare(
             environment: settings.environment.to_vec4().with_w(camera.exposure),
             history: Vec4::new(
                 settings.temporal_blend,
-                0.0,
+                // The deferred trace is still compiling: the immediate trace
+                // takes every receiver.
+                f32::from(pipelines.ready_mask() & DEFERRED_TRACE_PIPELINES != DEFERRED_TRACE_PIPELINES),
                 if buffers.history_valid.load(Ordering::Relaxed) {
                     1.0
                 } else {
@@ -8306,6 +8416,12 @@ fn prepare(
             emissive_dirty_max,
             light_dirty_min,
             light_dirty_max,
+            ray_traced: UVec4::new(
+                u32::from(settings.ray_traced.multi_bounce),
+                settings.ray_traced.spatial_samples.min(16),
+                settings.ray_traced.reservoir_history.clamp(1, 255),
+                u32::from(buffers.rtgi_lit_history_valid.load(Ordering::Relaxed)),
+            ),
         };
         for (level, uniform) in buffers.uniforms.iter_mut().enumerate() {
             let mut level_params = params;
@@ -8391,9 +8507,7 @@ fn prepare(
                 key: binding_key,
                 bindings: bindings.clone(),
             });
-            let required = required_pipelines(settings);
-            let pipelines_ready = (0..COMPUTE_ENTRIES.len())
-                .all(|i| required & (1 << i) == 0 || pipelines.pipeline(i).is_some())
+            let pipelines_ready = view_pipelines_ready(settings, pipelines.ready_mask())
                 && cache.get_render_pipeline(pipelines.composite).is_some()
                 && cache.get_compute_pipeline(pipelines.composite_anchors).is_some();
             let (target_size, viewport) = camera_descriptor(Some(camera));
@@ -8509,6 +8623,10 @@ fn prepare(
                     resource: reservoirs.as_entire_binding(),
                 });
             }
+            entries.push(BindGroupEntry {
+                binding: 47,
+                resource: BindingResource::TextureView(&buffers.rtgi_lit_history_view),
+            });
             if let Some(tlas) = hardware_tlas {
                 entries.push(BindGroupEntry {
                     binding: TLAS_BINDING,
@@ -8715,9 +8833,7 @@ fn prepare(
             &cache.get_bind_group_layout(&pipelines.composite_layout),
             &composite_entries,
         );
-        let required = required_pipelines(settings);
-        let pipelines_ready = (0..COMPUTE_ENTRIES.len())
-            .all(|i| required & (1 << i) == 0 || pipelines.pipeline(i).is_some())
+        let pipelines_ready = view_pipelines_ready(settings, pipelines.ready_mask())
             && cache.get_render_pipeline(pipelines.composite).is_some()
             && cache.get_compute_pipeline(pipelines.composite_anchors).is_some();
         let (target_size, viewport) = camera_descriptor(Some(camera));
@@ -8829,6 +8945,7 @@ fn prepare(
 fn render(
     view: ViewQuery<(
         &ViewTarget,
+        &ExtractedView,
         &RadianceCascades,
         &ViewBuffers,
         &ViewBindings,
@@ -8847,7 +8964,8 @@ fn render(
     hardware: Option<Res<hardware::HardwareTraversal>>,
 ) {
     let diagnostic_view = view.entity();
-    let (target, settings, buffers, bindings, receiver, raw_output, lighting) = view.into_inner();
+    let (target, extracted_view, settings, buffers, bindings, receiver, raw_output, lighting) =
+        view.into_inner();
     let history_was_valid = buffers.history_valid.load(Ordering::Relaxed);
     let cold_priority = cold_priority_enabled(settings.history_frames, history_was_valid);
     buffers
@@ -8889,17 +9007,22 @@ fn render(
     }
     let compute: [Option<&ComputePipeline>; COMPUTE_ENTRIES.len()] =
         std::array::from_fn(|i| pipelines.pipeline(i));
-    let required = required_pipelines(buffers.settings);
-    let missing = compute
-        .iter()
-        .enumerate()
-        .fold(0u64, |mask, (i, pipeline)| {
-            mask | if pipeline.is_none() {
-                required & (1 << i)
-            } else {
-                0
-            }
-        });
+    // Ray-traced GI replaces every cascade pass with path sampling and ReSTIR
+    // GI reuse; the outputs feed the same temporal filter and composition.
+    // Until hardware traversal is ready the view falls back to the cascades,
+    // and waits for their pipelines if those are still compiling.
+    let ready = pipelines.ready_mask();
+    let ray_traced = ray_traced_requested(buffers.settings)
+        && hardware
+            .as_ref()
+            .is_some_and(|hardware| hardware.ready_for(scene.revision))
+        && ray_traced_pipelines(buffers.settings) & !ready == 0;
+    let required = if ray_traced {
+        ray_traced_pipelines(buffers.settings)
+    } else {
+        required_pipelines(buffers.settings)
+    };
+    let missing = required & !ready;
     if missing != 0 {
         buffers.screen_history_valid.store(false, Ordering::Relaxed);
         if *pending_pipelines != missing {
@@ -9122,20 +9245,6 @@ fn render(
         .div_ceil(64);
     let ray_groups = (buffers.size.x * buffers.size.y).div_ceil(64);
     let trace_groups = ray_groups * TRACE_MAX_LANE_STRIDE;
-    // Ray-traced GI replaces every cascade pass with path sampling and ReSTIR
-    // GI reuse; the outputs feed the same temporal filter and composition.
-    // Without hardware traversal the view falls back to the cascades.
-    let ray_traced = settings.method == crate::GiMethod::RayTraced
-        && settings.hardware_ray_queries
-        && hardware
-            .as_ref()
-            .is_some_and(|hardware| hardware.ready_for(scene.revision))
-        && compute[RTGI_SAMPLE].is_some()
-        && compute[RTGI_RESOLVE].is_some()
-        && compute[RTGI_CACHE_RECORD].is_some()
-        && compute[RTGI_CACHE_VISIBILITY].is_some()
-        && compute[RTGI_CACHE_SHADE].is_some()
-        && compute[RTGI_CACHE_BOUNCE].is_some();
     // The multi-bounce secondary cache belongs to the cascades.
     let secondary_enabled = bindings.secondary_enabled && !ray_traced;
     shaders.status.set_active_method(if ray_traced {
@@ -9260,6 +9369,8 @@ fn render(
         } else {
             (17, 19)
         };
+        // Matches the flag prepare wrote into this frame's parameters.
+        let deferred_ready = ready & DEFERRED_TRACE_PIPELINES == DEFERRED_TRACE_PIPELINES;
         for (name, stage, groups) in [
             ("trace", closest_hit_stage, trace_groups),
             ("traceRecord", 18, trace_groups),
@@ -9271,6 +9382,9 @@ fn render(
             ("traceResolve", 20, trace_groups),
             ("traceOverflow", 7, trace_groups),
         ] {
+            if !deferred_ready && stage != 7 {
+                continue;
+            }
             dispatch(
                 name,
                 compute[stage].expect("radiance cascade trace pipeline ready"),
@@ -9571,6 +9685,34 @@ fn render(
     pass.draw(0..3, 0..1);
     drop(pass);
     composition_span.end(context.command_encoder());
+    // Ray-traced GI's screen-space cache reads this frame's lit image next frame.
+    let lit_history = buffers._rtgi_lit_history.size();
+    if ray_traced && lit_history.width == buffers.viewport_size.x
+        && lit_history.height == buffers.viewport_size.y
+    {
+        context.command_encoder().copy_texture_to_texture(
+            TexelCopyTextureInfo {
+                texture: target.main_texture(),
+                mip_level: 0,
+                origin: Origin3d {
+                    x: extracted_view.viewport.x,
+                    y: extracted_view.viewport.y,
+                    z: 0,
+                },
+                aspect: TextureAspect::All,
+            },
+            TexelCopyTextureInfo {
+                texture: &buffers._rtgi_lit_history,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            lit_history,
+        );
+        buffers.rtgi_lit_history_valid.store(true, Ordering::Relaxed);
+    } else {
+        buffers.rtgi_lit_history_valid.store(false, Ordering::Relaxed);
+    }
     if required & (1 << CACHE_COMMIT) != 0 && !ray_traced {
         // Publish once, after composition has finished reading the live table.
         // Publication changes heads from working-entry to history-entry offsets.
@@ -13208,6 +13350,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("missing"), "{error}");
+    }
+
+    // Dev tool: times the driver compile of the entries in PENUMBRA_TIME_ENTRIES.
+    #[test]
+    #[ignore = "dev timing tool"]
+    fn time_pipeline_compiles() {
+        use bevy::render::{
+            renderer::initialize_renderer,
+            settings::{Backends, WgpuSettings},
+        };
+        let Ok(wanted) = std::env::var("PENUMBRA_TIME_ENTRIES") else {
+            return;
+        };
+        let options = WgpuSettings::default();
+        let resources = block_on(initialize_renderer(
+            options.backends.unwrap_or(Backends::PRIMARY),
+            None,
+            &options,
+        ));
+        let device = &resources.0;
+        let ray_query = device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+        let layout = compute_layout(ray_query);
+        let layouts =
+            [device.create_bind_group_layout(Some(layout.label.as_ref()), &layout.entries)];
+        let wanted: &'static str = Box::leak(wanted.into_boxed_str());
+        for entry in wanted.split(',') {
+            let shader = compile(&SlangCompiler::default(), "cascades.slang", &[entry]).unwrap();
+            let bevy::shader::Source::Wgsl(source) = shader.source else {
+                panic!("expected WGSL");
+            };
+            // A per-run constant makes the SPIR-V unique, so the driver's
+            // own disk cache cannot answer.
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000;
+            let header = format!("fn {entry}(@builtin(global_invocation_id) thread_0 : vec3<u32>)\r\n{{");
+            assert!(source.contains(&header), "{entry}: {:?}", source.find(&format!("fn {entry}(")).map(|at| &source[at..at + 120]));
+            let source = source.replacen(
+                &header,
+                &format!("{header}\n    if (params_0.frame_0.x == {nonce}u) {{ return; }}"),
+                1,
+            );
+            let start = std::time::Instant::now();
+            compute_pipeline(
+                device.clone(),
+                layouts.clone(),
+                Arc::from(source.as_str()),
+                entry,
+                None,
+                true,
+                ray_query,
+            )
+            .unwrap();
+            eprintln!("PIPELINE {entry} {:.2}s wgsl_bytes={}", start.elapsed().as_secs_f64(), source.len());
+        }
     }
 
     #[test]

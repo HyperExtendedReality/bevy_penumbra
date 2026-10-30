@@ -425,6 +425,8 @@ pub struct RadianceCascades {
     /// The diffuse GI estimator. Both feed the same temporal filter, denoiser
     /// and composition.
     pub method: GiMethod,
+    /// Controls for [`GiMethod::RayTraced`]; ignored by the cascades.
+    pub ray_traced: RayTracedSettings,
     /// Shared receiver-grid, update, traversal, cache, and reconstruction limits.
     pub sampling: SamplingSettings,
     /// Per-view invalidation epoch. Call `reset_history()` after a game-driven
@@ -501,6 +503,30 @@ pub struct RadianceCascades {
     pub emissive_samples: u32,
 }
 
+/// [`GiMethod::RayTraced`] controls.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RayTracedSettings {
+    /// Each world-cache cell traces a bounce ray and feeds the radiance it
+    /// finds into its next update, so light gains a bounce per update.
+    /// Off, the cache holds direct lighting only.
+    pub multi_bounce: bool,
+    /// Neighbour reservoirs merged per pixel in spatial reuse, clamped to 0..=16.
+    pub spatial_samples: u32,
+    /// Cap on the temporal reservoir's sample count, clamped to 1..=255. Lower
+    /// values follow lighting changes faster with more noise.
+    pub reservoir_history: u32,
+}
+
+impl Default for RayTracedSettings {
+    fn default() -> Self {
+        Self {
+            multi_bounce: true,
+            spatial_samples: 4,
+            reservoir_history: 20,
+        }
+    }
+}
+
 /// How a view estimates diffuse global illumination.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GiMethod {
@@ -519,6 +545,7 @@ impl Default for RadianceCascades {
     fn default() -> Self {
         Self {
             method: GiMethod::SplitRadianceCascades,
+            ray_traced: RayTracedSettings::default(),
             sampling: SamplingSettings::default(),
             history_epoch: 0,
             probe_spacing: 0.25,

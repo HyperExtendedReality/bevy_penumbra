@@ -34,7 +34,7 @@ struct Parameters {
     uint4 size;           // GI width, height, pixel count, hash bucket count
     float4 tuning;        // probe spacing, interval cutoff, normal bias, intensity
     float4 environment;  // RGB radiance, exposure
-    float4 history;      // temporal blend, reserved, valid, retention frames
+    float4 history;      // temporal blend, deferred trace unavailable, valid, retention frames
     float4 intervalHistory; // transmittance decay, Split flag, diffuse debug .25, early query cap
     uint4 frame;         // frame index, merge cascade, instance count, light count
     uint4 lightCounts;   // conventional count, emissive count, hit-lighting sample budget, cached hit sky
@@ -56,6 +56,7 @@ struct Parameters {
     float4 emissiveDirtyMax; // changed emitter source AABB maximum.xyz
     float4 lightDirtyMin; // finite punctual-light influence union; w > 0 marks local change
     float4 lightDirtyMax;
+    uint4 rayTraced;      // multi-bounce, spatial samples, reservoir history, lit history valid
 };
 
 [ForceInline]

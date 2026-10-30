@@ -60,6 +60,7 @@ struct TransportParameters {
     emissive_dirty_max: Vec4,
     light_dirty_min: Vec4,
     light_dirty_max: Vec4,
+    ray_traced: UVec4,
 }
 
 const TRANSPORT_SHADER: &str = r#"
@@ -1119,6 +1120,7 @@ fn temporal_test_parameters(history_frames: u32) -> TransportParameters {
         emissive_dirty_max: Vec4::ZERO,
         light_dirty_min: Vec4::ZERO,
         light_dirty_max: Vec4::ZERO,
+        ray_traced: UVec4::ZERO,
     }
 }
 

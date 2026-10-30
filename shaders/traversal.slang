@@ -632,6 +632,24 @@ bool hardwareClosestCandidate(uint instance, uint primitive) {
     return true;
 }
 
+// Called by the WGSL closest-hit loop on its committed hit with the
+// hardware's distance and barycentrics, so a hardware-opaque hit, which
+// commits without the candidate test, still gets a hit record. Opaque
+// instances need no material test, and calling the full candidate test a
+// second time here cost the driver up to a minute per closest-hit kernel.
+[noinline]
+void hardwareCommittedHit(uint instance, uint primitive, float distance, float2 barycentric) {
+    if (instance == EMPTY) return;
+    uint triangle = sceneWord(instanceBase(instance) + 8).y + primitive;
+    // Already confirmed by the candidate test.
+    if (hardwareHit.triangle == triangle && hardwareHit.instance == instance) return;
+    hardwareHit.distance = distance;
+    hardwareHit.triangle = triangle;
+    hardwareHit.instance = instance;
+    hardwareHit.barycentric = float3(1 - barycentric.x - barycentric.y, barycentric);
+    hardwareHit.footprint = 0;
+}
+
 // Called by the WGSL occlusion loop; true ends the query as blocked.
 [noinline]
 bool hardwareOccludedCandidate(uint instance, uint primitive) {
@@ -657,8 +675,10 @@ Hit hardwareClosestHit(float3 origin, float3 direction, Hit hit, bool anyHit,
     hardwareHit = hit;
     // The query always returns true. The guarded call keeps the callback in
     // the emitted module, where only the WGSL loop calls it.
-    if (!hardwareQueryClosest(origin, direction, hit.distance, anyHit, hardwareRayMask()))
+    if (!hardwareQueryClosest(origin, direction, hit.distance, anyHit, hardwareRayMask())) {
         hardwareClosestCandidate(EMPTY, 0u);
+        hardwareCommittedHit(EMPTY, 0u, 0.0, 0.0);
+    }
     return hardwareHit;
 }
 

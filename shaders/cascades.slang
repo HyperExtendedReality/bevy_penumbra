@@ -788,6 +788,8 @@ struct RtgiCacheCell {
 [[vk::binding(45, 0)]] RWStructuredBuffer<RtgiCacheCell> rtgiCacheCells;
 // [0], [1]: queued cell counts by frame parity; then one queue per parity.
 [[vk::binding(46, 0)]] RWStructuredBuffer<Atomic<uint>> rtgiCacheQueue;
+// Last frame's composed HDR image over the viewport, exposure applied.
+[[vk::binding(47, 0)]] Texture2D<float4> rtgiLitHistory;
 
 // Mirrors RTGI_CACHE_* in render.rs.
 static const uint RTGI_CACHE_CAPACITY = 1u << 18;
@@ -799,9 +801,6 @@ static const float RTGI_CACHE_CELL = 0.25;    // metres at the first distance LO
 static const float RTGI_CACHE_LOD_DISTANCE = 10.0;
 static const float RTGI_CACHE_MIN_BLEND = 0.1;
 
-// Temporal history cap: bounds lag after lighting changes.
-static const float RTGI_HISTORY_M = 20.0;
-static const uint RTGI_SPATIAL_SAMPLES = 4u;
 static const float RTGI_SPATIAL_RADIUS = 12.0; // resolve pixels
 static const float RTGI_ESCAPE_DISTANCE = 1.0e4;
 
@@ -820,9 +819,13 @@ float rtgiLuminance(float3 value) {
 // Cell key: position quantized by a distance-dependent cell size (idTech 8)
 // and the dominant axis of the normal, so opposite faces of a thin wall never
 // share radiance. Returns the home slot; `key` is never zero.
-uint rtgiCacheHome(float3 position, float3 normal, out uint key) {
+float rtgiCacheLod(float3 position) {
     float distance = length(position - params.cameraPosition.xyz);
-    float lod = exp2(floor(log2(1.0 + distance / RTGI_CACHE_LOD_DISTANCE)));
+    return exp2(floor(log2(1.0 + distance / RTGI_CACHE_LOD_DISTANCE)));
+}
+
+uint rtgiCacheHome(float3 position, float3 normal, out uint key) {
+    float lod = rtgiCacheLod(position);
     int3 cell = int3(floor(position / (RTGI_CACHE_CELL * lod)));
     float3 magnitude = abs(normal);
     uint axis = magnitude.x >= magnitude.y && magnitude.x >= magnitude.z ? 0u
@@ -873,6 +876,39 @@ void rtgiCacheStoreHit(uint slot, float3 origin, float3 direction, Hit hit) {
         barycentric.x | (barycentric.y << 16u), params.frame.x);
 }
 
+// idTech 8's first cache level: a gather hit the camera also sees takes its
+// radiance from last frame's lit image, which carries every bounce at full
+// shading detail. False when the hit is off screen, faces away from the
+// camera or is hidden in the current depth buffer.
+// shortcut: the image is view-dependent, so glossy hits bring their camera-facing specular; mask by roughness if that shows.
+bool rtgiScreenRadiance(float3 position, float3 normal, out float3 radiance) {
+    radiance = 0.0;
+    if (params.rayTraced.w == 0u
+        || dot(normal, params.cameraPosition.xyz - position) <= 0.0) return false;
+    float4 clip = mul(params.clipFromWorld, float4(position, 1.0));
+    float4 previous = mul(params.previousClipFromWorld, float4(position, 1.0));
+    if (!(clip.w > 0.0) || !(previous.w > 0.0)) return false;
+    float2 uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
+    float2 previousUv = float2(previous.x / previous.w * 0.5 + 0.5,
+        0.5 - previous.y / previous.w * 0.5);
+    if (any(uv <= 0.0) || any(uv >= 1.0) || any(previousUv <= 0.0) || any(previousUv >= 1.0))
+        return false;
+    uint2 pixel = params.viewport.xy + min(uint2(uv * float2(params.viewport.zw)),
+        params.viewport.zw - 1u);
+    float depth = depthTexture.Load(int3(pixel, 0));
+    if (!(depth > 0.0)) return false;
+    float3 seen = worldPosition(float2(pixel) + 0.5, depth, params);
+    float distance = length(position - params.cameraPosition.xyz);
+    if (!(length(seen - position) < 0.01 * distance + 0.02)) return false;
+    uint2 previousPixel = min(uint2(previousUv * float2(params.viewport.zw)),
+        params.viewport.zw - 1u);
+    float3 lit = rtgiLitHistory.Load(int3(previousPixel, 0)).rgb
+        / max(params.environment.w, 1e-20);
+    if (!all(isfinite(lit))) return false;
+    radiance = max(lit, 0.0);
+    return true;
+}
+
 float3 rtgiCosineDirection(float3 normal, inout uint state) {
     float u = rtgiRandom(state);
     float phi = 2.0 * PI * rtgiRandom(state);
@@ -886,12 +922,21 @@ float3 rtgiCosineDirection(float3 normal, inout uint state) {
 
 // Reads the cache cell at a gather ray's hit, claiming one and queueing it
 // for shading on `parity`'s queue when missing. Returns the cell's radiance
-// (w: background fraction), zero until the cell is first shaded.
+// (w: background fraction); w is negative while the cell has no radiance yet.
+// The lookup point is jittered by up to half a cell in the surface plane
+// (GI-1.0, SHaRC), so cell edges average out instead of showing as blocks.
 float4 rtgiCacheGather(float3 origin, float3 direction, Hit hit, float3 position,
                        float3 normal, uint parity, inout uint state) {
+    float3 tangent = normalize(abs(normal.y) < 0.999
+        ? cross(float3(0.0, 1.0, 0.0), normal)
+        : cross(float3(1.0, 0.0, 0.0), normal));
+    float3 bitangent = cross(normal, tangent);
+    float jitter = RTGI_CACHE_CELL * rtgiCacheLod(position);
+    float3 lookup = position + (tangent * (rtgiRandom(state) - 0.5)
+        + bitangent * (rtgiRandom(state) - 0.5)) * jitter;
     bool inserted;
-    uint slot = rtgiCacheFind(position, normal, true, inserted);
-    if (slot == EMPTY) return 0.0;
+    uint slot = rtgiCacheFind(lookup, normal, true, inserted);
+    if (slot == EMPTY) return float4(0.0, 0.0, 0.0, -1.0);
     if (inserted) {
         rtgiCacheStoreHit(slot, origin, direction, hit);
         rtgiCacheCells[slot].extra = 0.0;
@@ -907,7 +952,7 @@ float4 rtgiCacheGather(float3 origin, float3 direction, Hit hit, float3 position
     }
     RtgiCacheCell cell = rtgiCacheCells[slot];
     return cell.radiance.w > 0.0 ? float4(max(cell.radiance.rgb, 0.0), cell.extra.x)
-        : 0.0;
+        : float4(0.0, 0.0, 0.0, -1.0);
 }
 
 // shortcut: splits the bounce by the cell's own background fraction; store the bounce's own split if sky tint looks off.
@@ -1040,10 +1085,14 @@ void rtgiCacheBounce(uint3 thread : SV_DispatchThreadID) {
     if (lane >= RTGI_CACHE_WORK) return;
     uint slot = rtgiCacheQueue[rtgiCacheWorkHead(lane)].load();
     if (slot == EMPTY || slot >= RTGI_CACHE_CAPACITY) return;
+    if (params.rayTraced.x == 0u) {
+        rtgiCacheCells[slot].extra.yzw = 0.0;
+        return;
+    }
     transportAdmissionBypass = true;
     RtgiCacheCell cell = rtgiCacheCells[slot];
     float3 position = cell.origin.xyz + cell.direction.xyz * cell.origin.w;
-    float3 normal = hitAttributes(rtgiCellHit(cell)).geometricNormal;
+    float3 normal = hitGeometricNormal(rtgiCellHit(cell));
     if (dot(normal, cell.direction.xyz) > 0.0) normal = -normal;
     uint state = rtgiHash(slot * 6271u ^ rtgiHash(params.frame.x * 9781u + 3u));
     float3 direction = rtgiCosineDirection(normal, state);
@@ -1052,15 +1101,19 @@ void rtgiCacheBounce(uint3 thread : SV_DispatchThreadID) {
     float dependencyStart, dependencyDistance, dependencyPadding;
     Hit hit = traceRayTracked(origin, direction, 1e20, traceDependency,
         dependencyStart, dependencyDistance, dependencyPadding);
+    if ((hit.errors & HIT_QUERY_UNSUPPORTED) != 0u) return;
     // Escaped rays add nothing: cell shading takes the sky through NEE.
     float3 bounce = 0.0;
-    if ((hit.errors & HIT_QUERY_UNSUPPORTED) == 0u && hit.triangle != EMPTY) {
+    if (hit.triangle != EMPTY) {
         float3 hitPosition = origin + direction * hit.distance;
-        float3 hitNormal = hitAttributes(hit).geometricNormal;
+        float3 hitNormal = hitGeometricNormal(hit);
         if (dot(hitNormal, direction) > 0.0) hitNormal = -hitNormal;
         // Queued for the next frame: this frame's queue is already drained.
-        bounce = rtgiCacheGather(origin, direction, hit, hitPosition, hitNormal,
-            1u - (params.frame.x & 1u), state).rgb;
+        float4 found = rtgiCacheGather(origin, direction, hit, hitPosition, hitNormal,
+            1u - (params.frame.x & 1u), state);
+        // An unshaded cell is unknown, not black: keep the last bounce.
+        if (found.w < 0.0) return;
+        bounce = found.rgb;
     }
     rtgiCacheCells[slot].extra.yzw = bounce;
 }
@@ -1157,6 +1210,7 @@ void rtgiSample(uint3 thread : SV_DispatchThreadID) {
     float3 direction = rtgiCosineDirection(receiver.normal, state);
     RtgiReservoir candidate = (RtgiReservoir)0;
     float candidateWeight = 0.0;
+    float candidateCount = 1.0;
     if (dot(direction, receiver.geometricNormal) > 0.0) {
         float3 origin = rayOffset(receiver.position, receiver.geometricNormal, params.tuning.z);
         DependencyContext traceDependency;
@@ -1171,19 +1225,30 @@ void rtgiSample(uint3 thread : SV_DispatchThreadID) {
                 candidate.radiance = float4(0.0, 0.0, 0.0, 1.0);
             } else {
                 float3 position = origin + direction * hit.distance;
-                float3 normal = hitAttributes(hit).geometricNormal;
+                float3 normal = hitGeometricNormal(hit);
                 if (dot(normal, direction) > 0.0) normal = -normal;
                 candidate.sample.xyz = position;
                 candidate.normal.xyz = normal;
                 candidate.radiance = rtgiCacheGather(origin, direction, hit, position, normal,
                     params.frame.x & 1u, state);
+                // The cache lookup still runs for an on-screen hit: it keeps
+                // the cell alive and supplies the background fraction.
+                float3 screen;
+                if (rtgiScreenRadiance(position, normal, screen))
+                    candidate.radiance = float4(screen, max(candidate.radiance.w, 0.0));
+                // A cell not shaded yet is unknown rather than black; counting
+                // it would darken every newly seen surface for a frame.
+                if (candidate.radiance.w < 0.0) {
+                    candidate.radiance = 0.0;
+                    candidateCount = 0.0;
+                }
             }
             // Source pdf cos/pi, target luminance*cos: weight pi*luminance.
             candidateWeight = PI * rtgiLuminance(candidate.radiance.rgb);
         }
     }
     float weightSum = 0.0;
-    if (!rtgiMerge(reservoir, weightSum, candidate, candidateWeight, 1.0, state))
+    if (!rtgiMerge(reservoir, weightSum, candidate, candidateWeight, candidateCount, state))
         reservoir.sample.xyz = receiver.position + receiver.normal;
 
     // Temporal reuse of the reprojected previous reservoir.
@@ -1212,7 +1277,7 @@ void rtgiSample(uint3 thread : SV_DispatchThreadID) {
                 && abs(dot(offset, receiver.normal)) < rtgiPlaneTolerance(receiver)
                 && dot(offset, offset) < 0.0625;
             if (similar) {
-                float count = min(previous.normal.w, RTGI_HISTORY_M);
+                float count = min(previous.normal.w, float(params.rayTraced.z));
                 rtgiMerge(reservoir, weightSum, previous,
                     rtgiTarget(previous, receiver) * previous.sample.w * count, count, state);
             }
@@ -1249,7 +1314,7 @@ void rtgiResolve(uint3 thread : SV_DispatchThreadID) {
     rtgiMerge(reservoir, weightSum, own,
         rtgiTarget(own, receiver) * own.sample.w * own.normal.w, own.normal.w, state);
     bool reused = false;
-    [loop] for (uint i = 0u; i < RTGI_SPATIAL_SAMPLES; ++i) {
+    [loop] for (uint i = 0u; i < params.rayTraced.y; ++i) {
         float angle = 2.0 * PI * rtgiRandom(state);
         float radius = RTGI_SPATIAL_RADIUS * sqrt(rtgiRandom(state));
         int2 pixel = int2(thread.xy) + int2(round(float2(cos(angle), sin(angle)) * radius));
@@ -1270,18 +1335,26 @@ void rtgiResolve(uint3 thread : SV_DispatchThreadID) {
     float3 toSample = reservoir.sample.xyz - receiver.position;
     float sampleDistance = length(toSample);
     float3 direction = sampleDistance > 0.0 ? toSample / sampleDistance : receiver.normal;
-    // A neighbour's vertex may be hidden from this receiver: drop it rather
-    // than leak light through occluders.
+    // A neighbour's vertex may be hidden from this receiver: rather than leak
+    // light through occluders or drop to black, keep this pixel's own sample.
     if (reused && contribution > 0.0) {
         float3 origin = rayOffset(receiver.position, receiver.geometricNormal, params.tuning.z);
         float limit = dot(reservoir.normal.xyz, reservoir.normal.xyz) > 0.0
             ? max(sampleDistance - params.tuning.z * 2.0, 0.0) : 1e20;
-        if (traceOccluded(origin, direction, limit)) contribution = 0.0;
+        if (traceOccluded(origin, direction, limit)) {
+            reservoir = own;
+            contribution = own.sample.w;
+            toSample = own.sample.xyz - receiver.position;
+            sampleDistance = length(toSample);
+            direction = sampleDistance > 0.0 ? toSample / sampleDistance : receiver.normal;
+        }
     }
     // Diffuse irradiance over pi: f(y)·W with f = L·cos/pi.
     float3 diffuse = reservoir.radiance.rgb * (max(dot(receiver.normal, direction), 0.0)
         * contribution / PI);
-    bool supported = all(isfinite(diffuse));
+    // No sample yet (only unshaded cells seen): unsupported, so the temporal
+    // filter keeps its history instead of blending in black.
+    bool supported = all(isfinite(diffuse)) && reservoir.normal.w > 0.0;
     if (!supported) diffuse = 0.0;
     float alpha = rawGiSupportAlpha(true, supported, 1.0);
     irradiance.Store(int2(thread.xy), float4(diffuse, alpha));

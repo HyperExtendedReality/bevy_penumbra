@@ -29,9 +29,9 @@ use bevy::{
     world_serialization::{WorldInstanceReady, WorldInstanceSpawner},
 };
 use bevy_penumbra::{
-    FrameTimingPlugin, GiMethod, RadianceCascades, RadianceCascadesDispatch, RadianceCascadesGeometry,
-    RadianceCascadesPlugin, RadianceCascadesRawOutput, RadianceCascadesRevisions,
-    RadianceCascadesStatus, HardwareRayQueries,
+    FrameTimingPlugin, GiMethod, HardwareRayQueries, RadianceCascades, RadianceCascadesDispatch,
+    RadianceCascadesGeometry, RadianceCascadesPlugin, RadianceCascadesRawOutput,
+    RadianceCascadesRevisions, RadianceCascadesStatus, RayTracedSettings,
 };
 use bevy_texture_cache::{TextureCachePlugin, TextureCacheStats};
 use std::{
@@ -149,6 +149,7 @@ struct Demo {
     ray_traced_sun_shadows: bool,
     /// `--rtgi`: ray-traced GI instead of Split Radiance Cascades.
     ray_traced_gi: bool,
+    ray_traced: RayTracedSettings,
     resolution_divisor: u32,
     max_rays: u32,
     max_traversal_queries: u32,
@@ -325,7 +326,6 @@ struct MotionCaptureSpot;
 
 #[derive(Component)]
 struct MotionCaptureEmissive;
-
 
 fn main() -> AppExit {
     let startup_started = std::time::Instant::now();
@@ -613,6 +613,7 @@ fn main() -> AppExit {
             cached_hit_sky,
             hardware_ray_queries,
             ray_traced_sun_shadows,
+            ray_traced: RayTracedSettings::default(),
             ray_traced_gi,
             resolution_divisor,
             max_rays,
@@ -1402,6 +1403,9 @@ fn controls(
         if gi.ray_traced_sun_shadows != demo.ray_traced_sun_shadows {
             gi.ray_traced_sun_shadows = demo.ray_traced_sun_shadows;
         }
+        if gi.ray_traced != demo.ray_traced {
+            gi.ray_traced = demo.ray_traced;
+        }
         if gi.multi_bounce != demo.multi_bounce {
             gi.multi_bounce = demo.multi_bounce;
             gi.cached_hit_sky = demo.multi_bounce && demo.cached_hit_sky;
@@ -1431,6 +1435,9 @@ enum MenuAction {
     Method(GiMethod),
     HardwareRays,
     MultiBounce,
+    RtMultiBounce,
+    RtSpatialSamples,
+    RtHistory,
     SunShadows,
     Hour(f32),
     Play,
@@ -1459,7 +1466,7 @@ fn spawn_debug_menu(commands: &mut Commands) {
         column_gap: Val::Px(4.0),
         ..default()
     };
-    let rows: [(&str, &[MenuAction]); 5] = [
+    let rows: [(&str, &[MenuAction]); 6] = [
         ("GI", &[MenuAction::ToggleGi]),
         (
             "Method",
@@ -1469,8 +1476,16 @@ fn spawn_debug_menu(commands: &mut Commands) {
             ],
         ),
         (
-            "Settings",
+            "Split",
             &[MenuAction::HardwareRays, MenuAction::MultiBounce],
+        ),
+        (
+            "Ray traced",
+            &[
+                MenuAction::RtMultiBounce,
+                MenuAction::RtSpatialSamples,
+                MenuAction::RtHistory,
+            ],
         ),
         ("Lighting", &[MenuAction::SunShadows]),
         (
@@ -1540,6 +1555,13 @@ fn menu_label(action: MenuAction, demo: &Demo, gi_on: bool) -> String {
         MenuAction::Method(GiMethod::RayTraced) => "Ray traced".into(),
         MenuAction::HardwareRays => format!("Hardware rays: {}", on(demo.hardware_ray_queries)),
         MenuAction::MultiBounce => format!("Multi-bounce: {}", on(demo.multi_bounce)),
+        MenuAction::RtMultiBounce => {
+            format!("Multi-bounce: {}", on(demo.ray_traced.multi_bounce))
+        }
+        MenuAction::RtSpatialSamples => {
+            format!("Spatial samples: {}", demo.ray_traced.spatial_samples)
+        }
+        MenuAction::RtHistory => format!("History: {}", demo.ray_traced.reservoir_history),
         MenuAction::SunShadows => format!(
             "Sun shadows: {}",
             if demo.ray_traced_sun_shadows {
@@ -1567,6 +1589,12 @@ fn menu_selected(action: MenuAction, demo: &Demo) -> bool {
     }
 }
 
+/// The step after `value` in `steps`, wrapping; the first step when `value` is not one.
+fn next_step(value: u32, steps: &[u32]) -> u32 {
+    let index = steps.iter().position(|&step| step == value);
+    steps[index.map_or(0, |index| (index + 1) % steps.len())]
+}
+
 /// Applies a clicked menu button to the demo and the GI cameras.
 fn on_menu_activate(
     activate: On<bevy::ui_widgets::Activate>,
@@ -1588,6 +1616,17 @@ fn on_menu_activate(
             MenuAction::Method(method) => demo.ray_traced_gi = method == GiMethod::RayTraced,
             MenuAction::HardwareRays => demo.hardware_ray_queries = !demo.hardware_ray_queries,
             MenuAction::MultiBounce => demo.multi_bounce = !demo.multi_bounce,
+            MenuAction::RtMultiBounce => {
+                demo.ray_traced.multi_bounce = !demo.ray_traced.multi_bounce;
+            }
+            MenuAction::RtSpatialSamples => {
+                demo.ray_traced.spatial_samples =
+                    next_step(demo.ray_traced.spatial_samples, &[0, 2, 4, 8]);
+            }
+            MenuAction::RtHistory => {
+                demo.ray_traced.reservoir_history =
+                    next_step(demo.ray_traced.reservoir_history, &[5, 10, 20, 40]);
+            }
             MenuAction::SunShadows => demo.ray_traced_sun_shadows = !demo.ray_traced_sun_shadows,
             MenuAction::Hour(hour) => {
                 demo.hour = hour;
@@ -1642,9 +1681,8 @@ fn update_debug_menu(
         return;
     }
     *refreshed = now;
-    let smoothed = |path: &bevy::diagnostic::DiagnosticPath| {
-        diagnostics.get(path).and_then(|d| d.smoothed())
-    };
+    let smoothed =
+        |path: &bevy::diagnostic::DiagnosticPath| diagnostics.get(path).and_then(|d| d.smoothed());
     let gpu = |path: &str| {
         diagnostics
             .iter()
@@ -4474,6 +4512,7 @@ mod tests {
             hardware_ray_queries: false,
             ray_traced_sun_shadows: false,
             ray_traced_gi: false,
+            ray_traced: RayTracedSettings::default(),
             resolution_divisor: RadianceCascades::low_end().sampling.grid_divisor,
             max_rays: 32_768,
             max_traversal_queries: 16_384,
@@ -4539,7 +4578,12 @@ mod tests {
         keys.reset_all();
         keys.press(KeyCode::KeyH);
         app.update();
-        assert!(!app.world().get::<RadianceCascades>(camera).unwrap().hardware_ray_queries);
+        assert!(
+            !app.world()
+                .get::<RadianceCascades>(camera)
+                .unwrap()
+                .hardware_ray_queries
+        );
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .reset_all();

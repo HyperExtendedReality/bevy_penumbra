@@ -1133,7 +1133,9 @@ void traceTransport(uint3 thread, bool deferred, uint ticket) {
     if (!splitSampleSurface(pixel, surfacePosition, geometricNormal)) return;
 
     float2 jitter = r2(transportHash(params.frame.x ^ 0x5a17c9e3u));
-    [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
+    // Not unrolled: each copy would inline the whole traversal, and the driver's
+    // compile time grows far faster than the code.
+    [loop] for (uint variant = 0u; variant < 2u; ++variant) {
         if (variant == 0u ? !lowSelected : !highSelected) continue;
         uint first = variant == 0u ? firstLow : firstHigh;
         uint lod = (uint(entries[first].key.w) & PROBE_LOD) >> 18u;
@@ -1215,7 +1217,7 @@ void finishTransportVariant(uint2 pixel, uint first, uint lod, float3 surfacePos
 
 // The deferred scratch exists only in primary cache heads sized for it.
 bool deferredTraceAvailable() {
-    if (params.environmentScale.z > 0.5) return false;
+    if (params.environmentScale.z > 0.5 || params.history.y > 0.5) return false;
     uint words, stride;
     heads.GetDimensions(words, stride);
     return words >= deferredTraceEnd(params);
@@ -1293,7 +1295,7 @@ void traceRecord(uint3 thread : SV_DispatchThreadID) {
     uint ticket = traceTicket(thread.x);
     if (ticket == EMPTY || ticket >= deferredTraceCapacity(params)
         || !deferredTraceAvailable()) return;
-    [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
+    [loop] for (uint variant = 0u; variant < 2u; ++variant) {
         uint slot = ticket * 2u + variant;
         float3 surfacePosition, rayOrigin, direction;
         Hit hit;
@@ -1361,7 +1363,7 @@ void traceResolve(uint3 thread : SV_DispatchThreadID) {
         || !deferredTraceAvailable()) return;
     uint2 pixel = ticketPixel(ticket);
     uint sample = pixel.x + pixel.y * params.size.x;
-    [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
+    [loop] for (uint variant = 0u; variant < 2u; ++variant) {
         uint slot = ticket * 2u + variant;
         float3 surfacePosition, rayOrigin, direction;
         Hit hit;
