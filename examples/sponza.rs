@@ -29,7 +29,7 @@ use bevy::{
     world_serialization::{WorldInstanceReady, WorldInstanceSpawner},
 };
 use bevy_penumbra::{
-    FrameTimingPlugin, RadianceCascades, RadianceCascadesDispatch, RadianceCascadesGeometry,
+    FrameTimingPlugin, GiMethod, RadianceCascades, RadianceCascadesDispatch, RadianceCascadesGeometry,
     RadianceCascadesPlugin, RadianceCascadesRawOutput, RadianceCascadesRevisions,
     RadianceCascadesStatus, HardwareRayQueries,
 };
@@ -145,6 +145,10 @@ struct Demo {
     multi_bounce: bool,
     cached_hit_sky: bool,
     hardware_ray_queries: bool,
+    /// Ray-traced sun shadows; `--shadow-maps` keeps Bevy's cascades.
+    ray_traced_sun_shadows: bool,
+    /// `--rtgi`: ray-traced GI instead of Split Radiance Cascades.
+    ray_traced_gi: bool,
     resolution_divisor: u32,
     max_rays: u32,
     max_traversal_queries: u32,
@@ -322,8 +326,6 @@ struct MotionCaptureSpot;
 #[derive(Component)]
 struct MotionCaptureEmissive;
 
-#[derive(Component)]
-struct DebugOverlay;
 
 fn main() -> AppExit {
     let startup_started = std::time::Instant::now();
@@ -343,6 +345,8 @@ fn main() -> AppExit {
     let mut multi_bounce = false;
     let mut cached_hit_sky = false;
     let mut hardware_ray_queries = true;
+    let mut ray_traced_sun_shadows = true;
+    let mut ray_traced_gi = false;
     let mut resolution_divisor = SPONZA_GRID_DIVISOR;
     let mut max_rays = SPONZA_UPDATE_BUDGET;
     let mut max_traversal_queries = SPONZA_TRAVERSAL_QUERY_BUDGET;
@@ -429,6 +433,10 @@ fn main() -> AppExit {
             cached_hit_sky = true;
         } else if arg == "--software-traversal" {
             hardware_ray_queries = false;
+        } else if arg == "--shadow-maps" {
+            ray_traced_sun_shadows = false;
+        } else if arg == "--rtgi" {
+            ray_traced_gi = true;
         } else if let Some(value) = arg.strip_prefix("--max-rays=") {
             max_rays = value.parse().expect("--max-rays requires an integer");
             assert!(
@@ -550,7 +558,7 @@ fn main() -> AppExit {
         app.add_plugins(
             plugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: CONTROLS.into(),
+                    title: "Sponza".into(),
                     resolution: WindowResolution::new(capture_size.0, capture_size.1)
                         .with_scale_factor_override(1.0),
                     present_mode: if no_vsync || (benchmark_windowed && !benchmark_vsync) {
@@ -604,6 +612,8 @@ fn main() -> AppExit {
             multi_bounce,
             cached_hit_sky,
             hardware_ray_queries,
+            ray_traced_sun_shadows,
+            ray_traced_gi,
             resolution_divisor,
             max_rays,
             max_traversal_queries,
@@ -642,6 +652,7 @@ fn main() -> AppExit {
             ..default()
         })
         .add_observer(scene_ready)
+        .add_observer(on_menu_activate)
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -649,7 +660,7 @@ fn main() -> AppExit {
                 prepare_scene,
                 fail_capture_on_gi_error,
                 controls,
-                update_debug_overlay,
+                update_debug_menu,
                 lighting,
                 capture_frame,
                 capture_motion,
@@ -693,6 +704,12 @@ fn apply_sponza_profile(settings: &mut RadianceCascades, demo: &Demo) {
     settings.multi_bounce = demo.multi_bounce;
     settings.cached_hit_sky = demo.cached_hit_sky;
     settings.hardware_ray_queries = demo.hardware_ray_queries;
+    settings.ray_traced_sun_shadows = demo.ray_traced_sun_shadows;
+    settings.method = if demo.ray_traced_gi {
+        GiMethod::RayTraced
+    } else {
+        GiMethod::SplitRadianceCascades
+    };
     settings.probe_spacing = SPONZA_PROBE_SPACING_METERS;
     settings.interval_length = SPONZA_INTERVAL_LENGTH_METERS;
     settings.emissive_samples = SPONZA_LIGHT_SAMPLES;
@@ -719,23 +736,7 @@ fn setup(
         "{CONTROLS}; demo material textures limited to {TEXTURE_SIZE} pixels, GI scene cap 2 GiB, texture-atlas cap 768 MiB"
     );
     if !demo.capture && !demo.benchmark {
-        commands.spawn((
-            DebugOverlay,
-            Text::new("FPS: 0.0"),
-            TextFont {
-                font_size: FontSize::Px(18.0),
-                ..default()
-            },
-            TextColor(Color::WHITE),
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(12.0),
-                left: Val::Px(12.0),
-                padding: UiRect::all(Val::Px(10.0)),
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.02, 0.02, 0.02, 0.78)),
-        ));
+        spawn_debug_menu(&mut commands);
     }
     commands.spawn(WorldAssetRoot(load_scene(&assets, &demo.scenes[0])));
     if demo.motion_capture && !demo.camera_motion_capture {
@@ -1103,8 +1104,22 @@ fn setup(
                 if (demo.benchmark || demo.capture)
                     && (*readback_count).is_multiple_of(60)
                 {
+                    // The slowest GI passes, as the debug menu lists them.
+                    let mut passes: Vec<(&str, f64)> = diagnostics
+                        .iter()
+                        .filter_map(|d| {
+                            let name = d
+                                .path()
+                                .as_str()
+                                .strip_prefix("render/split_rc/")?
+                                .strip_suffix("/elapsed_gpu")?;
+                            Some((name, d.value()?))
+                        })
+                        .collect();
+                    passes.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    passes.truncate(4);
                     info!(
-                        "Sponza GI readback progress: samples={}, dispatch={}, ready_streak={}, scene_revision={}, geometry_revision={}, light_revision={}, support={}/{}, eligible={}, raw={}, finite={}, mean_luminance={:.5}, supported_mean_luminance={:.5}, max_luminance={:.5}, irradiance_cache_rejections={:?}, persistent_cache_dropped={:?}, directional_probe_count={:?}, transport_query_attempts={:?}, transport_queries_admitted={:?}, retention_demand={:?}, split_rc_gpu_ms={:?}, trace_gpu_ms={:?}, world_resolve_gpu_ms={:?}, merge_gpu_ms={:?}, penumbra_frame_gpu_ms={:?}",
+                        "Sponza GI readback progress: samples={}, dispatch={}, ready_streak={}, scene_revision={}, geometry_revision={}, light_revision={}, support={}/{}, eligible={}, raw={}, finite={}, mean_luminance={:.5}, supported_mean_luminance={:.5}, max_luminance={:.5}, irradiance_cache_rejections={:?}, persistent_cache_dropped={:?}, directional_probe_count={:?}, transport_query_attempts={:?}, transport_queries_admitted={:?}, retention_demand={:?}, split_rc_gpu_ms={:?}, trace_gpu_ms={:?}, world_resolve_gpu_ms={:?}, merge_gpu_ms={:?}, penumbra_frame_gpu_ms={:?}, slowest_passes_ms={:.2?}",
                         *readback_count,
                         demo.raw_gi.dispatch_sequence,
                         demo.gi_frames,
@@ -1130,6 +1145,7 @@ fn setup(
                         gpu_timing_ms("render/split_rc/worldResolve/elapsed_gpu"),
                         gpu_timing_ms("render/split_rc/merge/elapsed_gpu"),
                         gpu_timing_ms("render/penumbra_frame/elapsed_gpu"),
+                        passes,
                     );
                 }
                 let required_frames = views
@@ -1324,6 +1340,7 @@ fn controls(
     time: Res<Time>,
     mut demo: ResMut<Demo>,
     mut cameras: Query<&mut RadianceCascades>,
+    mut menus: Query<&mut Visibility, With<DebugMenu>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if demo.capture || demo.benchmark {
@@ -1357,9 +1374,37 @@ fn controls(
     if keys.just_pressed(KeyCode::KeyH) {
         demo.hardware_ray_queries = !demo.hardware_ray_queries;
     }
+    if keys.just_pressed(KeyCode::KeyM) {
+        demo.ray_traced_gi = !demo.ray_traced_gi;
+    }
+    if keys.just_pressed(KeyCode::F1) {
+        for mut visibility in &mut menus {
+            *visibility = if *visibility == Visibility::Hidden {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+        }
+    }
+    let method = if demo.ray_traced_gi {
+        GiMethod::RayTraced
+    } else {
+        GiMethod::SplitRadianceCascades
+    };
     for mut gi in &mut cameras {
+        // Change detection: only write settings that differ.
         if gi.hardware_ray_queries != demo.hardware_ray_queries {
             gi.hardware_ray_queries = demo.hardware_ray_queries;
+        }
+        if gi.method != method {
+            gi.method = method;
+        }
+        if gi.ray_traced_sun_shadows != demo.ray_traced_sun_shadows {
+            gi.ray_traced_sun_shadows = demo.ray_traced_sun_shadows;
+        }
+        if gi.multi_bounce != demo.multi_bounce {
+            gi.multi_bounce = demo.multi_bounce;
+            gi.cached_hit_sky = demo.multi_bounce && demo.cached_hit_sky;
         }
         if keys.just_pressed(KeyCode::KeyG) {
             gi.intensity = if gi.intensity > 0.0 { 0.0 } else { 1.0 };
@@ -1371,20 +1416,303 @@ fn controls(
     }
 }
 
-fn update_debug_overlay(
-    diagnostics: Res<DiagnosticsStore>,
-    settings: Query<&RadianceCascades>,
-    mut overlay: Query<&mut Text, With<DebugOverlay>>,
+/// In-window debug menu: live status, GPU pass timings and GI controls. F1 hides it.
+#[derive(Component)]
+struct DebugMenu;
+
+/// The menu's live status text.
+#[derive(Component)]
+struct DebugMenuStatus;
+
+/// A menu button and the setting it changes.
+#[derive(Component, Clone, Copy, PartialEq)]
+enum MenuAction {
+    ToggleGi,
+    Method(GiMethod),
+    HardwareRays,
+    MultiBounce,
+    SunShadows,
+    Hour(f32),
+    Play,
+}
+
+const MENU_BACKGROUND: Color = Color::srgba(0.02, 0.02, 0.02, 0.82);
+const MENU_BUTTON: Color = Color::srgb(0.16, 0.16, 0.18);
+const MENU_BUTTON_HOVER: Color = Color::srgb(0.26, 0.26, 0.30);
+const MENU_BUTTON_ACTIVE: Color = Color::srgb(0.18, 0.34, 0.52);
+
+fn spawn_debug_menu(commands: &mut Commands) {
+    let text = |value: &str, size: f32| {
+        (
+            Text::new(value),
+            TextFont {
+                font_size: FontSize::Px(size),
+                ..default()
+            },
+            TextColor(Color::WHITE),
+        )
+    };
+    let row = || Node {
+        flex_direction: FlexDirection::Row,
+        flex_wrap: FlexWrap::Wrap,
+        align_items: AlignItems::Center,
+        column_gap: Val::Px(4.0),
+        ..default()
+    };
+    let rows: [(&str, &[MenuAction]); 5] = [
+        ("GI", &[MenuAction::ToggleGi]),
+        (
+            "Method",
+            &[
+                MenuAction::Method(GiMethod::SplitRadianceCascades),
+                MenuAction::Method(GiMethod::RayTraced),
+            ],
+        ),
+        (
+            "Settings",
+            &[MenuAction::HardwareRays, MenuAction::MultiBounce],
+        ),
+        ("Lighting", &[MenuAction::SunShadows]),
+        (
+            "Time",
+            &[
+                MenuAction::Hour(6.0),
+                MenuAction::Hour(12.0),
+                MenuAction::Hour(18.0),
+                MenuAction::Hour(0.0),
+                MenuAction::Play,
+            ],
+        ),
+    ];
+    commands
+        .spawn((
+            DebugMenu,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(12.0),
+                left: Val::Px(12.0),
+                max_width: Val::Px(460.0),
+                padding: UiRect::all(Val::Px(10.0)),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(6.0),
+                ..default()
+            },
+            BackgroundColor(MENU_BACKGROUND),
+        ))
+        .with_children(|menu| {
+            menu.spawn((DebugMenuStatus, text("", 14.0)));
+            for (label, actions) in rows {
+                menu.spawn(row()).with_children(|row| {
+                    row.spawn((
+                        text(label, 13.0),
+                        Node {
+                            width: Val::Px(70.0),
+                            ..default()
+                        },
+                    ));
+                    for &action in actions {
+                        row.spawn((
+                            bevy::ui_widgets::Button,
+                            bevy::picking::hover::Hovered::default(),
+                            action,
+                            Node {
+                                padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                                ..default()
+                            },
+                            BackgroundColor(MENU_BUTTON),
+                        ))
+                        .with_child(text("", 13.0));
+                    }
+                });
+            }
+            menu.spawn(text(
+                "F1 menu | M method | G GI | H hardware rays | [ ] time | Space play\nRMB + WASD/QE fly | F12 cursor grab | P screenshot",
+                12.0,
+            ));
+        });
+}
+
+fn menu_label(action: MenuAction, demo: &Demo, gi_on: bool) -> String {
+    let on = |value: bool| if value { "on" } else { "off" };
+    match action {
+        MenuAction::ToggleGi => format!("GI: {}", on(gi_on)),
+        MenuAction::Method(GiMethod::SplitRadianceCascades) => "Split radiance cascades".into(),
+        MenuAction::Method(GiMethod::RayTraced) => "Ray traced".into(),
+        MenuAction::HardwareRays => format!("Hardware rays: {}", on(demo.hardware_ray_queries)),
+        MenuAction::MultiBounce => format!("Multi-bounce: {}", on(demo.multi_bounce)),
+        MenuAction::SunShadows => format!(
+            "Sun shadows: {}",
+            if demo.ray_traced_sun_shadows {
+                "ray traced"
+            } else {
+                "shadow maps"
+            }
+        ),
+        MenuAction::Hour(hour) => match hour as u32 {
+            6 => "Dawn",
+            12 => "Noon",
+            18 => "Dusk",
+            _ => "Night",
+        }
+        .into(),
+        MenuAction::Play => if demo.playing { "Pause" } else { "Play" }.into(),
+    }
+}
+
+fn menu_selected(action: MenuAction, demo: &Demo) -> bool {
+    match action {
+        MenuAction::Method(method) => (method == GiMethod::RayTraced) == demo.ray_traced_gi,
+        MenuAction::Hour(hour) => (demo.hour - hour).abs() < 0.01,
+        _ => false,
+    }
+}
+
+/// Applies a clicked menu button to the demo and the GI cameras.
+fn on_menu_activate(
+    activate: On<bevy::ui_widgets::Activate>,
+    actions: Query<&MenuAction>,
+    mut demo: ResMut<Demo>,
+    mut cameras: Query<&mut RadianceCascades>,
 ) {
-    let Some(_) = settings.iter().next() else {
+    let Ok(action) = actions.get(activate.entity) else {
         return;
     };
-    let fps = diagnostics
-        .get(&FrameTimeDiagnosticsPlugin::FPS)
-        .and_then(|diagnostic| diagnostic.smoothed())
-        .unwrap_or(0.0);
-    for mut text in &mut overlay {
-        text.0 = format!("FPS: {fps:.1}");
+    {
+        match *action {
+            MenuAction::ToggleGi => {
+                for mut gi in &mut cameras {
+                    gi.intensity = if gi.intensity > 0.0 { 0.0 } else { 1.0 };
+                    gi.reset_history();
+                }
+            }
+            MenuAction::Method(method) => demo.ray_traced_gi = method == GiMethod::RayTraced,
+            MenuAction::HardwareRays => demo.hardware_ray_queries = !demo.hardware_ray_queries,
+            MenuAction::MultiBounce => demo.multi_bounce = !demo.multi_bounce,
+            MenuAction::SunShadows => demo.ray_traced_sun_shadows = !demo.ray_traced_sun_shadows,
+            MenuAction::Hour(hour) => {
+                demo.hour = hour;
+                for mut gi in &mut cameras {
+                    gi.reset_history();
+                }
+            }
+            MenuAction::Play => demo.playing = !demo.playing,
+        }
+    }
+}
+
+/// Refreshes button labels every frame and the status text four times a second.
+#[allow(clippy::too_many_arguments)]
+fn update_debug_menu(
+    time: Res<Time<Real>>,
+    demo: Res<Demo>,
+    status: Res<RadianceCascadesStatus>,
+    diagnostics: Res<DiagnosticsStore>,
+    cameras: Query<&RadianceCascades>,
+    mut status_text: Query<&mut Text, With<DebugMenuStatus>>,
+    mut buttons: Query<(
+        &MenuAction,
+        Has<bevy::ui::Pressed>,
+        &bevy::picking::hover::Hovered,
+        &mut BackgroundColor,
+        &Children,
+    )>,
+    mut labels: Query<&mut Text, Without<DebugMenuStatus>>,
+    mut refreshed: Local<f64>,
+) {
+    let gi_on = cameras.iter().any(|gi| gi.intensity > 0.0);
+    for (action, pressed, hovered, mut background, children) in &mut buttons {
+        background.0 = if pressed || menu_selected(*action, &demo) {
+            MENU_BUTTON_ACTIVE
+        } else if hovered.0 {
+            MENU_BUTTON_HOVER
+        } else {
+            MENU_BUTTON
+        };
+        let label = menu_label(*action, &demo, gi_on);
+        for child in children.iter() {
+            if let Ok(mut text) = labels.get_mut(child)
+                && text.0 != label
+            {
+                text.0 = label.clone();
+            }
+        }
+    }
+    let now = time.elapsed_secs_f64();
+    if now < *refreshed + 0.25 {
+        return;
+    }
+    *refreshed = now;
+    let smoothed = |path: &bevy::diagnostic::DiagnosticPath| {
+        diagnostics.get(path).and_then(|d| d.smoothed())
+    };
+    let gpu = |path: &str| {
+        diagnostics
+            .iter()
+            .find(|d| d.path().as_str() == path)
+            .and_then(|d| d.smoothed())
+    };
+    let ms = |value: Option<f64>| value.map_or("-".into(), |value| format!("{value:.2}"));
+    let method_name = |method: GiMethod| match method {
+        GiMethod::SplitRadianceCascades => "split cascades",
+        GiMethod::RayTraced => "ray traced",
+    };
+    let requested = if demo.ray_traced_gi {
+        GiMethod::RayTraced
+    } else {
+        GiMethod::SplitRadianceCascades
+    };
+    let traversal = match status.hardware_ray_queries() {
+        HardwareRayQueries::Active => "hardware",
+        HardwareRayQueries::Inactive if demo.hardware_ray_queries => "software (hardware pending)",
+        HardwareRayQueries::Inactive => "software",
+        HardwareRayQueries::Unsupported => "software (no hardware support)",
+    };
+    let mut passes: Vec<(String, f64)> = diagnostics
+        .iter()
+        .filter_map(|d| {
+            let name = d
+                .path()
+                .as_str()
+                .strip_prefix("render/split_rc/")?
+                .strip_suffix("/elapsed_gpu")?;
+            (name != "elapsed_gpu").then_some(())?;
+            Some((name.to_owned(), d.smoothed()?))
+        })
+        .collect();
+    passes.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let top = passes
+        .iter()
+        .take(6)
+        .map(|(name, value)| format!("{name} {value:.2}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fps = smoothed(&FrameTimeDiagnosticsPlugin::FPS).unwrap_or(0.0);
+    let frame_ms = smoothed(&FrameTimeDiagnosticsPlugin::FRAME_TIME).unwrap_or(0.0);
+    let text = format!(
+        "{fps:.1} FPS  {frame_ms:.2} ms   {:02}:{:02} {}\n\
+         GI: {} (running {}) | rays: {traversal}\n\
+         Sun shadows: {}\n\
+         GPU ms  GI {} | sun {} | prepass {} | receivers {}\n\
+         {top}",
+        demo.hour as u32,
+        ((demo.hour.fract() * 60.0) as u32).min(59),
+        if demo.playing { "playing" } else { "paused" },
+        method_name(requested),
+        status.active_method().map_or("-", method_name),
+        if status.ray_traced_sun_shadows() {
+            "ray traced"
+        } else {
+            "shadow maps"
+        },
+        ms(gpu("render/split_rc/elapsed_gpu")),
+        ms(gpu("render/sun_shadows/elapsed_gpu")),
+        ms(gpu("render/early deferred prepass/elapsed_gpu")),
+        ms(gpu("render/gi_receiver_identity/elapsed_gpu")),
+    );
+    for mut status_text in &mut status_text {
+        if status_text.0 != text {
+            status_text.0 = text.clone();
+        }
     }
 }
 
@@ -1465,7 +1793,6 @@ fn lighting(
 
 #[derive(Default)]
 struct PerformanceSamples {
-    title_updated: f64,
     gi: Vec<f64>,
     trace: Vec<f64>,
     frame: Vec<f64>,
@@ -1557,7 +1884,6 @@ fn performance(
     time: Res<Time<Real>>,
     diagnostics: Res<DiagnosticsStore>,
     renderer_metadata: Option<Res<SharedRendererMetadata>>,
-    mut windows: Query<&mut Window>,
     mut state: Local<PerformanceSamples>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -1577,29 +1903,6 @@ fn performance(
             std::time::Instant::now(),
             "status_observation",
         );
-    }
-    if now >= state.title_updated + 0.5 {
-        state.title_updated = now;
-        let fps = diagnostics
-            .get(&FrameTimeDiagnosticsPlugin::FPS)
-            .and_then(|d| d.smoothed());
-        for mut window in &mut windows {
-            window.title = format!(
-                "Sponza | {:.1} FPS | {:02}:{:02} {} | rays: {} | {CONTROLS}",
-                fps.unwrap_or(0.0),
-                demo.hour as u32,
-                ((demo.hour.fract() * 60.0) as u32).min(59),
-                if demo.playing { "playing" } else { "paused" },
-                match status.hardware_ray_queries() {
-                    HardwareRayQueries::Active => "hardware",
-                    HardwareRayQueries::Inactive if demo.hardware_ray_queries => {
-                        "software (hardware pending)"
-                    }
-                    HardwareRayQueries::Inactive => "software",
-                    HardwareRayQueries::Unsupported => "software (no hardware support)",
-                }
-            );
-        }
     }
     // Offscreen benchmarks report GI GPU timings and separate frame-time
     // diagnostics. Readback confirms the full scene has produced fresh GI.
@@ -4169,6 +4472,8 @@ mod tests {
             multi_bounce: true,
             cached_hit_sky: false,
             hardware_ray_queries: false,
+            ray_traced_sun_shadows: false,
+            ray_traced_gi: false,
             resolution_divisor: RadianceCascades::low_end().sampling.grid_divisor,
             max_rays: 32_768,
             max_traversal_queries: 16_384,

@@ -4,8 +4,9 @@
 //! BVH walk with wgpu ray queries. The structures here mirror the live GPU
 //! scene: one BLAS per instance triangle range, built from the positions in the
 //! scene geometry buffer, and a TLAS whose custom data is the packed instance
-//! index. Every BLAS is non-opaque, so the shaders re-test each candidate with
-//! the software triangle tests and keep the software hit semantics.
+//! index. Non-opaque BLAS candidates are re-tested with the software triangle
+//! tests, keeping the software hit semantics; hardware-opaque instances (see
+//! `hardware_opaque` in scene.rs) need no test and commit in hardware.
 
 use std::collections::HashMap;
 
@@ -37,8 +38,8 @@ pub(super) struct HardwareTraversal {
     /// Geometry buffer and mesh revision that `indices` and `blas` describe.
     source: Option<(BufferId, u64)>,
     indices: Option<Buffer>,
-    /// Keyed by the instance's (first triangle, triangle count).
-    blas: HashMap<(u32, u32), HardwareBlas>,
+    /// Keyed by the instance's (first triangle, triangle count, hardware opaque).
+    blas: HashMap<(u32, u32, bool), HardwareBlas>,
     /// Instance words the TLAS was last built from.
     instances: Vec<UVec4>,
     /// Scene revision the TLAS describes; `None` until it matches the live scene.
@@ -179,7 +180,8 @@ pub(super) fn build_hardware_traversal(
             continue;
         }
         let deformed = record[6].w & INSTANCE_FLAG_ACTIVE_DEFORMATION != 0;
-        let key = (first, triangles);
+        let opaque = record[6].z != 0;
+        let key = (first, triangles, opaque);
         match hardware.blas.entry(key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let size = wgpu::BlasTriangleGeometrySizeDescriptor {
@@ -187,8 +189,13 @@ pub(super) fn build_hardware_traversal(
                     vertex_count: header.w,
                     index_format: Some(wgpu::IndexFormat::Uint32),
                     index_count: Some(triangles * 3),
-                    // Non-opaque: every triangle reaches the shader's acceptance test.
-                    flags: wgpu::AccelerationStructureGeometryFlags::NO_DUPLICATE_ANY_HIT_INVOCATION,
+                    // Non-opaque triangles reach the shader's acceptance test;
+                    // hardware-opaque instances need none.
+                    flags: if opaque {
+                        wgpu::AccelerationStructureGeometryFlags::OPAQUE
+                    } else {
+                        wgpu::AccelerationStructureGeometryFlags::NO_DUPLICATE_ANY_HIT_INVOCATION
+                    },
                 };
                 let blas = device.wgpu_device().create_blas(
                     &wgpu::CreateBlasDescriptor {
@@ -231,7 +238,8 @@ pub(super) fn build_hardware_traversal(
     let mut instances = instance_records.iter();
     for slot in 0..hardware.capacity as usize {
         hardware.tlas[slot] = instances.next().and_then(|record| {
-            let blas = hardware.blas.get(&(record[8].y, record[8].z))?;
+            let opaque = record[6].z != 0;
+            let blas = hardware.blas.get(&(record[8].y, record[8].z, opaque))?;
             // World-from-local rows, 3×4 row-major as the TLAS expects.
             let mut transform = [0.0; 12];
             for (row, word) in record[3..6].iter().enumerate() {
@@ -239,11 +247,12 @@ pub(super) fn build_hardware_traversal(
                     transform[row * 4 + column] = f32::from_bits(value);
                 }
             }
+            // Mask bits mirror `hardwareRayMask` in traversal.slang.
             Some(wgpu::TlasInstance::new(
                 &blas.blas,
                 transform,
                 slot as u32,
-                0xff,
+                if opaque { 0x01 } else { 0x02 },
             ))
         });
     }
@@ -251,7 +260,7 @@ pub(super) fn build_hardware_traversal(
     let entries: Vec<_> = builds
         .iter()
         .filter_map(|key| hardware.blas.get(key).map(|blas| (key, blas)))
-        .map(|((first, _), blas)| wgpu::BlasBuildEntry {
+        .map(|((first, ..), blas)| wgpu::BlasBuildEntry {
             blas: &blas.blas,
             geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
                 size: &blas.size,

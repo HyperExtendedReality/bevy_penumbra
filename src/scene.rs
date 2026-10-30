@@ -94,7 +94,8 @@ pub(crate) struct GiLight {
     pub edge1: Vec4,
     pub edge2: Vec4,
     // Emissive source's instance/triangle. After the actual lights, per-view
-    // mask records use all four words; punctual entries do not use this field.
+    // mask records use all four words; point/spot entries do not use this
+    // field. A directional light's x is 1 when Bevy shadow-maps it.
     pub source: UVec4,
 }
 
@@ -1056,6 +1057,17 @@ fn refit(nodes: &mut [BvhNode], instances: &[SceneInstance]) {
     }
 }
 
+/// Hardware traversal may accept this instance's hits without the shader's
+/// triangle test: an opaque material, no face culling and the default layer.
+fn hardware_opaque(instance: &SceneInstance, materials: &[UVec4]) -> bool {
+    let cutoff = materials
+        .get(instance.material as usize * MATERIAL_WORDS + 1)
+        .map(|word| word.w);
+    instance.flags & 3 == 0
+        && cutoff == Some((-1.0f32).to_bits())
+        && instance.layers == RenderLayers::default()
+}
+
 fn pack_instances(
     instances: &[SceneInstance],
     tlas_count: usize,
@@ -1076,11 +1088,12 @@ fn pack_instances(
         }
         let mask = layer_words(&instance.layers);
         // Former constant-color slots are unused by textured material shading.
-        // Keep the nine-word instance stride and flags in w.
+        // Keep the nine-word instance stride and flags in w; z marks instances
+        // whose hits need no per-triangle shader test (see hardware_opaque).
         words.push(UVec4::new(
             (layer_base + layer_masks.len()) as u32,
             mask.len() as u32,
-            0,
+            u32::from(hardware_opaque(instance, materials)),
             instance.flags,
         ));
         for group in mask.chunks(4) {
@@ -1522,6 +1535,7 @@ pub(crate) fn update_scene(
         let gpu_light = GiLight {
             position: (-transform.forward()).extend(0.0),
             color: (light.color.to_linear().to_vec4().truncate() * light.illuminance).extend(0.0),
+            source: UVec4::new(u32::from(light.shadow_maps_enabled), 0, 0, 0),
             ..default()
         };
         if gpu_light.position.is_finite() && gpu_light.color.is_finite() {

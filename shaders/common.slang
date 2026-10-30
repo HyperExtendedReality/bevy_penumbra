@@ -593,3 +593,22 @@ uint2 fullPixel(uint2 pixel, Parameters p) {
     return p.viewport.xy + min(uint2((float2(pixel) + 0.5) * float2(p.viewport.zw) / float2(p.size.xy) + jitter),
                                p.viewport.zw - 1);
 }
+
+// Ray-traced sun shadows cover at most this many directional lights that Bevy
+// would shadow-map, in light-buffer order. Mirrors SUN_SHADOW_LIGHTS in render.rs.
+static const uint SUN_SHADOW_LIGHTS = 1u;
+bool sunShadowLight(Light light) {
+    return light.position.w == 0.0 && light.source.x != 0u;
+}
+// The sun shadow mask holds one Rgba32Float texel per 4x8-pixel tile. Light k's
+// 32 occlusion bits are two exactly representable 16-bit halves, .xy or .zw.
+uint2 sunShadowTexel(uint2 local) {
+    return uint2(local.x / 4u, local.y / 8u);
+}
+uint sunShadowBit(uint2 local) {
+    return (local.x & 3u) + 4u * (local.y & 7u);
+}
+uint sunShadowBits(float4 texel, uint light) {
+    float2 halves = light == 0u ? texel.xy : texel.zw;
+    return uint(halves.x) | (uint(halves.y) << 16u);
+}

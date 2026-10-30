@@ -15,6 +15,7 @@
 [[vk::binding(13, 0)]] Texture2D<float4> anchorNormal;
 [[vk::binding(14, 0)]] [format("rgba32f")] WTexture2D<float4> anchorPositionOutput;
 [[vk::binding(15, 0)]] [format("rgba32f")] WTexture2D<float4> anchorNormalOutput;
+[[vk::binding(16, 0)]] Texture2D<float4> sunShadowMask;
 
 void splitLodBlend(float3 position, out uint lowLod, out uint highLod, out float blend) {
     splitLodBlendForParameters(position, params, lowLod, highLod, blend);
@@ -226,4 +227,15 @@ float4 fragment(VertexOutput input) : SV_Target {
     float3 albedo = deferredDiffuseAlbedo(deferred);
     return float4(diffuseGi * albedo * diffuseOcclusion
         * params.tuning.w * params.environment.w, 0.0);
+}
+
+// Bevy's directional shadow lookup reads this layer at the shaded pixel for a
+// light whose shadow is ray traced (see sun_shadow_patch.rs). The layer is
+// cleared to one (visible); pixels that sunShadowsHardware found blocked keep
+// the fullscreen triangle's depth of zero, the others are discarded.
+[shader("fragment")]
+void sunShadowDepth(VertexOutput input) {
+    uint2 local = uint2(input.position.xy) - params.viewport.xy;
+    float4 mask = sunShadowMask.Load(int3(sunShadowTexel(local), 0));
+    if ((sunShadowBits(mask, 0u) & (1u << sunShadowBit(local))) == 0u) discard;
 }

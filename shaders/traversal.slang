@@ -14,8 +14,11 @@ static const uint MAX_LEAF_INSTANCES = 4096u;
 // counter is reset by the cache-clear pass once per frame. A zero budget is
 // unbounded while still recording attempts when the buffer is present.
 static const uint HIT_QUERY_UNSUPPORTED = 4u;
+// Ray-traced GI has no cascade query budget, and nothing resets its counters.
+static bool transportAdmissionBypass = false;
 #ifndef GI_TRAVERSAL_CHECK
 bool admitTransportQuery(uint admissionLimit) {
+    if (transportAdmissionBypass) return true;
     uint attemptIndex = 2u * params.size.w + 5u;
     uint admittedIndex = 2u * params.size.w + 6u;
     heads[attemptIndex].add(1u);
@@ -577,13 +580,19 @@ static float hardwareConeSpread;
 static uint4 hardwareGeometryHeader;
 static Hit hardwareHit;
 
+// TLAS instance mask bits: 1 for hardware-opaque instances, which carry only
+// the default render layer, and 2 for the rest. A view without layer 0 skips
+// bit 1; the shader's layer test still filters the rest.
+uint hardwareRayMask() {
+    return params.layers.w == 0u ? 0xffu : params.layers.w;
+}
 // Runs the closest-hit loop; always returns true.
-bool hardwareQueryClosest(float3 origin, float3 direction, float limit, bool anyHit) {
-    __target_switch { case wgsl: __intrinsic_asm "penumbraRayQueryClosest($0, $1, $2, $3)"; }
+bool hardwareQueryClosest(float3 origin, float3 direction, float limit, bool anyHit, uint mask) {
+    __target_switch { case wgsl: __intrinsic_asm "penumbraRayQueryClosest($0, $1, $2, $3, $4)"; }
 }
 // Runs the occlusion loop; returns 1 when blocked and 0 otherwise.
-uint hardwareQueryOccluded(float3 origin, float3 direction, float limit) {
-    __target_switch { case wgsl: __intrinsic_asm "penumbraRayQueryOccluded($0, $1, $2)"; }
+uint hardwareQueryOccluded(float3 origin, float3 direction, float limit, uint mask) {
+    __target_switch { case wgsl: __intrinsic_asm "penumbraRayQueryOccluded($0, $1, $2, $3)"; }
 }
 
 // The TLAS custom data is the packed instance index, and each BLAS covers that
@@ -648,7 +657,7 @@ Hit hardwareClosestHit(float3 origin, float3 direction, Hit hit, bool anyHit,
     hardwareHit = hit;
     // The query always returns true. The guarded call keeps the callback in
     // the emitted module, where only the WGSL loop calls it.
-    if (!hardwareQueryClosest(origin, direction, hit.distance, anyHit))
+    if (!hardwareQueryClosest(origin, direction, hit.distance, anyHit, hardwareRayMask()))
         hardwareClosestCandidate(EMPTY, 0u);
     return hardwareHit;
 }
@@ -658,7 +667,7 @@ bool hardwareOccluded(float3 origin, float3 direction, float limit, uint4 geomet
     hardwareDirection = direction;
     hardwareLimit = limit;
     hardwareGeometryHeader = geometryHeader;
-    uint blocked = hardwareQueryOccluded(origin, direction, limit);
+    uint blocked = hardwareQueryOccluded(origin, direction, limit, hardwareRayMask());
     // Never above one; the guarded call keeps the callback in the module.
     if (blocked > 1u) hardwareOccludedCandidate(EMPTY, 0u);
     return blocked != 0u;
@@ -789,10 +798,15 @@ Hit traceRay(float3 origin, float3 direction, float limit, bool anyHit = false,
                            coneWidth, coneSpread, admissionLimit);
 }
 
+// Shadow rays leave the receiver toward the light, so they meet the side of a
+// one-sided occluder facing away from the light, which a shadow map, rendered
+// from the light, never culls. Set by sunShadowsHardware.
+static bool occlusionIgnoresCulling = false;
+
 bool occludedTriangle(float3 origin, float3 direction, TriangleRay ray, uint triangleIndex,
                       uint instance, uint flags, float limit, uint4 geometryHeader) {
     Triangle triangle = localTriangle(triangleIndex, geometryHeader);
-    if ((flags & 3u) != 0) {
+    if ((flags & 3u) != 0 && !occlusionIgnoresCulling) {
         float facing = dot(cross(triangle.b.xyz-triangle.a.xyz,triangle.c.xyz-triangle.a.xyz),direction)
                        * ((flags & 4) != 0 ? -1 : 1);
         if (((flags & 1) != 0 && facing >= 0) || ((flags & 2) != 0 && facing <= 0)) return false;

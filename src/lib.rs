@@ -23,6 +23,7 @@ pub use environment::RadianceCascadesEnvironment;
 mod receiver;
 mod render;
 mod scene;
+mod sun_shadow_patch;
 
 /// Shader/pipeline failures and scene revisions submitted by the GI renderer.
 #[derive(Resource, Clone, Default, bevy::render::extract_resource::ExtractResource)]
@@ -86,6 +87,8 @@ struct RadianceCascadesStatusState {
     shader_backend: u8,
     hardware_ray_queries_supported: bool,
     hardware_ray_queries_active: bool,
+    active_method: Option<GiMethod>,
+    ray_traced_sun_shadows: bool,
 }
 
 impl RadianceCascadesStatus {
@@ -165,6 +168,37 @@ impl RadianceCascadesStatus {
         } else {
             HardwareRayQueries::Unsupported
         }
+    }
+
+    /// The GI method the latest dispatch ran, after any fallback.
+    pub fn active_method(&self) -> Option<GiMethod> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active_method
+    }
+
+    /// Whether the shadowed sun currently takes ray-traced visibility
+    /// instead of Bevy's shadow maps.
+    pub fn ray_traced_sun_shadows(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .ray_traced_sun_shadows
+    }
+
+    pub(crate) fn set_active_method(&self, method: GiMethod) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active_method = Some(method);
+    }
+
+    pub(crate) fn set_ray_traced_sun_shadows(&self, active: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .ray_traced_sun_shadows = active;
     }
 
     pub(crate) fn set_hardware_ray_queries_supported(&self, supported: bool) {
@@ -388,6 +422,9 @@ impl Default for SamplingSettings {
     Msaa::Off
 )]
 pub struct RadianceCascades {
+    /// The diffuse GI estimator. Both feed the same temporal filter, denoiser
+    /// and composition.
+    pub method: GiMethod,
     /// Shared receiver-grid, update, traversal, cache, and reconstruction limits.
     pub sampling: SamplingSettings,
     /// Per-view invalidation epoch. Call `reset_history()` after a game-driven
@@ -425,6 +462,18 @@ pub struct RadianceCascades {
     /// support, the software traversal runs instead. See
     /// [`RadianceCascadesStatus::hardware_ray_queries`].
     pub hardware_ray_queries: bool,
+    /// Replace Bevy's cascaded shadow maps for the shadowed directional light
+    /// with one hardware ray per pixel against the GI scene, skipping the
+    /// per-cascade geometry passes. Bevy's PBR shader modules are patched so
+    /// every material it shades, deferred or forward (including blended
+    /// decals), reads that visibility at its pixel. Shadows are hard and cast
+    /// only by [`RadianceCascadesGeometry`] meshes, ignoring `NotShadowCaster`;
+    /// translucent surfaces take the visibility of the opaque surface behind
+    /// them, and fog in-scattering is unshadowed. Applies while hardware ray
+    /// queries are active, every 3D camera uses it, at most one directional
+    /// light is shadowed and no spot light is; Bevy's shadow maps are used
+    /// otherwise.
+    pub ray_traced_sun_shadows: bool,
     /// Apply Bevy's material and screen-space occlusion to composed GI.
     /// Raw output bypasses these artistic factors.
     pub artistic_occlusion: bool,
@@ -452,9 +501,24 @@ pub struct RadianceCascades {
     pub emissive_samples: u32,
 }
 
+/// How a view estimates diffuse global illumination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GiMethod {
+    /// Split Radiance Cascades: a sparse world-space radiance field, shared
+    /// across frames and views. Runs with software or hardware traversal.
+    #[default]
+    SplitRadianceCascades,
+    /// One hardware ray per resolve sample with ReSTIR GI temporal and spatial
+    /// path resampling (Ouyang et al. 2021). Skips the cascade passes. Needs
+    /// `hardware_ray_queries`; without hardware support the view falls back
+    /// to Split Radiance Cascades.
+    RayTraced,
+}
+
 impl Default for RadianceCascades {
     fn default() -> Self {
         Self {
+            method: GiMethod::SplitRadianceCascades,
             sampling: SamplingSettings::default(),
             history_epoch: 0,
             probe_spacing: 0.25,
@@ -466,6 +530,7 @@ impl Default for RadianceCascades {
             multi_bounce: false,
             cached_hit_sky: false,
             hardware_ray_queries: false,
+            ray_traced_sun_shadows: false,
             artistic_occlusion: true,
             environment: LinearRgba::BLACK,
             temporal_blend: 0.88,
@@ -614,6 +679,8 @@ impl Plugin for RadianceCascadesPlugin {
                 upload_bytes: self.geometry_upload_bytes_per_frame.max(16),
             })
             .init_resource::<environment::EnvironmentTables>()
+            .init_resource::<sun_shadow_patch::SunShadowPatch>()
+            .add_systems(Update, sun_shadow_patch::patch_bevy_shadow_shaders)
             .add_plugins((
                 ExtractComponentPlugin::<RadianceCascades>::default(),
                 ExtractComponentPlugin::<RadianceCascadesRuntimeBudget>::default(),
@@ -623,6 +690,7 @@ impl Plugin for RadianceCascadesPlugin {
                 ExtractResourcePlugin::<render::SceneBudget>::default(),
                 ExtractResourcePlugin::<environment::EnvironmentTables>::default(),
                 ExtractResourcePlugin::<RadianceCascadesStatus>::default(),
+                ExtractResourcePlugin::<sun_shadow_patch::SunShadowPatch>::default(),
             ))
             .add_systems(
                 PostUpdate,

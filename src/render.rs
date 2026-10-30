@@ -68,7 +68,7 @@ const COLD_RANK_PHASES: [usize; 3] = [1, 2, 3];
 pub(crate) const PROBE_SIZE: u64 = 1792;
 const PACK_PROBE_GROUPS_PER_ROW: u64 = 256;
 const CACHE_COMMIT: usize = 14;
-const COMPUTE_ENTRIES: [&str; 23] = [
+const COMPUTE_ENTRIES: [&str; 29] = [
     "clear",
     "seed",
     "parents",
@@ -92,6 +92,12 @@ const COMPUTE_ENTRIES: [&str; 23] = [
     "traceResolve",
     "traceDeferredHardware",
     "traceVisibilityHardware",
+    "sunShadowsHardware",
+    "rtgiSample",
+    "rtgiResolve",
+    "rtgiCacheRecord",
+    "rtgiCacheVisibility",
+    "rtgiCacheShade",
 ];
 const SLANG_OPTIMIZATION_LEVEL: u8 = 2;
 const HISTORY_DIAGNOSTIC_WORDS: u64 = 26;
@@ -208,6 +214,7 @@ fn history_settings_changed(previous: RadianceCascades, next: RadianceCascades) 
     comparable.intensity = next.intensity;
     comparable.environment = next.environment;
     comparable.hardware_ray_queries = next.hardware_ray_queries;
+    comparable.ray_traced_sun_shadows = next.ray_traced_sun_shadows;
     comparable != next
 }
 
@@ -218,6 +225,7 @@ fn world_cache_settings_changed(mut previous: RadianceCascades, next: RadianceCa
     previous.environment = next.environment;
     previous.sampling.resolve_scale = next.sampling.resolve_scale;
     previous.hardware_ray_queries = next.hardware_ray_queries;
+    previous.ray_traced_sun_shadows = next.ray_traced_sun_shadows;
     previous != next
 }
 
@@ -431,12 +439,44 @@ fn adapt_view_settings(
 // Hardware ray-query variants of `traceDeferred` and `traceVisibility`.
 const HARDWARE_TRACE_DEFERRED: usize = 21;
 const HARDWARE_TRACE_VISIBILITY: usize = 22;
-const HARDWARE_TRAVERSAL_PIPELINES: u64 =
-    (1 << HARDWARE_TRACE_DEFERRED) | (1 << HARDWARE_TRACE_VISIBILITY);
+/// Ray-traced sun shadow mask; see `RadianceCascades::ray_traced_sun_shadows`.
+const SUN_SHADOWS_HARDWARE: usize = 23;
+/// Directional lights a sun shadow mask covers; mirrors common.slang.
+const SUN_SHADOW_LIGHTS: usize = 1;
+/// Ray-traced GI (`GiMethod::RayTraced`): path sampling with temporal reuse,
+/// then spatial reuse and resolve.
+const RTGI_SAMPLE: usize = 24;
+const RTGI_RESOLVE: usize = 25;
+/// World radiance cache shading: record shadow rays, trace them in hardware,
+/// then replay the shading with the answers.
+const RTGI_CACHE_RECORD: usize = 26;
+const RTGI_CACHE_VISIBILITY: usize = 27;
+const RTGI_CACHE_SHADE: usize = 28;
+/// Bytes of one `RtgiReservoir` in cascades.slang.
+const RTGI_RESERVOIR_BYTES: u64 = 64;
+// Mirror RTGI_CACHE_* in cascades.slang.
+const RTGI_CACHE_CAPACITY: u64 = 1 << 18;
+const RTGI_CACHE_CELL_BYTES: u64 = 80;
+const RTGI_CACHE_QUEUE: u64 = 8192;
+const RTGI_CACHE_REFRESH: u64 = 8192;
+const HARDWARE_TRAVERSAL_PIPELINES: u64 = (1 << HARDWARE_TRACE_DEFERRED)
+    | (1 << HARDWARE_TRACE_VISIBILITY)
+    | (1 << SUN_SHADOWS_HARDWARE)
+    | (1 << RTGI_SAMPLE)
+    | (1 << RTGI_RESOLVE)
+    | (1 << RTGI_CACHE_VISIBILITY);
 const RAY_QUERY_DEFINE: &str = "PENUMBRA_HARDWARE_RAY_QUERY";
 
 fn hardware_traversal_entry(entry: &str) -> bool {
-    matches!(entry, "traceDeferredHardware" | "traceVisibilityHardware")
+    matches!(
+        entry,
+        "traceDeferredHardware"
+            | "traceVisibilityHardware"
+            | "sunShadowsHardware"
+            | "rtgiSample"
+            | "rtgiResolve"
+            | "rtgiCacheVisibility"
+    )
 }
 
 /// Pipelines a view cannot render without. Hardware traversal is optional:
@@ -462,7 +502,7 @@ fn wanted_pipelines(settings: RadianceCascades) -> u64 {
 
 const MODULES: [(&str, &[&str]); 4] = [
     ("cascades.slang", &COMPUTE_ENTRIES),
-    ("composite.slang", &["vertex", "fragment", "compositeAnchors"]),
+    ("composite.slang", &["vertex", "fragment", "compositeAnchors", "sunShadowDepth"]),
     ("acceleration.slang", &["refitTlas"]),
     ("deformation.slang", &["deformVertices", "refitBlas"]),
 ];
@@ -812,6 +852,7 @@ struct Pipelines {
     driver_cache_save: Option<std::thread::JoinHandle<Result<(), String>>>,
     driver_cache_dirty: bool,
     composite: CachedRenderPipelineId,
+    sun_shadow_depth: CachedRenderPipelineId,
     composite_anchors: CachedComputePipelineId,
     refit: CachedComputePipelineId,
     deform: [CachedComputePipelineId; 2],
@@ -839,8 +880,9 @@ pub(crate) const TLAS_BINDING: u32 = 41;
 /// (`traversal.slang`, `PENUMBRA_HARDWARE_RAY_QUERY`) calls through
 /// `__intrinsic_asm`. Slang's WGSL target has no ray-query types, and naga
 /// requires each query to be a local of the function that drives it, so each
-/// loop calls back into the Slang candidate test emitted in `source`. Every
-/// BLAS is non-opaque, so each triangle reaches that test.
+/// loop calls back into the Slang candidate test emitted in `source`.
+/// Hardware-opaque instances (see `hardware_opaque` in scene.rs) commit
+/// without that test; every other triangle reaches it.
 fn ray_query_source(source: &str) -> Result<String, String> {
     // Slang suffixes each function name with `_N`.
     let callback = |name: &str| {
@@ -859,15 +901,23 @@ fn ray_query_source(source: &str) -> Result<String, String> {
     );
     if let Some(closest) = closest {
         prelude.push_str(&format!(
-            "fn penumbraRayQueryClosest(origin: vec3<f32>, direction: vec3<f32>, limit: f32, any_hit: bool) -> bool {{
+            "fn penumbraRayQueryClosest(origin: vec3<f32>, direction: vec3<f32>, limit: f32, any_hit: bool, mask: u32) -> bool {{
     var query: ray_query;
-    rayQueryInitialize(&query, penumbraTlas, RayDesc(RAY_FLAG_NONE, 0xffu, 0.0, limit, origin, direction));
+    let flags = select(RAY_FLAG_NONE, RAY_FLAG_TERMINATE_ON_FIRST_HIT, any_hit);
+    rayQueryInitialize(&query, penumbraTlas, RayDesc(flags, mask, 0.0, limit, origin, direction));
     while (rayQueryProceed(&query)) {{
         let candidate = rayQueryGetCandidateIntersection(&query);
         if ({closest}(candidate.instance_custom_data, candidate.primitive_index)) {{
             rayQueryConfirmIntersection(&query);
             if (any_hit) {{ rayQueryTerminate(&query); }}
         }}
+    }}
+    // A hardware-opaque hit commits without the candidate test. Run it once
+    // here so its hit record matches the shader's triangle test; a hit already
+    // confirmed above is not closer than itself and is kept unchanged.
+    let committed = rayQueryGetCommittedIntersection(&query);
+    if (committed.kind != RAY_QUERY_INTERSECTION_NONE) {{
+        {closest}(committed.instance_custom_data, committed.primitive_index);
     }}
     return true;
 }}
@@ -876,9 +926,9 @@ fn ray_query_source(source: &str) -> Result<String, String> {
     }
     if let Some(occluded) = occluded {
         prelude.push_str(&format!(
-            "fn penumbraRayQueryOccluded(origin: vec3<f32>, direction: vec3<f32>, limit: f32) -> u32 {{
+            "fn penumbraRayQueryOccluded(origin: vec3<f32>, direction: vec3<f32>, limit: f32, mask: u32) -> u32 {{
     var query: ray_query;
-    rayQueryInitialize(&query, penumbraTlas, RayDesc(RAY_FLAG_NONE, 0xffu, 0.0, limit, origin, direction));
+    rayQueryInitialize(&query, penumbraTlas, RayDesc(RAY_FLAG_TERMINATE_ON_FIRST_HIT, mask, 0.000025, limit, origin, direction));
     while (rayQueryProceed(&query)) {{
         let candidate = rayQueryGetCandidateIntersection(&query);
         if ({occluded}(candidate.instance_custom_data, candidate.primitive_index)) {{
@@ -886,7 +936,8 @@ fn ray_query_source(source: &str) -> Result<String, String> {
             return 1u;
         }}
     }}
-    return 0u;
+    // A hardware-opaque hit ends the query without reaching the loop.
+    return select(0u, 1u, rayQueryGetCommittedIntersection(&query).kind != RAY_QUERY_INTERSECTION_NONE);
 }}
 "
         ));
@@ -1439,6 +1490,13 @@ pub(crate) fn install(
                 .after(RenderSystems::ExtractCommands)
                 .before(RenderSystems::CreateViews),
         )
+        .init_resource::<SunShadowOwnership>()
+        .add_systems(
+            Render,
+            own_sun_shadows
+                .after(RenderSystems::ExtractCommands)
+                .before(RenderSystems::CreateViews),
+        )
         .add_systems(RenderStartup, init_pipelines)
         .add_systems(
             Render,
@@ -1477,6 +1535,15 @@ pub(crate) fn install(
         .add_systems(
             Core3d,
             finalize_view_lighting
+                .in_set(Core3dSystems::MainPass)
+                .after(crate::receiver::draw)
+                .before(deferred_lighting)
+                .before(screen_space_reflections)
+                .before(main_opaque_pass_3d),
+        )
+        .add_systems(
+            Core3d,
+            trace_sun_shadows
                 .in_set(Core3dSystems::MainPass)
                 .after(crate::receiver::draw)
                 .before(deferred_lighting)
@@ -1548,6 +1615,19 @@ fn compute_layout(ray_query: bool) -> BindGroupLayoutDescriptor {
                 .build(binding, ShaderStages::COMPUTE),
         );
     }
+    // Current and previous ray-traced GI reservoirs.
+    layout
+        .entries
+        .push(storage_buffer_sized(false, None).build(42, ShaderStages::COMPUTE));
+    layout
+        .entries
+        .push(storage_buffer_read_only_sized(false, None).build(43, ShaderStages::COMPUTE));
+    // Ray-traced GI world radiance cache: keys, cells, shading queue.
+    for binding in [44, 45, 46] {
+        layout
+            .entries
+            .push(storage_buffer_sized(false, None).build(binding, ShaderStages::COMPUTE));
+    }
     layout
         .entries
         .retain(|entry| !matches!(entry.binding, 5 | 17 | 18 | 19 | 21 | 24 | 30));
@@ -1561,6 +1641,9 @@ fn compute_layout(ray_query: bool) -> BindGroupLayoutDescriptor {
             count: None,
         });
     }
+    // The SPIR-V passthrough numbers bindings by their position here, which
+    // must match wgpu's binding order, so the TLAS cannot trail 42 and up.
+    layout.entries.sort_by_key(|entry| entry.binding);
     layout
 }
 
@@ -1629,14 +1712,19 @@ fn init_pipelines(
                 storage_buffer_read_only_sized(false, None),
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 texture_2d(TextureSampleType::Float { filterable: false }),
+                // Not bound: the anchor outputs of compositeAnchors.
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
             ),
         ),
     );
     composite_layout
         .entries
-        .retain(|entry| !matches!(entry.binding, 1 | 4));
-    let composite = cache.queue_render_pipeline(RenderPipelineDescriptor {
-        label: Some("split_rc_composite".into()),
+        .retain(|entry| !matches!(entry.binding, 1 | 4 | 14 | 15));
+    let composite_pipeline = |label: &'static str, entry: &'static str| {
+        cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some(label.into()),
         layout: vec![composite_layout.clone()],
         vertex: VertexState {
             shader: handles[COMPUTE_ENTRIES.len()].clone(),
@@ -1645,7 +1733,7 @@ fn init_pipelines(
         },
         fragment: Some(FragmentState {
             shader: handles[COMPUTE_ENTRIES.len()].clone(),
-            entry_point: Some("fragment".into()),
+            entry_point: Some(entry.into()),
             targets: vec![Some(ColorTargetState {
                 format: TextureFormat::Rgba16Float,
                 blend: Some(BlendState {
@@ -1663,6 +1751,32 @@ fn init_pipelines(
                 write_mask: ColorWrites::ALL,
             })],
             ..default()
+        }),
+        ..default()
+    })
+    };
+    let composite = composite_pipeline("split_rc_composite", "fragment");
+    // Writes traced sun visibility as depth into Bevy's directional shadow texture.
+    let sun_shadow_depth = cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("split_rc_sun_shadow_depth".into()),
+        layout: vec![composite_layout.clone()],
+        vertex: VertexState {
+            shader: handles[COMPUTE_ENTRIES.len()].clone(),
+            entry_point: Some("vertex".into()),
+            ..default()
+        },
+        fragment: Some(FragmentState {
+            shader: handles[COMPUTE_ENTRIES.len()].clone(),
+            entry_point: Some("sunShadowDepth".into()),
+            targets: Vec::new(),
+            ..default()
+        }),
+        depth_stencil: Some(DepthStencilState {
+            format: bevy::pbr::CORE_3D_SHADOW_MAP_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::Always),
+            stencil: default(),
+            bias: default(),
         }),
         ..default()
     });
@@ -1697,6 +1811,7 @@ fn init_pipelines(
         driver_cache_save: None,
         driver_cache_dirty: false,
         composite,
+        sun_shadow_depth,
         composite_anchors,
         refit,
         deform: ["deformVertices", "refitBlas"].map(|entry| {
@@ -4771,6 +4886,14 @@ struct ViewBuffers {
     /// Composite anchor position/compatibility and geometric normal.
     _composite_anchor_textures: [Texture; 2],
     composite_anchor_views: [TextureView; 2],
+    /// Ray-traced GI reservoirs by frame parity; one placeholder entry each
+    /// unless the view uses `GiMethod::RayTraced`.
+    rtgi_reservoirs: [Buffer; 2],
+    /// Ray-traced GI world radiance cache keys, cells and shading queue.
+    rtgi_cache: [Buffer; 3],
+    /// Packed hard sun-shadow bits; see `sun_shadow_mask_size`.
+    _sun_shadow_mask: Texture,
+    sun_shadow_mask_view: TextureView,
     uniforms: [UniformBuffer<Parameters>; LEVELS],
     clear_uniforms: [UniformBuffer<Parameters>; 2],
     /// Reuse bind groups while their exact resources/layout slices remain stable.
@@ -4876,6 +4999,8 @@ struct ViewBindings {
     world_resolve: BindGroup,
     composite_anchors: BindGroup,
     composite: BindGroup,
+    /// Writes the sun shadow mask; present with hardware ray queries.
+    sun_shadows: Option<BindGroup>,
     frame: RenderedFrame,
     scene_history: SceneHistorySnapshot,
 }
@@ -4945,6 +5070,11 @@ fn view_binding_key(
         &buffers.entries,
         &buffers.history_entries,
         &buffers.irradiance_probes,
+        &buffers.rtgi_reservoirs[0],
+        &buffers.rtgi_reservoirs[1],
+        &buffers.rtgi_cache[0],
+        &buffers.rtgi_cache[1],
+        &buffers.rtgi_cache[2],
     ] {
         hash_buffer(buffer, &mut hasher);
     }
@@ -4985,6 +5115,7 @@ fn view_binding_key(
     for view in &buffers.composite_anchor_views {
         hash_view(view, &mut hasher);
     }
+    hash_view(&buffers.sun_shadow_mask_view, &mut hasher);
     hasher.finish()
 }
 
@@ -5078,13 +5209,195 @@ fn clear_pass_parameters(mut params: Parameters, clear_index: usize) -> Paramete
     params
 }
 
+/// Whether this frame's shadow-mapped directional light takes ray-traced
+/// visibility instead of Bevy's cascades. Decided before Bevy prepares lights.
+#[derive(Resource, Default)]
+struct SunShadowOwnership(bool);
+
+/// Hands the shadowed sun to the patched Bevy lookup: no cascades, a marked
+/// depth bias, and a directional shadow texture large enough to hold the
+/// screen-space visibility in layer 0.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn own_sun_shadows(
+    mut ownership: ResMut<SunShadowOwnership>,
+    patch: Option<Res<crate::sun_shadow_patch::SunShadowPatch>>,
+    scene: Res<GiScene>,
+    gpu_scene: Option<Res<GpuScene>>,
+    hardware: Option<Res<hardware::HardwareTraversal>>,
+    pipelines: Option<Res<Pipelines>>,
+    cache: Res<PipelineCache>,
+    cameras: Query<
+        (
+            &ExtractedView,
+            Option<&RadianceCascades>,
+            Option<&ViewBindings>,
+            Has<ViewBuffers>,
+            Has<crate::receiver::ReceiverTexture>,
+        ),
+        With<Camera3d>,
+    >,
+    mut lights: Query<&mut bevy::pbr::ExtractedDirectionalLight>,
+    punctual: Query<&bevy::pbr::ExtractedPointLight>,
+    mut shadow_map: ResMut<bevy::light::DirectionalLightShadowMap>,
+    status: Option<Res<RadianceCascadesStatus>>,
+) {
+    let ready = patch.is_some_and(|patch| patch.applied())
+        && scene.ready
+        && gpu_scene.is_some_and(|gpu| gpu.ready_for_revision(scene.revision))
+        && hardware.is_some_and(|hardware| hardware.ready_for(scene.revision))
+        && pipelines.is_some_and(|pipelines| {
+            pipelines.pipeline(SUN_SHADOWS_HARDWARE).is_some()
+                && cache.get_render_pipeline(pipelines.sun_shadow_depth).is_some()
+        });
+    // A camera on Bevy's shadow maps would lose them, so every 3D camera must
+    // trace the sun. Its bindings come from the previous frame's prepare.
+    // shortcut: a view whose bindings are dropped later this frame shows one
+    // unshadowed frame; move the decision after prepare if that becomes visible.
+    let views_ready = !cameras.is_empty()
+        && cameras.iter().all(|(_, settings, bindings, buffers, receiver)| {
+            settings.is_some_and(|settings| {
+                let settings = settings.sanitized();
+                settings.ray_traced_sun_shadows && settings.hardware_ray_queries
+            }) && bindings.is_some_and(|bindings| bindings.sun_shadows.is_some())
+                && buffers
+                && receiver
+        });
+    // Without cascades, shadowed spot lights would take layer 0 as well.
+    let spot_shadows = punctual
+        .iter()
+        .any(|light| light.shadow_maps_enabled && light.spot_light_angles.is_some());
+    let shadowed = lights.iter().filter(|light| light.shadow_maps_enabled).count();
+    ownership.0 = ready && views_ready && !spot_shadows && shadowed <= SUN_SHADOW_LIGHTS;
+    if let Some(status) = status {
+        status.set_ray_traced_sun_shadows(ownership.0);
+    }
+    if !ownership.0 {
+        return;
+    }
+    for mut light in &mut lights {
+        if light.shadow_maps_enabled {
+            light.shadow_maps_enabled = false;
+            light.shadow_depth_bias = crate::sun_shadow_patch::RAY_TRACED_SHADOW_BIAS;
+        }
+    }
+    let extent = cameras
+        .iter()
+        .map(|(view, ..)| (view.viewport.xy() + view.viewport.zw()).max_element())
+        .max()
+        .unwrap_or(1) as usize;
+    shadow_map.size = shadow_map.size.max(extent);
+}
+
+/// Traces the owned sun's visibility, then writes it as depth into layer 0 of
+/// Bevy's directional shadow texture before any Bevy lighting reads it.
+fn trace_sun_shadows(
+    view: ViewQuery<(&ViewBuffers, &ViewBindings, &bevy::pbr::ViewShadowBindings)>,
+    ownership: Res<SunShadowOwnership>,
+    pipelines: Res<Pipelines>,
+    cache: Res<PipelineCache>,
+    mut context: RenderContext,
+) {
+    let (buffers, bindings, shadows) = view.into_inner();
+    let (true, Some(group), Some(mask), Some(depth)) = (
+        ownership.0,
+        bindings.sun_shadows.as_ref(),
+        pipelines.pipeline(SUN_SHADOWS_HARDWARE),
+        cache.get_render_pipeline(pipelines.sun_shadow_depth),
+    ) else {
+        return;
+    };
+    let diagnostics = context.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+    let span = diagnostics.time_span(context.command_encoder(), "sun_shadows");
+    let mut pass = context
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("split_rc_sun_shadow_mask"),
+            ..default()
+        });
+    pass.set_pipeline(mask);
+    pass.set_bind_group(0, group, &[]);
+    pass.dispatch_workgroups(
+        buffers.viewport.z.div_ceil(8),
+        buffers.viewport.w.div_ceil(8),
+        1,
+    );
+    drop(pass);
+    let layer = shadows
+        .directional_light_depth_texture
+        .create_view(&TextureViewDescriptor {
+            label: Some("split_rc_sun_shadow_layer"),
+            dimension: Some(TextureViewDimension::D2),
+            aspect: TextureAspect::DepthOnly,
+            base_array_layer: 0,
+            array_layer_count: Some(1),
+            ..default()
+        });
+    let mut pass = context
+        .command_encoder()
+        .begin_render_pass(&RenderPassDescriptor {
+            label: Some("split_rc_sun_shadow_depth"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: &layer,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..default()
+        });
+    let viewport = buffers.viewport.as_vec4();
+    pass.set_viewport(viewport.x, viewport.y, viewport.z, viewport.w, 0.0, 1.0);
+    pass.set_pipeline(depth);
+    pass.set_bind_group(0, &bindings.composite, &[]);
+    pass.draw(0..3, 0..1);
+    drop(pass);
+    span.end(context.command_encoder());
+}
+
+/// One reservoir per resolve sample in ray-traced mode, else a placeholder.
+fn rtgi_reservoir_bytes(shading_size: UVec2, settings: RadianceCascades) -> u64 {
+    if settings.method == crate::GiMethod::RayTraced {
+        u64::from(shading_size.x) * u64::from(shading_size.y) * RTGI_RESERVOIR_BYTES
+    } else {
+        RTGI_RESERVOIR_BYTES
+    }
+}
+
+/// Cache keys, cells and the two-parity shading queue in ray-traced mode;
+/// one word each otherwise. Buffers start zeroed, so every key is empty.
+fn rtgi_cache_bytes(settings: RadianceCascades) -> [u64; 3] {
+    if settings.method == crate::GiMethod::RayTraced {
+        [
+            RTGI_CACHE_CAPACITY * 4,
+            RTGI_CACHE_CAPACITY * RTGI_CACHE_CELL_BYTES,
+            // Counts, two parity queues, then one work slot per update lane.
+            (2 + 2 * RTGI_CACHE_QUEUE + RTGI_CACHE_QUEUE + RTGI_CACHE_REFRESH) * 4,
+        ]
+    } else {
+        [16, RTGI_CACHE_CELL_BYTES, 16]
+    }
+}
+
+/// One texel per 4x8-pixel tile; an 8x8 dispatch group writes two tiles.
+fn sun_shadow_mask_size(viewport: UVec2) -> UVec2 {
+    UVec2::new(viewport.x.div_ceil(8) * 2, viewport.y.div_ceil(8)).max(UVec2::ONE)
+}
+
 fn view_bytes(size: UVec2, shading_size: UVec2, settings: RadianceCascades) -> u64 {
     let pixels = u64::from(size.x) * u64::from(size.y);
     let shading_pixels = u64::from(shading_size.x) * u64::from(shading_size.y);
     let buckets = cache_bucket_count(pixels, settings);
     // Four diffuse, five temporal metadata, one post-denoise receiver, three
-    // independent background current/history images and two composite anchors.
-    let image_bytes = shading_pixels * 15 * 16;
+    // independent background current/history images, two composite anchors,
+    // and the sun shadow mask over the resolve-covered viewport.
+    let mask = sun_shadow_mask_size(shading_size * resolve_scale(settings));
+    let image_bytes = shading_pixels * 15 * 16
+        + u64::from(mask.x) * u64::from(mask.y) * 16
+        + 2 * rtgi_reservoir_bytes(shading_size, settings)
+        + rtgi_cache_bytes(settings).iter().sum::<u64>();
     image_bytes
         + 12
         + (LEVELS as u64 + 2) * std::mem::size_of::<Parameters>() as u64
@@ -5505,6 +5818,24 @@ impl ViewBuffers {
         let composite_anchor_views = std::array::from_fn(|i| {
             composite_anchor_textures[i].create_view(&TextureViewDescriptor::default())
         });
+        let rtgi_reservoirs = std::array::from_fn(|_| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some("split_rc_rtgi_reservoirs"),
+                size: rtgi_reservoir_bytes(shading_size, settings),
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        });
+        let rtgi_cache = rtgi_cache_bytes(settings).map(|size| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some("split_rc_rtgi_cache"),
+                size,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        });
+        let sun_shadow_mask = make_texture(sun_shadow_mask_size(viewport_size));
+        let sun_shadow_mask_view = sun_shadow_mask.create_view(&TextureViewDescriptor::default());
         Self {
             size,
             shading_size,
@@ -5532,6 +5863,10 @@ impl ViewBuffers {
             denoise_receiver_history_output_view,
             _composite_anchor_textures: composite_anchor_textures,
             composite_anchor_views,
+            rtgi_reservoirs,
+            rtgi_cache,
+            _sun_shadow_mask: sun_shadow_mask,
+            sun_shadow_mask_view,
             uniforms: std::array::from_fn(|_| UniformBuffer::default()),
             clear_uniforms: std::array::from_fn(|_| UniformBuffer::default()),
             binding_cache: std::array::from_fn(|_| None),
@@ -5972,11 +6307,13 @@ fn prepare(
         }
         return;
     }
-    if device.limits().max_storage_buffers_per_shader_stage < 8 {
-        warn_once!("Radiance Cascades needs eight storage buffers per compute stage");
+    // shortcut: ray-traced GI's five buffers share the cascades' layout, so
+    // every method needs 13; give RTGI its own layout to get back to WebGPU's 8.
+    if device.limits().max_storage_buffers_per_shader_stage < 13 {
+        warn_once!("Radiance Cascades needs thirteen storage buffers per compute stage");
         return;
     }
-    // The shared layouts contain eight storage buffers, fourteen sampled images
+    // The shared layouts contain thirteen storage buffers, fourteen sampled images
     // in group zero plus two in group one, and three storage images plus one.
     if device.limits().max_sampled_textures_per_shader_stage < 16 {
         warn_once!("Radiance Cascades needs sixteen sampled textures per compute stage");
@@ -7357,6 +7694,7 @@ fn prepare(
                 || v.viewport_size != viewport
                 || v.settings.max_rays != settings.max_rays
                 || v.settings.multi_bounce != settings.multi_bounce
+                || v.settings.method != settings.method
                 || v.settings.sampling != settings.sampling
                 || v.buckets
                     != cache_bucket_count(u64::from(size.x) * u64::from(size.y), settings) as u32
@@ -7894,7 +8232,12 @@ fn prepare(
                 buffers.layer_selector.x,
                 buffers.layer_selector.y,
                 u32::from(settings.artistic_occlusion) | (u32::from(ssao_valid) << 1),
-                0,
+                // Hardware ray mask; hardware-opaque instances only carry layer 0.
+                if render_layers.intersects(&RenderLayers::layer(0)) {
+                    0
+                } else {
+                    0xfe
+                },
             ),
             environment_info: buffers.environment_info,
             environment_rotation,
@@ -8149,6 +8492,18 @@ fn prepare(
                     resource: BindingResource::TextureView(view),
                 });
             }
+            for (binding, reservoirs) in [
+                (42, &buffers.rtgi_reservoirs[parity]),
+                (43, &buffers.rtgi_reservoirs[1 - parity]),
+                (44, &buffers.rtgi_cache[0]),
+                (45, &buffers.rtgi_cache[1]),
+                (46, &buffers.rtgi_cache[2]),
+            ] {
+                entries.push(BindGroupEntry {
+                    binding,
+                    resource: reservoirs.as_entire_binding(),
+                });
+            }
             if let Some(tlas) = hardware_tlas {
                 entries.push(BindGroupEntry {
                     binding: TLAS_BINDING,
@@ -8297,6 +8652,23 @@ fn prepare(
             current_receiver_history,
             &buffers.denoise_receiver_history_output_view,
         );
+        let sun_shadows = hardware_tlas.is_some().then(|| {
+            bind_compute(
+                &uniforms[0],
+                &buffers.sun_shadow_mask_view,
+                previous_irradiance,
+                previous_irradiance,
+                metadata,
+                previous_metadata,
+                &buffers.metadata_views[2],
+                current_receiver_history,
+                previous_receiver_history,
+                next_background,
+                current_background,
+                None,
+                false,
+            )
+        });
         let composite_anchors = device.create_bind_group(
             "split_rc_composite_anchors",
             &cache.get_bind_group_layout(&composite_anchor_layout()),
@@ -8325,9 +8697,12 @@ fn prepare(
             buffers.irradiance_probes.as_entire_binding(),
             &buffers.composite_anchor_views[0],
             &buffers.composite_anchor_views[1],
+            &buffers.composite_anchor_views[0],
+            &buffers.composite_anchor_views[1],
+            &buffers.sun_shadow_mask_view,
         ))
         .iter()
-        .filter(|entry| !matches!(entry.binding, 1 | 4))
+        .filter(|entry| !matches!(entry.binding, 1 | 4 | 14 | 15))
         .cloned()
         .collect::<Vec<_>>();
         let composite = device.create_bind_group(
@@ -8364,6 +8739,7 @@ fn prepare(
             world_resolve,
             composite_anchors,
             composite,
+            sun_shadows,
             frame: RenderedFrame {
                 clip_from_world,
                 world_from_clip: params.world_from_clip,
@@ -8657,7 +9033,11 @@ fn render(
                 | "traceResolve" | "traceOverflow" => {
                     bindings.trace.as_ref().unwrap_or(&bindings.compute[level])
                 }
-                "worldResolve" => &bindings.world_resolve,
+                // Ray-traced GI writes worldResolve's outputs.
+                "worldResolve" | "rtgiSample" | "rtgiResolve" | "rtgiCacheRecord"
+                | "rtgiCacheVisibility" | "rtgiCacheShade" => {
+                    &bindings.world_resolve
+                }
                 _ => &bindings.compute[level],
             },
         };
@@ -8737,129 +9117,81 @@ fn render(
         .div_ceil(64);
     let ray_groups = (buffers.size.x * buffers.size.y).div_ceil(64);
     let trace_groups = ray_groups * TRACE_MAX_LANE_STRIDE;
-    dispatch(
-        "clear",
-        compute[0].expect("cascade pipeline ready"),
-        0,
-        clear_groups,
-        1,
-    );
-    dispatch(
-        "seed",
-        compute[1].expect("cascade pipeline ready"),
-        0,
-        image_x,
-        image_y,
-    );
-    dispatch(
-        "rank",
-        compute[3].expect("cascade pipeline ready"),
-        0,
-        ray_groups,
-        1,
-    );
-    for &phase in cold_rank_phases(settings.history_frames, history_was_valid) {
+    // Ray-traced GI replaces every cascade pass with path sampling and ReSTIR
+    // GI reuse; the outputs feed the same temporal filter and composition.
+    // Without hardware traversal the view falls back to the cascades.
+    let ray_traced = settings.method == crate::GiMethod::RayTraced
+        && settings.hardware_ray_queries
+        && hardware
+            .as_ref()
+            .is_some_and(|hardware| hardware.ready_for(scene.revision))
+        && compute[RTGI_SAMPLE].is_some()
+        && compute[RTGI_RESOLVE].is_some()
+        && compute[RTGI_CACHE_RECORD].is_some()
+        && compute[RTGI_CACHE_VISIBILITY].is_some()
+        && compute[RTGI_CACHE_SHADE].is_some();
+    // The multi-bounce secondary cache belongs to the cascades.
+    let secondary_enabled = bindings.secondary_enabled && !ray_traced;
+    shaders.status.set_active_method(if ray_traced {
+        crate::GiMethod::RayTraced
+    } else {
+        crate::GiMethod::SplitRadianceCascades
+    });
+    if ray_traced {
+        shaders.status.set_hardware_ray_queries_active(true);
+        // Empties the cascades' probe directory, so the composite's world-probe
+        // fallback finds nothing instead of scanning stale probes, and resets
+        // the per-frame counters.
+        // shortcut: sub-resolve facets then get no GI; give them an RTGI fallback if it shows.
+        dispatch(
+            "clear",
+            compute[0].expect("cascade pipeline ready"),
+            0,
+            clear_groups,
+            1,
+        );
+        for (name, stage) in [("rtgiSample", RTGI_SAMPLE), ("rtgiResolve", RTGI_RESOLVE)] {
+            dispatch(name, compute[stage].expect("checked"), 0, shading_x, shading_y);
+        }
+        // Shades cells queued by this frame's gather; the next gather reads them.
+        let work_groups = (RTGI_CACHE_QUEUE + RTGI_CACHE_REFRESH).div_ceil(64) as u32;
+        for (name, stage, groups) in [
+            ("rtgiCacheRecord", RTGI_CACHE_RECORD, work_groups),
+            (
+                "rtgiCacheVisibility",
+                RTGI_CACHE_VISIBILITY,
+                work_groups * DEFERRED_VISIBILITY_QUERIES as u32,
+            ),
+            ("rtgiCacheShade", RTGI_CACHE_SHADE, work_groups),
+        ] {
+            dispatch(name, compute[stage].expect("checked"), 0, groups, 1);
+        }
+    } else {
+        dispatch(
+            "clear",
+            compute[0].expect("cascade pipeline ready"),
+            0,
+            clear_groups,
+            1,
+        );
+        dispatch(
+            "seed",
+            compute[1].expect("cascade pipeline ready"),
+            0,
+            image_x,
+            image_y,
+        );
         dispatch(
             "rank",
             compute[3].expect("cascade pipeline ready"),
-            phase,
+            0,
             ray_groups,
             1,
         );
-    }
-    for level in 1..LEVELS {
-        dispatch(
-            "parents",
-            compute[2].expect("cascade pipeline ready"),
-            level,
-            probe_directory_groups,
-            1,
-        );
-    }
-    for level in (0..LEVELS).rev() {
-        dispatch(
-            "prefix",
-            compute[4].expect("cascade pipeline ready"),
-            level,
-            probe_directory_groups,
-            1,
-        );
-    }
-    dispatch(
-        "generateDirections",
-        compute[5].expect("cascade pipeline ready"),
-        0,
-        image_x,
-        image_y,
-    );
-    dispatch(
-        "clear",
-        compute[0].expect("cascade pipeline ready"),
-        0,
-        clear_groups,
-        1,
-    );
-    // Primary transport runs in passes that each hold at most one hit-shading
-    // call: closest hits, recorded visibility queries, the queries in
-    // parallel, then shading and deposit. The immediate kernel takes only
-    // receivers beyond the deferred scratch capacity.
-    let deferred_query_lanes = (u64::from(buffers.size.x) * u64::from(buffers.size.y))
-        .min(DEFERRED_TRACE_RECEIVERS)
-        * 2
-        * DEFERRED_VISIBILITY_QUERIES
-        * u64::from(TRACE_MAX_LANE_STRIDE);
-    // Hardware traversal replaces only the closest-hit and visibility kernels,
-    // and only once the TLAS describes this scene revision.
-    let hardware_traversal = settings.hardware_ray_queries
-        && hardware.is_some_and(|hardware| hardware.ready_for(scene.revision))
-        && compute[HARDWARE_TRACE_DEFERRED].is_some()
-        && compute[HARDWARE_TRACE_VISIBILITY].is_some();
-    shaders
-        .status
-        .set_hardware_ray_queries_active(hardware_traversal);
-    let (closest_hit_stage, visibility_stage) = if hardware_traversal {
-        (HARDWARE_TRACE_DEFERRED, HARDWARE_TRACE_VISIBILITY)
-    } else {
-        (17, 19)
-    };
-    for (name, stage, groups) in [
-        ("trace", closest_hit_stage, trace_groups),
-        ("traceRecord", 18, trace_groups),
-        (
-            "traceVisibility",
-            visibility_stage,
-            deferred_query_lanes.div_ceil(64) as u32,
-        ),
-        ("traceResolve", 20, trace_groups),
-        ("traceOverflow", 7, trace_groups),
-    ] {
-        dispatch(
-            name,
-            compute[stage].expect("radiance cascade trace pipeline ready"),
-            0,
-            groups,
-            1,
-        );
-    }
-    let secondary_enabled = bindings.secondary_enabled;
-    if secondary_enabled {
-        for (name, stage, x, y) in [
-            ("secondary/clear", 0, clear_groups, 1),
-            ("secondary/seed", 1, image_x, image_y),
-            ("secondary/rank", 3, ray_groups, 1),
-        ] {
+        for &phase in cold_rank_phases(settings.history_frames, history_was_valid) {
             dispatch(
-                name,
-                compute[stage].expect("secondary pipeline ready"),
-                0,
-                x,
-                y,
-            );
-        }
-        for &phase in cold_rank_phases(settings.history_frames.max(1), history_was_valid) {
-            dispatch(
-                "secondary/rank",
-                compute[3].expect("secondary pipeline ready"),
+                "rank",
+                compute[3].expect("cascade pipeline ready"),
                 phase,
                 ray_groups,
                 1,
@@ -8867,8 +9199,8 @@ fn render(
         }
         for level in 1..LEVELS {
             dispatch(
-                "secondary/parents",
-                compute[2].expect("secondary pipeline ready"),
+                "parents",
+                compute[2].expect("cascade pipeline ready"),
                 level,
                 probe_directory_groups,
                 1,
@@ -8876,112 +9208,210 @@ fn render(
         }
         for level in (0..LEVELS).rev() {
             dispatch(
-                "secondary/prefix",
-                compute[4].expect("secondary pipeline ready"),
+                "prefix",
+                compute[4].expect("cascade pipeline ready"),
                 level,
                 probe_directory_groups,
                 1,
             );
         }
-        for (name, stage, x, y) in [
-            ("secondary/generateDirections", 5, image_x, image_y),
-            ("secondary/clear", 0, clear_groups, 1),
-            ("secondary/trace", 7, trace_groups, 1),
-            ("secondary/retain", 6, bucket_groups, 1),
-            ("secondary/reduce", 8, bucket_groups, 1),
+        dispatch(
+            "generateDirections",
+            compute[5].expect("cascade pipeline ready"),
+            0,
+            image_x,
+            image_y,
+        );
+        dispatch(
+            "clear",
+            compute[0].expect("cascade pipeline ready"),
+            0,
+            clear_groups,
+            1,
+        );
+        // Primary transport runs in passes that each hold at most one hit-shading
+        // call: closest hits, recorded visibility queries, the queries in
+        // parallel, then shading and deposit. The immediate kernel takes only
+        // receivers beyond the deferred scratch capacity.
+        let deferred_query_lanes = (u64::from(buffers.size.x) * u64::from(buffers.size.y))
+            .min(DEFERRED_TRACE_RECEIVERS)
+            * 2
+            * DEFERRED_VISIBILITY_QUERIES
+            * u64::from(TRACE_MAX_LANE_STRIDE);
+        // Hardware traversal replaces only the closest-hit and visibility kernels,
+        // and only once the TLAS describes this scene revision.
+        let hardware_traversal = settings.hardware_ray_queries
+            && hardware.is_some_and(|hardware| hardware.ready_for(scene.revision))
+            && compute[HARDWARE_TRACE_DEFERRED].is_some()
+            && compute[HARDWARE_TRACE_VISIBILITY].is_some();
+        shaders
+            .status
+            .set_hardware_ray_queries_active(hardware_traversal);
+        let (closest_hit_stage, visibility_stage) = if hardware_traversal {
+            (HARDWARE_TRACE_DEFERRED, HARDWARE_TRACE_VISIBILITY)
+        } else {
+            (17, 19)
+        };
+        for (name, stage, groups) in [
+            ("trace", closest_hit_stage, trace_groups),
+            ("traceRecord", 18, trace_groups),
+            (
+                "traceVisibility",
+                visibility_stage,
+                deferred_query_lanes.div_ceil(64) as u32,
+            ),
+            ("traceResolve", 20, trace_groups),
+            ("traceOverflow", 7, trace_groups),
         ] {
             dispatch(
                 name,
-                compute[stage].expect("secondary pipeline ready"),
+                compute[stage].expect("radiance cascade trace pipeline ready"),
                 0,
-                x,
-                y,
+                groups,
+                1,
             );
         }
-        let secondary_work = cache_work_slots(samples);
-        let secondary_entries =
-            secondary_work + CACHE_HISTORY_PER_BUCKET * u64::from(buffers.buckets);
+        if secondary_enabled {
+            for (name, stage, x, y) in [
+                ("secondary/clear", 0, clear_groups, 1),
+                ("secondary/seed", 1, image_x, image_y),
+                ("secondary/rank", 3, ray_groups, 1),
+            ] {
+                dispatch(
+                    name,
+                    compute[stage].expect("secondary pipeline ready"),
+                    0,
+                    x,
+                    y,
+                );
+            }
+            for &phase in cold_rank_phases(settings.history_frames.max(1), history_was_valid) {
+                dispatch(
+                    "secondary/rank",
+                    compute[3].expect("secondary pipeline ready"),
+                    phase,
+                    ray_groups,
+                    1,
+                );
+            }
+            for level in 1..LEVELS {
+                dispatch(
+                    "secondary/parents",
+                    compute[2].expect("secondary pipeline ready"),
+                    level,
+                    probe_directory_groups,
+                    1,
+                );
+            }
+            for level in (0..LEVELS).rev() {
+                dispatch(
+                    "secondary/prefix",
+                    compute[4].expect("secondary pipeline ready"),
+                    level,
+                    probe_directory_groups,
+                    1,
+                );
+            }
+            for (name, stage, x, y) in [
+                ("secondary/generateDirections", 5, image_x, image_y),
+                ("secondary/clear", 0, clear_groups, 1),
+                ("secondary/trace", 7, trace_groups, 1),
+                ("secondary/retain", 6, bucket_groups, 1),
+                ("secondary/reduce", 8, bucket_groups, 1),
+            ] {
+                dispatch(
+                    name,
+                    compute[stage].expect("secondary pipeline ready"),
+                    0,
+                    x,
+                    y,
+                );
+            }
+            let secondary_work = cache_work_slots(samples);
+            let secondary_entries =
+                secondary_work + CACHE_HISTORY_PER_BUCKET * u64::from(buffers.buckets);
+            for level in (0..LEVELS).rev() {
+                dispatch(
+                    "secondary/merge",
+                    compute[9].expect("secondary pipeline ready"),
+                    level,
+                    secondary_entries.div_ceil(64 * LEVELS as u64) as u32,
+                    LEVELS as u32,
+                );
+            }
+            for (name, stage, x, y) in [
+                (
+                    "secondary/seedProbes",
+                    10,
+                    secondary_work.div_ceil(64 * LEVELS as u64) as u32,
+                    1,
+                ),
+                (
+                    "secondary/packProbes",
+                    11,
+                    pack_probe_groups_x,
+                    pack_probe_groups_y,
+                ),
+            ] {
+                dispatch(
+                    name,
+                    compute[stage].expect("secondary pipeline ready"),
+                    0,
+                    x,
+                    y,
+                );
+            }
+        }
+        dispatch(
+            "retain",
+            compute[6].expect("cascade pipeline ready"),
+            0,
+            bucket_groups,
+            1,
+        );
+        dispatch(
+            "reduce",
+            compute[8].expect("cascade pipeline ready"),
+            0,
+            bucket_groups,
+            1,
+        );
+        let current_capacity = cache_work_slots(samples);
+        let entry_count = current_capacity + CACHE_HISTORY_PER_BUCKET * u64::from(buffers.buckets);
         for level in (0..LEVELS).rev() {
             dispatch(
-                "secondary/merge",
-                compute[9].expect("secondary pipeline ready"),
+                "merge",
+                compute[9].expect("cascade pipeline ready"),
                 level,
-                secondary_entries.div_ceil(64 * LEVELS as u64) as u32,
+                entry_count.div_ceil(64 * LEVELS as u64) as u32,
                 LEVELS as u32,
             );
         }
         for (name, stage, x, y) in [
             (
-                "secondary/seedProbes",
+                "seedProbes",
                 10,
-                secondary_work.div_ceil(64 * LEVELS as u64) as u32,
+                current_capacity.div_ceil(64 * LEVELS as u64) as u32,
                 1,
             ),
-            (
-                "secondary/packProbes",
-                11,
-                pack_probe_groups_x,
-                pack_probe_groups_y,
-            ),
+            ("packProbes", 11, pack_probe_groups_x, pack_probe_groups_y),
         ] {
             dispatch(
                 name,
-                compute[stage].expect("secondary pipeline ready"),
+                compute[stage].expect("directional probe pipeline ready"),
                 0,
                 x,
                 y,
             );
         }
-    }
-    dispatch(
-        "retain",
-        compute[6].expect("cascade pipeline ready"),
-        0,
-        bucket_groups,
-        1,
-    );
-    dispatch(
-        "reduce",
-        compute[8].expect("cascade pipeline ready"),
-        0,
-        bucket_groups,
-        1,
-    );
-    let current_capacity = cache_work_slots(samples);
-    let entry_count = current_capacity + CACHE_HISTORY_PER_BUCKET * u64::from(buffers.buckets);
-    for level in (0..LEVELS).rev() {
         dispatch(
-            "merge",
-            compute[9].expect("cascade pipeline ready"),
-            level,
-            entry_count.div_ceil(64 * LEVELS as u64) as u32,
-            LEVELS as u32,
-        );
-    }
-    for (name, stage, x, y) in [
-        (
-            "seedProbes",
-            10,
-            current_capacity.div_ceil(64 * LEVELS as u64) as u32,
-            1,
-        ),
-        ("packProbes", 11, pack_probe_groups_x, pack_probe_groups_y),
-    ] {
-        dispatch(
-            name,
-            compute[stage].expect("directional probe pipeline ready"),
+            "worldResolve",
+            compute[16].expect("world field resolve pipeline ready"),
             0,
-            x,
-            y,
+            shading_x,
+            shading_y,
         );
     }
-    dispatch(
-        "worldResolve",
-        compute[16].expect("world field resolve pipeline ready"),
-        0,
-        shading_x,
-        shading_y,
-    );
     let frame = buffers.frame.load(Ordering::Relaxed);
     // Copy the geometry-aware sparse reconstruction before temporal clamping,
     // filtering, albedo, AO, intensity and exposure.
@@ -9133,7 +9563,7 @@ fn render(
     pass.draw(0..3, 0..1);
     drop(pass);
     composition_span.end(context.command_encoder());
-    if required & (1 << CACHE_COMMIT) != 0 {
+    if required & (1 << CACHE_COMMIT) != 0 && !ray_traced {
         // Publish once, after composition has finished reading the live table.
         // Publication changes heads from working-entry to history-entry offsets.
         for (name, stage, groups) in [
@@ -9346,7 +9776,17 @@ mod tests {
     }
 
     #[test]
-    fn compute_layout_fits_eight_storage_buffers() {
+    fn compute_layout_is_in_binding_order() {
+        // The SPIR-V passthrough binding map relies on it; see compute_layout.
+        for ray_query in [false, true] {
+            assert!(compute_layout(ray_query)
+                .entries
+                .is_sorted_by_key(|entry| entry.binding));
+        }
+    }
+
+    #[test]
+    fn compute_layout_fits_thirteen_storage_buffers() {
         let count = compute_layout(true)
             .entries
             .iter()
@@ -9360,7 +9800,7 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(count, 8);
+        assert_eq!(count, 13);
     }
 
     #[test]
@@ -10077,6 +10517,14 @@ mod tests {
         };
         assert!(!history_settings_changed(base, hardware));
         assert!(!world_cache_settings_changed(base, hardware));
+
+        // Sun shadow ownership changes direct light, not cached GI transport.
+        let sun = RadianceCascades {
+            ray_traced_sun_shadows: !base.ray_traced_sun_shadows,
+            ..base
+        };
+        assert!(!history_settings_changed(base, sun));
+        assert!(!world_cache_settings_changed(base, sun));
 
         let layout = RadianceCascades {
             probe_spacing: base.probe_spacing * 2.0,
@@ -12674,6 +13122,7 @@ mod tests {
             .chain(&view._background_textures)
             .chain(std::iter::once(&view._denoise_receiver_history_output))
             .chain(&view._composite_anchor_textures)
+            .chain(std::iter::once(&view._sun_shadow_mask))
             .map(|texture| u64::from(texture.width()) * u64::from(texture.height()) * 16)
             .sum();
         let buffer_bytes: u64 = view
@@ -12684,6 +13133,8 @@ mod tests {
             + view.entries.size()
             + view.history_entries.size()
             + view.irradiance_probes.size()
+            + view.rtgi_reservoirs.iter().map(|buffer| buffer.size()).sum::<u64>()
+            + view.rtgi_cache.iter().map(|buffer| buffer.size()).sum::<u64>()
             + (LEVELS as u64 + 2) * std::mem::size_of::<Parameters>() as u64;
         assert!(
             view_bytes(view.size, view.shading_size, view.settings) >= texture_bytes + buffer_bytes,
