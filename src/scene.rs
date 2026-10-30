@@ -1225,7 +1225,7 @@ pub(crate) fn update_scene(
 ) {
     if !cameras
         .iter()
-        .any(|(camera, settings)| camera.is_active && settings.sanitized().intensity > 0.0)
+        .any(|(camera, settings)| camera.is_active && settings.sanitized().radiance_transport_active())
     {
         *suspended = true;
         if scene.ready {

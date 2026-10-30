@@ -1,10 +1,13 @@
-//! Split radiance cascades global illumination.
+//! Global illumination for Bevy with three methods: Split Radiance Cascades,
+//! idTech 8 / AMD GI-1.2 style ray-traced GI, and PXTGI, traced against the
+//! `bevy_box3d` physics colliders (see [`GiMethod`]).
 //!
 //! Add [`RadianceCascadesPlugin`] after Bevy's render plugins, attach
 //! [`RadianceCascades`] to a 3D camera, and tag participating `Mesh3d` /
-//! `MeshMaterial3d<StandardMaterial>` entities with [`RadianceCascadesGeometry`].
-//! Shaders are embedded Slang sources compiled once using `bevy_slang`.
-//! See the crate README for requirements, costs, and research deviations.
+//! `MeshMaterial3d<StandardMaterial>` entities with [`RadianceCascadesGeometry`]
+//! (PXTGI traces `bevy_box3d::Collider`s instead). Shaders are embedded Slang
+//! sources compiled once using `bevy_slang`. See the crate README for
+//! requirements, costs, and research deviations.
 
 #![recursion_limit = "256"]
 
@@ -20,7 +23,9 @@ mod frame_timing;
 pub use frame_timing::FrameTimingPlugin;
 mod material;
 #[cfg(feature = "pxtgi")]
-pub mod pxtgi;
+mod pxtgi;
+#[cfg(feature = "pxtgi")]
+pub use pxtgi::{PxtgiLook, PxtgiProbe};
 pub use environment::RadianceCascadesEnvironment;
 mod receiver;
 mod render;
@@ -424,11 +429,13 @@ impl Default for SamplingSettings {
     Msaa::Off
 )]
 pub struct RadianceCascades {
-    /// The diffuse GI estimator. Both feed the same temporal filter, denoiser
-    /// and composition.
+    /// The diffuse GI estimator. Each method has its own temporal filter,
+    /// denoiser and upsampling; both add to the same lit image.
     pub method: GiMethod,
-    /// Controls for [`GiMethod::RayTraced`]; ignored by the cascades.
+    /// Controls for [`GiMethod::RayTraced`]; ignored by the other methods.
     pub ray_traced: RayTracedSettings,
+    /// Controls for [`GiMethod::Pxtgi`]; ignored by the other methods.
+    pub pxtgi: PxtgiSettings,
     /// Shared receiver-grid, update, traversal, cache, and reconstruction limits.
     pub sampling: SamplingSettings,
     /// Per-view invalidation epoch. Call `reset_history()` after a game-driven
@@ -459,31 +466,36 @@ pub struct RadianceCascades {
     /// diffuse only and one frame late; ignored without `multi_bounce`.
     pub cached_hit_sky: bool,
     /// Traverse the scene with hardware ray queries instead of the software
-    /// BVH, for the primary closest-hit and visibility passes. Hits keep the
-    /// software triangle, culling, layer and alpha-coverage tests. Requires
-    /// Vulkan with wgpu's experimental ray-query feature and unpaged scene
-    /// geometry. Until the hardware structures are ready, or without that
-    /// support, the software traversal runs instead. See
+    /// BVH, for the cascades' primary closest-hit and visibility passes and
+    /// for ray-traced sun shadows. Hits keep the software triangle, culling,
+    /// layer and alpha-coverage tests. Requires Vulkan with wgpu's
+    /// experimental ray-query feature and unpaged scene geometry. Until the
+    /// hardware structures are ready, or without that support, the software
+    /// traversal runs instead. [`GiMethod::RayTraced`] always uses hardware
+    /// traversal and ignores this flag. See
     /// [`RadianceCascadesStatus::hardware_ray_queries`].
     pub hardware_ray_queries: bool,
     /// Replace Bevy's cascaded shadow maps for the shadowed directional light
     /// with one hardware ray per pixel against the GI scene, skipping the
     /// per-cascade geometry passes. Bevy's PBR shader modules are patched so
     /// every material it shades, deferred or forward (including blended
-    /// decals), reads that visibility at its pixel. Shadows are hard and cast
-    /// only by [`RadianceCascadesGeometry`] meshes, ignoring `NotShadowCaster`;
+    /// decals), reads that visibility at its pixel. Each ray aims at a point
+    /// on the sun's disk and a depth-aware 5x5 filter averages neighbouring
+    /// rays, giving antialiased, slightly soft edges. Shadows are cast only by
+    /// [`RadianceCascadesGeometry`] meshes, ignoring `NotShadowCaster`;
     /// translucent surfaces take the visibility of the opaque surface behind
     /// them, and fog in-scattering is unshadowed. Applies while hardware ray
-    /// queries are active, every 3D camera uses it, at most one directional
-    /// light is shadowed and no spot light is; Bevy's shadow maps are used
-    /// otherwise.
+    /// queries are active (`hardware_ray_queries` or [`GiMethod::RayTraced`]),
+    /// every 3D camera uses it, at most one directional light is shadowed and
+    /// no spot light is; Bevy's shadow maps are used otherwise.
     pub ray_traced_sun_shadows: bool,
     /// Apply Bevy's material and screen-space occlusion to composed GI.
     /// Raw output bypasses these artistic factors.
     pub artistic_occlusion: bool,
     /// Constant source radiance for visibility-tested diffuse indirect estimates
-    /// at Split ray-hit surfaces. Bevy PBR shades visible surfaces with its own
-    /// ambient and environment-map lighting.
+    /// at Split ray-hit surfaces, and the sky PXTGI's escaping rays see when
+    /// the camera has no `EnvironmentMapLight` or `Skybox`. Bevy PBR shades
+    /// visible surfaces with its own ambient and environment-map lighting.
     pub environment: LinearRgba,
     /// Blend with validated previous irradiance.
     /// Split also uses this as per-observation radiance interval retention;
@@ -508,9 +520,10 @@ pub struct RadianceCascades {
 /// [`GiMethod::RayTraced`] controls.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RayTracedSettings {
-    /// Each world-cache cell traces a bounce ray and feeds the radiance it
-    /// finds into its next update, so light gains a bounce per update.
-    /// Off, the cache holds direct lighting only.
+    /// AMD GI-1.2 multibounce: each shaded world-cache cell traces a bounce
+    /// ray and accumulates the radiance it finds into a separate indirect
+    /// estimator, applied through the cell's diffuse reflectance, so light
+    /// gains a bounce per cache update. Off, the cache holds direct lighting only.
     pub multi_bounce: bool,
     /// Neighbour reservoirs merged per pixel in spatial reuse, clamped to 0..=16.
     pub spatial_samples: u32,
@@ -529,18 +542,130 @@ impl Default for RayTracedSettings {
     }
 }
 
+/// Which reflections PXTGI traces on surfaces smoother than
+/// [`PxtgiSettings::reflection_roughness_cutoff`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PxtgiReflections {
+    /// Leave reflections to Bevy (environment map, screen-space reflections).
+    Off,
+    /// Trace them on screen only.
+    ScreenSpace,
+    /// Trace them on screen, then against the colliders, so what is behind
+    /// the camera or off screen is reflected too.
+    #[default]
+    Traced,
+    /// As `Traced`, but an off-screen hit on a static body inside a Bevy
+    /// reflection probe (a `LightProbe` with an `EnvironmentMapLight`) takes
+    /// its colour from the probe's capture where the probe sees that point,
+    /// and a ray that finds nothing inside a probe falls back to the probe's
+    /// box-projected capture instead of the sky.
+    TracedAndProbes,
+}
+
+/// What a PXTGI view shows instead of the lit scene, matching the Godot
+/// module's debug views (1 to 5) plus two of this port's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PxtgiDebug {
+    /// The lit scene.
+    #[default]
+    Off,
+    /// Last frame's image reprojected onto this frame: what screen rays see.
+    LastFrame,
+    /// How far a point projected into last frame and back lands from where
+    /// it started: reprojection error, red where it is large.
+    RoundTrip,
+    /// The lit scene with bounce light from the colliders alone (no screen
+    /// march): how well the colliders stand in for the geometry.
+    WorldOnly,
+    /// The fraction of rays that hit a collider (no screen march).
+    WorldHits,
+    /// The world position each pixel reconstructs to, as `fract(position)`.
+    WorldPosition,
+    /// The filtered bounce light alone, before albedo.
+    BounceLight,
+    /// The traced reflections alone.
+    Reflections,
+}
+
+/// [`GiMethod::Pxtgi`] controls. Distances are in world units (metres).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PxtgiSettings {
+    /// How far rays follow what is on screen before continuing against the
+    /// colliders. Minimum 0.1.
+    pub max_distance: f32,
+    /// How far rays go against the colliders. Light from surfaces further
+    /// away is not bounced. Minimum 0.1.
+    pub world_ray_distance: f32,
+    /// Rays each traced texel sends per frame, clamped to 1..=4. More settle
+    /// faster and flicker less, at about proportional cost.
+    pub rays_per_texel: u32,
+    /// Light bounces more than once through the radiance cache. Off, every ray
+    /// that leaves the screen lights what it hits from scratch (one bounce).
+    pub multi_bounce: bool,
+    /// Traced reflections on smooth surfaces.
+    pub reflections: PxtgiReflections,
+    /// Surfaces with a perceptual roughness below this get traced
+    /// reflections, faded into Bevy's own over the last quarter of it.
+    /// Clamped to 0..=1.
+    pub reflection_roughness_cutoff: f32,
+    /// What the view shows; [`PxtgiDebug::Off`] for the lit scene.
+    pub debug: PxtgiDebug,
+}
+
+impl Default for PxtgiSettings {
+    fn default() -> Self {
+        Self {
+            max_distance: 8.0,
+            world_ray_distance: 30.0,
+            rays_per_texel: 4,
+            multi_bounce: true,
+            reflections: PxtgiReflections::Traced,
+            reflection_roughness_cutoff: 0.5,
+            debug: PxtgiDebug::Off,
+        }
+    }
+}
+
 /// How a view estimates diffuse global illumination.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GiMethod {
     /// Split Radiance Cascades: a sparse world-space radiance field, shared
-    /// across frames and views. Runs with software or hardware traversal.
+    /// across frames and views. Runs with software or hardware traversal
+    /// (`hardware_ray_queries`).
     #[default]
     SplitRadianceCascades,
-    /// One hardware ray per resolve sample with ReSTIR GI temporal and spatial
-    /// path resampling (Ouyang et al. 2021). Skips the cascade passes. Needs
-    /// `hardware_ray_queries`; without hardware support the view falls back
-    /// to Split Radiance Cascades.
+    /// idTech 8 / AMD GI-1.2 style ray-traced GI, a separate estimator that
+    /// runs none of the cascade passes. A final gather traces one hardware
+    /// ray per resolve sample; its hit takes radiance from last frame's lit
+    /// image when the camera sees it, else a spatial-hash world radiance
+    /// cache shaded a bounded number of cells per frame, else camera-centred
+    /// cascaded irradiance volumes. ReSTIR GI (Ouyang et al. 2021) reuses the
+    /// paths over time and space; the result is stored as L1 spherical
+    /// harmonics, denoised with separable bilateral and temporal filters
+    /// (`spatial_filter_steps` > 0 enables the former, `history_frames` caps
+    /// the latter) and upsampled with each pixel's own normal. Always traces
+    /// with hardware ray queries. It never falls back to the cascades: until
+    /// its hardware structures and pipelines are ready, or on a device
+    /// without ray-query support, the view keeps Bevy's native lighting.
     RayTraced,
+    /// PXTGI, the physics-based GI of the Godot `godot_physx` module: a third
+    /// method that runs none of the other two's passes and needs no GI scene
+    /// registration. Each visible surface sends a few rays per frame at a
+    /// quarter of the resolution. A ray first follows what is on screen,
+    /// taking the light that point had in last frame's image; where it leaves
+    /// the screen or passes behind what it shows, it continues against the
+    /// `bevy_box3d::Collider`s (boxes, spheres, capsules, convex hulls and
+    /// triangle meshes), which stand in for the geometry. Hits are lit by the
+    /// sun, point and spot lights (shadowed by the colliders), the camera's
+    /// ambient light and a hashed world-space radiance cache that gives
+    /// multiple bounces; rays leaving the scene see the environment. The
+    /// result is accumulated over frames, filtered along depth and normals,
+    /// upsampled, and replaces Bevy's ambient light where rays hit. Smooth
+    /// surfaces also get traced reflections. Configure it with
+    /// [`RadianceCascades::pxtgi`]; [`PxtgiLook`] overrides a body's colour.
+    /// Needs the crate's `pxtgi` feature (on by default); without it the view
+    /// keeps Bevy's native lighting.
+    Pxtgi,
 }
 
 impl Default for RadianceCascades {
@@ -548,6 +673,7 @@ impl Default for RadianceCascades {
         Self {
             method: GiMethod::SplitRadianceCascades,
             ray_traced: RayTracedSettings::default(),
+            pxtgi: PxtgiSettings::default(),
             sampling: SamplingSettings::default(),
             history_epoch: 0,
             probe_spacing: 0.25,
@@ -628,6 +754,36 @@ impl RadianceCascades {
             finite(self.environment.blue, 0.0, 0.0, 100_000.0),
             1.0,
         );
+        self.pxtgi = self.pxtgi.sanitized();
+        self
+    }
+
+    /// The view runs one of the radiance-transport methods (cascades or
+    /// ray-traced GI) rather than PXTGI or nothing.
+    pub(crate) fn radiance_transport_active(&self) -> bool {
+        self.intensity > 0.0 && self.method != GiMethod::Pxtgi
+    }
+
+    /// The view runs PXTGI.
+    #[cfg_attr(not(feature = "pxtgi"), allow(dead_code))]
+    pub(crate) fn pxtgi_active(&self) -> bool {
+        self.intensity > 0.0 && self.method == GiMethod::Pxtgi
+    }
+}
+
+impl PxtgiSettings {
+    pub(crate) fn sanitized(mut self) -> Self {
+        let finite = |value: f32, fallback: f32, min: f32, max: f32| {
+            if value.is_finite() {
+                value.clamp(min, max)
+            } else {
+                fallback
+            }
+        };
+        self.max_distance = finite(self.max_distance, 8.0, 0.1, 10_000.0);
+        self.world_ray_distance = finite(self.world_ray_distance, 30.0, 0.1, 100_000.0);
+        self.rays_per_texel = self.rays_per_texel.clamp(1, 4);
+        self.reflection_roughness_cutoff = finite(self.reflection_roughness_cutoff, 0.5, 0.0, 1.0);
         self
     }
 }
@@ -732,6 +888,8 @@ impl Plugin for RadianceCascadesPlugin {
             PostUpdate,
             environment::update_environment_tables.after(bevy::asset::AssetEventSystems),
         );
+        #[cfg(feature = "pxtgi")]
+        pxtgi::install(app, self.compiler.clone(), status.clone());
         render::install(
             app,
             self.compiler.clone(),

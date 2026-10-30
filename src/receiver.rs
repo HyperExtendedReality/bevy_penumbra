@@ -285,7 +285,7 @@ fn extract(
 ) {
     let active = cameras
         .iter()
-        .any(|(_, camera, settings)| camera.is_active && settings.sanitized().intensity > 0.0);
+        .any(|(_, camera, settings)| camera.is_active && settings.sanitized().radiance_transport_active());
     if !active {
         if *was_active {
             // Clean up once on the transition, including identities whose
@@ -320,7 +320,7 @@ fn extract(
     }
     live.clear();
     for (entity, camera, settings) in &cameras {
-        if !camera.is_active || settings.sanitized().intensity <= 0.0 {
+        if !camera.is_active || !settings.sanitized().radiance_transport_active() {
             continue;
         }
         let view = bevy::render::view::RetainedViewEntity::new(entity.into(), None, 0);

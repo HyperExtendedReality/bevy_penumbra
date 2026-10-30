@@ -1,30 +1,34 @@
-//! PXTGI: real-time global illumination traced against the physics colliders.
+//! PXTGI ([`crate::GiMethod::Pxtgi`]): global illumination traced against the
+//! physics colliders.
 //!
-//! A port of the experimental PXTGI from the godot_physx module
+//! A port of PXTGI from the godot_physx module
 //! (`modules/godot_physx/nodes/pxtgi_3d.cpp`, `physx_gi_effect.cpp`). Each
 //! visible surface sends a few rays per frame. A ray first follows what is on
 //! screen, taking the light that point had in last frame's image; where it
 //! leaves the screen or passes behind what the screen shows it continues
 //! against the [`bevy_box3d::Collider`]s (boxes, spheres, capsules, convex
 //! hulls and triangle meshes), which stand in for the geometry. Hits are lit by
-//! the sun, point and spot lights (shadowed by the colliders) and by a hashed
-//! world-space radiance cache that gives multiple bounces; rays leaving the
-//! scene see the camera's `EnvironmentMapLight`. The result is accumulated
-//! over frames, filtered along depth and normals, upsampled and added onto the
-//! lit deferred image times each pixel's albedo. Smooth surfaces also get
-//! traced reflections, which take over from Bevy's environment-map reflection
-//! where they find something.
+//! the camera's ambient light, the sun, point and spot lights (shadowed by the
+//! colliders) and by a hashed world-space radiance cache that gives multiple
+//! bounces; rays leaving the scene see the camera's `EnvironmentMapLight`,
+//! else its `Skybox`, else [`crate::RadianceCascades::environment`]. The
+//! result is accumulated over frames, filtered along depth and normals,
+//! upsampled, and replaces Bevy's ambient light (and environment-map diffuse)
+//! by the fraction of rays that hit, times each pixel's albedo. Smooth
+//! surfaces also get traced reflections, which take over from Bevy's own
+//! reflection where they find something; Bevy reflection probes take over
+//! inside their boxes, or serve as capture sources in
+//! [`crate::PxtgiReflections::TracedAndProbes`].
 //!
-//! Add [`PxtgiPlugin`] after `DefaultPlugins`, put [`Pxtgi`] on a 3D camera and
-//! give bodies a `Collider`. A body's colour comes from [`PxtgiLook`], else its
-//! own `MeshMaterial3d<StandardMaterial>`, else its first child's; otherwise it
-//! bounces as neutral grey. Emissive `StandardMaterial` meshes outside any
-//! collider body give off light as their bounding box. Independent of
-//! [`crate::RadianceCascadesPlugin`]; use one or the other on a camera.
-//!
-//! Not ported: reflection probes (Bevy's light probes work differently). The
-//! diffuse GI is added to Bevy's own ambient light rather than replacing it,
-//! so keep `AmbientLight` low on PXTGI cameras.
+//! Installed by [`crate::RadianceCascadesPlugin`]; runs on cameras whose
+//! [`crate::RadianceCascades::method`] is `Pxtgi`. A body's colour comes from
+//! [`PxtgiLook`] on it, else its own `MeshMaterial3d<StandardMaterial>`, else
+//! its child meshes' (albedo from the first, emission from the brightest; a
+//! child's own `PxtgiLook` wins); otherwise it bounces as neutral grey. A
+//! material's albedo is its base colour times its base-colour texture's mean,
+//! and its emission its emissive colour times its emissive texture's mean.
+//! Emissive `StandardMaterial` meshes outside any collider body give off light
+//! as their bounding box.
 
 use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
@@ -34,19 +38,21 @@ use std::{
 };
 
 use bevy::{
-    camera::{Hdr, primitives::Aabb},
+    camera::primitives::Aabb,
     core_pipeline::{
         Core3dSystems, FullscreenShader,
         core_3d::{main_opaque_pass_3d, main_transparent_pass_3d},
-        prepass::{DeferredPrepass, DepthPrepass, ViewPrepassTextures},
+        prepass::ViewPrepassTextures,
         schedule::Core3d,
     },
+    image::Image,
+    light::{EnvironmentMapLight, LightProbe, ParallaxCorrection, Skybox},
     math::Affine3A,
     prelude::*,
     render::{
         Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
         camera::ExtractedCamera,
-        extract_component::{ExtractComponent, ExtractComponentPlugin},
+        diagnostic::RecordDiagnostics,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_asset::RenderAssets,
         render_resource::{binding_types::*, *},
@@ -59,8 +65,13 @@ use bevy::{
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
     transform::TransformSystems,
 };
-use bevy_box3d::Collider;
+use bevy_box3d::{Collider, RigidBody};
 use bevy_slang::{SlangCompiler, SlangLoaderError, SlangSettings, SlangTarget};
+
+use crate::{
+    GiMethod, PxtgiDebug, PxtgiReflections, PxtgiSettings, RadianceCascades, RadianceCascadesRawOutput,
+    RadianceCascadesStatus,
+};
 
 /// Radiance-cache slots shared by every PXTGI view (80 bytes each).
 const CACHE_SLOTS: u32 = 1 << 17;
@@ -70,12 +81,19 @@ const PRIMITIVE_VEC4S: usize = 6;
 const MAX_LIGHTS: usize = 8;
 const MAX_EMISSIVES: usize = 16;
 // Frames the cache follows quickly after the light sources change.
-const FRESH_FRAMES: u32 = 30;
-// Refits before the tree is rebuilt: moving bodies loosen its boxes.
-const REFITS_PER_BUILD: u32 = 120;
+const FRESH_FRAMES: u32 = 60;
+// Frames of motion after which the tree is rebuilt: a refit keeps the last
+// build's grouping, and as a pile tumbles its boxes loosen and every ray
+// walks more of the tree (a quarter second at 60 Hz, as Godot's).
+const MOVES_PER_BUILD: u32 = 15;
+// Frames a pending rescan (bodies added, removed or reshaped) waits, so a
+// stream of spawned debris doesn't rebuild the tree every frame.
+const RESCAN_FRAMES: u32 = 10;
+// Reflection probes PXTGI knows of, the nearest to the camera.
+const MAX_PROBES: usize = 8;
 
 const SOURCE: &str = include_str!("../shaders/pxtgi.slang");
-const ENTRY_POINTS: [&str; 11] = [
+const ENTRY_POINTS: [&str; 12] = [
     "cache_update",
     "trace",
     "temporal",
@@ -87,17 +105,52 @@ const ENTRY_POINTS: [&str; 11] = [
     "reflect_filter1",
     "reflect_filter2",
     "composite",
+    "raw_output",
 ];
 
-/// Adds PXTGI to cameras with [`Pxtgi`]. Requires Bevy's render plugins and
-/// [`bevy_box3d::Box3dPlugin`] (or colliders placed some other way).
-///
-/// The shaders are Slang, compiled to WGSL by `slangc` (`SLANGC` or on `PATH`)
-/// in the background at startup; PXTGI starts drawing once that finishes.
-#[derive(Clone, Debug, Default)]
-pub struct PxtgiPlugin {
-    /// Slang compiler configuration.
-    pub compiler: SlangCompiler,
+/// Installs PXTGI; called by [`crate::RadianceCascadesPlugin`]. The shader is
+/// Slang, compiled to WGSL in the background at startup; PXTGI starts drawing
+/// once that finishes.
+pub(crate) fn install(app: &mut App, compiler: SlangCompiler, status: RadianceCascadesStatus) {
+    // Pipelines are queued with this handle and wait until compilation fills it.
+    let shader = app.world().resource::<Assets<Shader>>().reserve_handle();
+    app.init_resource::<PxtgiScene>()
+        .insert_resource(PxtgiCompilation {
+            compiler,
+            handle: shader.clone(),
+            task: None,
+            started: false,
+            status,
+        })
+        .add_plugins(ExtractResourcePlugin::<PxtgiScene>::default())
+        .add_systems(Update, compile_pxtgi_shader)
+        .add_systems(
+            PostUpdate,
+            update_scene
+                .after(TransformSystems::Propagate)
+                .after(bevy::asset::AssetEventSystems),
+        );
+    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+        return;
+    };
+    render_app
+        .insert_resource(PxtgiShader(shader))
+        .add_systems(ExtractSchedule, extract_view_sources)
+        .add_systems(RenderStartup, init_pipelines)
+        .add_systems(
+            Render,
+            (
+                prepare_scene.in_set(RenderSystems::PrepareResources),
+                prepare_views.in_set(RenderSystems::PrepareBindGroups),
+            ),
+        )
+        .add_systems(
+            Core3d,
+            render
+                .in_set(Core3dSystems::MainPass)
+                .after(main_opaque_pass_3d)
+                .before(main_transparent_pass_3d),
+        );
 }
 
 fn compile_shader(compiler: &SlangCompiler) -> Result<Shader, SlangLoaderError> {
@@ -122,10 +175,19 @@ struct PxtgiCompilation {
     handle: Handle<Shader>,
     task: Option<Task<Result<Shader, SlangLoaderError>>>,
     started: bool,
+    status: RadianceCascadesStatus,
 }
 
-fn compile_pxtgi_shader(mut compilation: ResMut<PxtgiCompilation>, mut shaders: ResMut<Assets<Shader>>) {
+fn compile_pxtgi_shader(
+    mut compilation: ResMut<PxtgiCompilation>,
+    mut shaders: ResMut<Assets<Shader>>,
+    cameras: Query<&RadianceCascades>,
+) {
+    // Compiled the first time a view asks for PXTGI.
     if !compilation.started {
+        if !cameras.iter().any(|settings| settings.pxtgi_active()) {
+            return;
+        }
         compilation.started = true;
         let compiler = compilation.compiler.clone();
         compilation.task = Some(AsyncComputeTaskPool::get().spawn(async move { compile_shader(&compiler) }));
@@ -143,86 +205,45 @@ fn compile_pxtgi_shader(mut compilation: ResMut<PxtgiCompilation>, mut shaders: 
                 error!(%error, "PXTGI shader handle expired");
             }
         }
-        Err(error) => error!(%error, "PXTGI shader compilation failed; PXTGI stays off"),
-    }
-}
-
-/// Which reflections PXTGI traces on surfaces smoother than
-/// [`Pxtgi::reflection_roughness_cutoff`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PxtgiReflections {
-    /// Leave reflections to Bevy (environment map, screen-space reflections).
-    Off,
-    /// Trace them on screen only.
-    ScreenSpace,
-    /// Trace them on screen, then against the colliders, so what is behind
-    /// the camera or off screen is reflected too.
-    #[default]
-    Traced,
-}
-
-/// Per-camera PXTGI settings. Distances are in metres.
-///
-/// Requires an HDR, single-sample deferred 3D camera with a perspective
-/// projection; required components are inserted automatically.
-#[derive(Component, Clone, Copy, Debug, PartialEq, ExtractComponent)]
-#[extract_app(RenderApp)]
-#[require(Camera3d, Hdr, DepthPrepass, DeferredPrepass, Msaa::Off)]
-pub struct Pxtgi {
-    /// Strength of the bounce light: 1 is physically based; zero turns it off.
-    pub intensity: f32,
-    /// How far rays follow what is on screen before continuing against the
-    /// colliders.
-    pub max_distance: f32,
-    /// How far rays go against the colliders. Light from surfaces further
-    /// away is not bounced.
-    pub world_ray_distance: f32,
-    /// Rays each traced texel sends per frame, 1..=4. More settle faster and
-    /// flicker less, at about proportional cost.
-    pub rays_per_texel: u32,
-    /// Light bounces more than once through the radiance cache. Off, every ray
-    /// that leaves the screen lights what it hits from scratch (one bounce).
-    pub multi_bounce: bool,
-    /// Traced reflections on smooth surfaces.
-    pub reflections: PxtgiReflections,
-    /// Surfaces with a perceptual roughness below this get traced
-    /// reflections, faded into Bevy's own over the last quarter of it. Traced
-    /// reflections cost per pixel; rougher surfaces look the same from the
-    /// environment map.
-    pub reflection_roughness_cutoff: f32,
-    /// Radiance (nits) a ray leaving the scene sees when the camera has no
-    /// `EnvironmentMapLight`.
-    pub sky: LinearRgba,
-    /// Shows one stage instead of the lit scene: 0 off, 1 last frame's image
-    /// reprojected, 2 the bounce light alone, 3 colliders only (no screen
-    /// march), 4 the fraction of rays that hit, 5 the traced reflections.
-    pub debug: u32,
-}
-
-impl Default for Pxtgi {
-    fn default() -> Self {
-        Self {
-            intensity: 1.0,
-            max_distance: 8.0,
-            world_ray_distance: 30.0,
-            rays_per_texel: 4,
-            multi_bounce: true,
-            reflections: PxtgiReflections::Traced,
-            reflection_roughness_cutoff: 0.5,
-            sky: LinearRgba::BLACK,
-            debug: 0,
+        Err(error) => {
+            compilation
+                .status
+                .record_failure(format!("PXTGI shader compilation failed: {error}"));
+            error!(%error, "PXTGI shader compilation failed; PXTGI stays off");
         }
     }
 }
 
 /// Overrides the albedo and emitted radiance PXTGI gives a collider's body,
-/// for bodies whose material isn't a `StandardMaterial`.
+/// or a mesh under one: for bodies whose material isn't a `StandardMaterial`,
+/// or whose colour comes from per-instance data.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct PxtgiLook {
     /// Diffuse albedo.
     pub albedo: LinearRgba,
     /// Emitted radiance, as `StandardMaterial::emissive`.
     pub emission: LinearRgba,
+}
+
+/// Which light a Bevy reflection probe (a `LightProbe` with an
+/// `EnvironmentMapLight`) takes over from PXTGI inside its core (its box less
+/// its falloff and a quarter metre). Without this component a probe takes
+/// over both, as a Godot `ReflectionProbe` does by default.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PxtgiProbe {
+    /// Leave the diffuse light inside the probe to Bevy's probe.
+    pub overrides_ambient: bool,
+    /// Leave reflections inside the probe to Bevy's probe.
+    pub overrides_reflections: bool,
+}
+
+impl Default for PxtgiProbe {
+    fn default() -> Self {
+        Self {
+            overrides_ambient: true,
+            overrides_reflections: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -241,6 +262,28 @@ struct Emissive {
     center: Vec3,
     axes: [Vec3; 3],
     color: Vec3,
+    // Bevy's `emissive_exposure_weight`.
+    exposure_weight: f32,
+}
+
+/// One Bevy reflection probe: a `LightProbe` with an `EnvironmentMapLight`.
+#[derive(Clone)]
+struct Probe {
+    // World to the probe's unit cube [-0.5, 0.5] (its transform, scale and all).
+    to_local: Affine3A,
+    // The unit cube's axes in world space.
+    to_world_dir: Mat3,
+    // Parallax-correction half extents in the unit cube, when Bevy box-projects it.
+    parallax: Option<Vec3>,
+    // Where it takes over from PXTGI, in the unit cube.
+    core: Vec3,
+    falloff: Vec3,
+    volume: f32,
+    capture: Vec3,
+    specular: AssetId<Image>,
+    intensity: f32,
+    rotation: Quat,
+    overrides: u32,
 }
 
 /// The traced scene as the GPU takes it.
@@ -263,7 +306,11 @@ struct SceneData {
     omnis: Vec<Light>,
     spots: Vec<Light>,
     emissives: Vec<Emissive>,
+    probes: Vec<Probe>,
     sources_changed: bool,
+    // Bumped whenever the light sources change; the geometry's version
+    // stands for the scene's revision in `RadianceCascadesStatus`.
+    lighting_revision: u64,
 }
 
 #[derive(Resource, Clone, Default, ExtractResource)]
@@ -273,56 +320,46 @@ struct PxtgiScene(Arc<SceneData>);
 #[derive(Resource)]
 struct PxtgiShader(Handle<Shader>);
 
-/// The camera's environment map, as PXTGI's sky.
-#[derive(Component)]
-struct PxtgiEnvironment {
+/// A cube map PXTGI samples: its specular map, strength (cd/m²) and rotation.
+#[derive(Clone, Copy)]
+struct CubeSource {
     specular: AssetId<Image>,
     intensity: f32,
     rotation: Quat,
 }
 
-impl Plugin for PxtgiPlugin {
-    fn build(&self, app: &mut App) {
-        // Pipelines are queued with this handle and wait until compilation fills it.
-        let shader = app.world().resource::<Assets<Shader>>().reserve_handle();
-        app.init_resource::<PxtgiScene>()
-            .insert_resource(PxtgiCompilation {
-                compiler: self.compiler.clone(),
-                handle: shader.clone(),
-                task: None,
-                started: false,
-            })
-            .add_plugins((
-                ExtractComponentPlugin::<Pxtgi>::default(),
-                ExtractResourcePlugin::<PxtgiScene>::default(),
-            ))
-            .add_systems(Update, compile_pxtgi_shader)
-            .add_systems(PostUpdate, update_scene.after(TransformSystems::Propagate));
-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
-            return;
-        };
-        render_app
-            .insert_resource(PxtgiShader(shader))
-            .add_systems(ExtractSchedule, extract_environment)
-            .add_systems(RenderStartup, init_pipelines)
-            .add_systems(
-                Render,
-                (
-                    prepare_scene.in_set(RenderSystems::PrepareResources),
-                    prepare_views.in_set(RenderSystems::PrepareBindGroups),
-                ),
-            )
-            .add_systems(
-                Core3d,
-                render
-                    .in_set(Core3dSystems::MainPass)
-                    .after(main_opaque_pass_3d)
-                    .before(main_transparent_pass_3d),
-            );
-    }
+/// What a PXTGI camera's rays see beyond the colliders and its ambient light.
+#[derive(Component)]
+struct PxtgiViewSources {
+    // The environment map, else the skybox (which lights nothing in Bevy).
+    background: Option<CubeSource>,
+    // Whether that background is an `EnvironmentMapLight`, lighting the scene.
+    environment_lights: bool,
+    // The camera's ambient light, linear radiance (cd/m²), not yet exposed.
+    ambient: Vec3,
 }
 
 // ---------------------------------------------------------------- main world
+
+/// What a body bounces and gives off: its albedo, emitted radiance and Bevy's
+/// `emissive_exposure_weight` for that emission.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Look {
+    albedo: LinearRgba,
+    emission: LinearRgba,
+    exposure_weight: f32,
+}
+
+/// A body PXTGI can't read a material for bounces as neutral grey.
+const GREY: Look = Look {
+    albedo: LinearRgba::rgb(0.5, 0.5, 0.5),
+    emission: LinearRgba::BLACK,
+    exposure_weight: 0.0,
+};
+
+fn luminance(c: LinearRgba) -> f32 {
+    0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue
+}
 
 /// One traced box, sphere, capsule, hull or mesh: a collider, or an emissive
 /// mesh's bounding box.
@@ -338,8 +375,9 @@ struct Item {
     shape: [f32; 4],
     lower: Vec3,
     upper: Vec3,
-    albedo: LinearRgba,
-    emission: LinearRgba,
+    look: Look,
+    // A static body: a reflection probe's capture may have seen it.
+    fixed: bool,
 }
 
 impl Item {
@@ -367,14 +405,24 @@ impl Item {
         std::array::from_fn(|r| rows.col(r).extend(to_local.translation[r]).to_array())
     }
 
+    /// The albedo (w: emission's exposure weight) and emission (w: static) rows.
+    fn look_rows(&self) -> [[f32; 4]; 2] {
+        let (a, e) = (self.look.albedo, self.look.emission);
+        [
+            [a.red, a.green, a.blue, self.look.exposure_weight],
+            [e.red, e.green, e.blue, f32::from(u8::from(self.fixed))],
+        ]
+    }
+
     fn record(&self) -> [[f32; 4]; PRIMITIVE_VEC4S] {
         let [r0, r1, r2] = self.rows();
-        let (a, e) = (self.albedo, self.emission);
-        [r0, r1, r2, self.shape, [a.red, a.green, a.blue, 1.0], [e.red, e.green, e.blue, 0.0]]
+        let [albedo, emission] = self.look_rows();
+        [r0, r1, r2, self.shape, albedo, emission]
     }
 
     fn emissive(&self) -> Option<Emissive> {
-        let color = Vec3::new(self.emission.red, self.emission.green, self.emission.blue);
+        let e = self.look.emission;
+        let color = Vec3::new(e.red, e.green, e.blue);
         (color.max_element() > 0.0).then(|| {
             let half = (self.upper - self.lower) * 0.5;
             let m = self.to_world.matrix3;
@@ -386,6 +434,7 @@ impl Item {
                     Vec3::from(m.z_axis) * half.z,
                 ],
                 color,
+                exposure_weight: self.look.exposure_weight,
             }
         })
     }
@@ -451,6 +500,115 @@ fn shape_key(collider: &Collider) -> Option<usize> {
     }
 }
 
+/// Reads looks from `StandardMaterial`s, keeping each texture's mean colour.
+struct LookReader<'a> {
+    materials: &'a Assets<StandardMaterial>,
+    images: &'a Assets<Image>,
+    means: &'a mut HashMap<AssetId<Image>, Vec3>,
+    // Textures not readable on the CPU yet: their looks are read again once they load.
+    missing: &'a mut HashSet<AssetId<Image>>,
+}
+
+impl LookReader<'_> {
+    /// A texture's mean linear colour over a 32 x 32 grid of texels, as Godot
+    /// takes it; white while it isn't readable (not loaded, compressed, or
+    /// kept on the GPU only).
+    fn mean(&mut self, texture: &Handle<Image>) -> Vec3 {
+        let id = texture.id();
+        if let Some(mean) = self.means.get(&id) {
+            return *mean;
+        }
+        let Some(image) = self.images.get(id) else {
+            self.missing.insert(id);
+            return Vec3::ONE;
+        };
+        let (w, h) = (image.width().max(1), image.height().max(1));
+        let mut sum = Vec3::ZERO;
+        for y in 0..32 {
+            for x in 0..32 {
+                let Ok(color) = image.get_color_at((x * 2 + 1) * w / 64, (y * 2 + 1) * h / 64) else {
+                    // Unreadable formats keep the material's own colour.
+                    self.means.insert(id, Vec3::ONE);
+                    return Vec3::ONE;
+                };
+                let c = color.to_linear();
+                sum += Vec3::new(c.red, c.green, c.blue);
+            }
+        }
+        let mean = sum / 1024.0;
+        self.means.insert(id, mean);
+        mean
+    }
+
+    /// A material's look: its base colour times its base-colour texture's
+    /// mean, its emission times its emissive texture's mean.
+    fn material(&mut self, id: AssetId<StandardMaterial>) -> Option<Look> {
+        let material = self.materials.get(id)?;
+        let base = material.base_color.to_linear();
+        let albedo_mean = material.base_color_texture.as_ref().map_or(Vec3::ONE, |t| self.mean(t));
+        let emission_mean = material.emissive_texture.as_ref().map_or(Vec3::ONE, |t| self.mean(t));
+        let e = material.emissive;
+        Some(Look {
+            albedo: LinearRgba::rgb(base.red * albedo_mean.x, base.green * albedo_mean.y, base.blue * albedo_mean.z),
+            emission: LinearRgba::rgb(e.red * emission_mean.x, e.green * emission_mean.y, e.blue * emission_mean.z),
+            exposure_weight: material.emissive_exposure_weight,
+        })
+    }
+}
+
+/// A body's look, as Godot's `body_look`: its own [`PxtgiLook`], else its own
+/// material, else its child meshes' (the first one's albedo, the brightest
+/// one's emission, a child's own `PxtgiLook` before its material); grey when
+/// none is readable. Also the materials it was read from.
+fn body_look(
+    reader: &mut LookReader,
+    own: Option<&PxtgiLook>,
+    material: Option<&MeshMaterial3d<StandardMaterial>>,
+    children: Option<&Children>,
+    child_looks: &Query<(Option<&PxtgiLook>, Option<&MeshMaterial3d<StandardMaterial>>), Without<Collider>>,
+) -> (Look, Vec<AssetId<StandardMaterial>>) {
+    let override_look = |look: &PxtgiLook| Look {
+        albedo: look.albedo,
+        emission: look.emission,
+        exposure_weight: 0.0,
+    };
+    if let Some(look) = own {
+        return (override_look(look), Vec::new());
+    }
+    if let Some(material) = material {
+        let id = material.id();
+        return (reader.material(id).unwrap_or(GREY), vec![id]);
+    }
+    let mut used = Vec::new();
+    let mut found: Option<Look> = None;
+    for child in children.into_iter().flatten() {
+        let Ok((look, material)) = child_looks.get(*child) else {
+            continue;
+        };
+        let look = match (look, material) {
+            (Some(look), _) => override_look(look),
+            (None, Some(material)) => {
+                used.push(material.id());
+                let Some(look) = reader.material(material.id()) else {
+                    continue;
+                };
+                look
+            }
+            (None, None) => continue,
+        };
+        found = Some(match found {
+            None => look,
+            Some(first) if luminance(look.emission) > luminance(first.emission) => Look {
+                emission: look.emission,
+                exposure_weight: look.exposure_weight,
+                ..first
+            },
+            Some(first) => first,
+        });
+    }
+    (found.unwrap_or(GREY), used)
+}
+
 #[derive(Default)]
 struct SceneState {
     geometry: Arc<Geometry>,
@@ -459,9 +617,19 @@ struct SceneState {
     items: Vec<Item>,
     bounds: Vec<(Vec3, Vec3)>,
     slots: HashMap<Entity, usize>,
-    refits: u32,
+    // Which items read their look from each material.
+    material_users: HashMap<AssetId<StandardMaterial>, Vec<Entity>>,
+    texture_means: HashMap<AssetId<Image>, Vec3>,
+    missing_textures: HashSet<AssetId<Image>>,
+    // A camera ran PXTGI last frame: the scene was kept up to date.
+    active: bool,
+    // Bodies came, went or were reshaped since the last build.
+    pending_rescan: bool,
+    frames_since_rescan: u32,
+    moves_since_build: u32,
     sources_hash: u64,
     fresh_frames: u32,
+    lighting_revision: u64,
 }
 
 type LightQueries<'w, 's> = (
@@ -469,6 +637,19 @@ type LightQueries<'w, 's> = (
     Query<'w, 's, (&'static PointLight, &'static GlobalTransform, &'static InheritedVisibility)>,
     Query<'w, 's, (&'static SpotLight, &'static GlobalTransform, &'static InheritedVisibility)>,
 );
+
+type ProbeQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static LightProbe,
+        &'static EnvironmentMapLight,
+        &'static GlobalTransform,
+        Option<&'static ParallaxCorrection>,
+        Option<&'static PxtgiProbe>,
+        &'static InheritedVisibility,
+    ),
+>;
 
 type ProxyQuery<'w, 's> = Query<
     'w,
@@ -484,65 +665,121 @@ type ProxyQuery<'w, 's> = Query<
     (With<Mesh3d>, Without<Collider>),
 >;
 
+type ColliderQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Collider,
+        &'static GlobalTransform,
+        Option<&'static RigidBody>,
+        Option<&'static PxtgiLook>,
+        Option<&'static MeshMaterial3d<StandardMaterial>>,
+        Option<&'static Children>,
+    ),
+>;
+
+/// Bodies whose shape or presence changed, and those whose look may have.
+type ChangeQueries<'w, 's> = (
+    Query<'w, 's, (), (With<Collider>, Changed<Collider>)>,
+    Query<
+        'w,
+        's,
+        (),
+        (
+            With<Mesh3d>,
+            Without<Collider>,
+            Or<(
+                Changed<Mesh3d>,
+                Changed<MeshMaterial3d<StandardMaterial>>,
+                Changed<Aabb>,
+                Changed<InheritedVisibility>,
+            )>,
+        ),
+    >,
+    Query<
+        'w,
+        's,
+        Entity,
+        (
+            Or<(With<Collider>, With<ChildOf>)>,
+            Or<(Changed<PxtgiLook>, Changed<MeshMaterial3d<StandardMaterial>>, Changed<RigidBody>)>,
+        ),
+    >,
+);
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_scene(
     mut scene: ResMut<PxtgiScene>,
     mut state: Local<SceneState>,
-    cameras: Query<&GlobalTransform, With<Pxtgi>>,
-    colliders: Query<(
-        Entity,
-        &Collider,
-        &GlobalTransform,
-        Option<&PxtgiLook>,
-        Option<&MeshMaterial3d<StandardMaterial>>,
-        Option<&Children>,
-    )>,
+    cameras: Query<(&Camera, &GlobalTransform, &RadianceCascades)>,
+    colliders: ColliderQuery,
     proxies: ProxyQuery,
     has_collider: Query<(), With<Collider>>,
-    restyled: (
-        Query<
-            (),
-            (
-                With<Collider>,
-                Or<(Changed<Collider>, Changed<PxtgiLook>, Changed<MeshMaterial3d<StandardMaterial>>)>,
-            ),
-        >,
-        Query<
-            (),
-            (
-                With<Mesh3d>,
-                Without<Collider>,
-                Or<(
-                    Changed<Mesh3d>,
-                    Changed<MeshMaterial3d<StandardMaterial>>,
-                    Changed<Aabb>,
-                    Changed<InheritedVisibility>,
-                )>,
-            ),
-        >,
-    ),
+    parents: Query<&ChildOf>,
+    child_looks: Query<(Option<&PxtgiLook>, Option<&MeshMaterial3d<StandardMaterial>>), Without<Collider>>,
+    changes: ChangeQueries,
     moved: Query<(Entity, &GlobalTransform), (Or<(With<Collider>, With<Mesh3d>)>, Changed<GlobalTransform>)>,
     mut removed: (RemovedComponents<Collider>, RemovedComponents<Mesh3d>),
-    child_materials: Query<&MeshMaterial3d<StandardMaterial>>,
     materials: Res<Assets<StandardMaterial>>,
-    mut material_events: MessageReader<AssetEvent<StandardMaterial>>,
+    images: Res<Assets<Image>>,
+    mut events: (MessageReader<AssetEvent<StandardMaterial>>, MessageReader<AssetEvent<Image>>),
     lights: LightQueries,
+    probes: ProbeQuery,
 ) {
     let removed = removed.0.read().count() + removed.1.read().count() > 0;
-    let material_changed = material_events.read().count() > 0;
-    // shortcut: lights and emissives are chosen for the first PXTGI camera;
-    // per-view selection if split screen ever needs it.
-    let Some(eye) = cameras.iter().next().map(GlobalTransform::translation) else {
+    let mut material_changed: HashSet<AssetId<StandardMaterial>> = HashSet::new();
+    for event in events.0.read() {
+        if let AssetEvent::Modified { id } | AssetEvent::LoadedWithDependencies { id } | AssetEvent::Added { id } =
+            event
+        {
+            material_changed.insert(*id);
+        }
+    }
+    let mut textures_changed = false;
+    for event in events.1.read() {
+        if let AssetEvent::Modified { id } | AssetEvent::LoadedWithDependencies { id } | AssetEvent::Added { id } =
+            event
+        {
+            let known = state.texture_means.remove(id).is_some();
+            textures_changed |= known || state.missing_textures.remove(id);
+        }
+    }
+    // shortcut: lights, emissives and probes are chosen for the first PXTGI
+    // camera; per-view selection if split screen ever needs it.
+    let Some(eye) = cameras
+        .iter()
+        .find(|(camera, _, settings)| camera.is_active && settings.pxtgi_active())
+        .map(|(_, transform, _)| transform.translation())
+    else {
+        // Nothing is kept up to date while no camera runs PXTGI.
+        state.active = false;
         return;
     };
     let state = &mut *state;
-    let any_moved = !moved.is_empty();
-    let rebuild = removed
-        || material_changed
-        || !restyled.0.is_empty()
-        || !restyled.1.is_empty()
+    let woke = !state.active;
+    state.active = true;
+
+    // Bodies that came, went or were reshaped: found again at most every
+    // RESCAN_FRAMES frames.
+    state.pending_rescan |= removed || !changes.0.is_empty() || !changes.1.is_empty();
+    if state.pending_rescan {
+        state.frames_since_rescan += 1;
+    }
+    let tracked_moves: Vec<_> = moved.iter().filter(|(entity, _)| state.slots.contains_key(entity)).collect();
+    if !tracked_moves.is_empty() {
+        state.moves_since_build += 1;
+    }
+    let rebuild = woke
         || state.geometry.version == 0
-        || (any_moved && state.refits >= REFITS_PER_BUILD);
+        || (state.pending_rescan && state.frames_since_rescan >= RESCAN_FRAMES)
+        || state.moves_since_build > MOVES_PER_BUILD;
+    let mut reader = LookReader {
+        materials: &materials,
+        images: &images,
+        means: &mut state.texture_means,
+        missing: &mut state.missing_textures,
+    };
     if rebuild {
         // Shared shape data no live collider uses is dropped once it is most of the store.
         let live: HashSet<usize> = colliders.iter().filter_map(|c| shape_key(c.1)).collect();
@@ -551,14 +788,12 @@ fn update_scene(
             state.store = ShapeStore { version, ..default() };
         }
         let mut items = Vec::new();
-        for (entity, collider, transform, look, material, children) in &colliders {
-            let look = look.map(|look| (look.albedo, look.emission)).or_else(|| {
-                material
-                    .or_else(|| children?.iter().find_map(|child| child_materials.get(child).ok()))
-                    .and_then(|material| materials.get(&material.0))
-                    .map(|material| (material.base_color.to_linear(), material.emissive))
-            });
-            let (albedo, emission) = look.unwrap_or((LinearRgba::rgb(0.5, 0.5, 0.5), LinearRgba::BLACK));
+        let mut material_users: HashMap<AssetId<StandardMaterial>, Vec<Entity>> = HashMap::new();
+        for (entity, collider, transform, body, own, material, children) in &colliders {
+            let (look, used) = body_look(&mut reader, own, material, children, &child_looks);
+            for id in used {
+                material_users.entry(id).or_default().push(entity);
+            }
             let (shape, lower, upper) = state.store.shape(collider);
             let mut item = Item {
                 entity,
@@ -568,24 +803,25 @@ fn update_scene(
                 shape,
                 lower,
                 upper,
-                albedo,
-                emission,
+                look,
+                fixed: matches!(body, None | Some(RigidBody::Static)),
             };
             item.place(transform);
             items.push(item);
         }
         // Emissive meshes outside any collider body stand in as their box.
         for (entity, transform, aabb, material, child_of, visible) in &proxies {
-            let Some(material) = materials.get(&material.0) else {
+            let Some(look) = reader.material(material.id()) else {
                 continue;
             };
-            let emission = material.emissive;
+            let emission = look.emission;
             if !visible.get()
                 || emission.red + emission.green + emission.blue <= 0.0
                 || child_of.is_some_and(|c| has_collider.contains(c.parent()))
             {
                 continue;
             }
+            material_users.entry(material.id()).or_default().push(entity);
             let half = Vec3::from(aabb.half_extents).max(Vec3::splat(1e-3));
             let mut item = Item {
                 entity,
@@ -595,8 +831,8 @@ fn update_scene(
                 shape: [0.0, half.x, half.y, half.z],
                 lower: -half,
                 upper: half,
-                albedo: material.base_color.to_linear(),
-                emission,
+                look,
+                fixed: false,
             };
             item.place(transform);
             items.push(item);
@@ -605,7 +841,10 @@ fn update_scene(
         state.bounds = items.iter().map(Item::world_bounds).collect();
         state.slots = items.iter().enumerate().map(|(slot, item)| (item.entity, slot)).collect();
         state.items = items;
-        state.refits = 0;
+        state.material_users = material_users;
+        state.pending_rescan = false;
+        state.frames_since_rescan = 0;
+        state.moves_since_build = 0;
         let shapes_changed = state.store.version != state.geometry.shapes_version;
         state.geometry = Arc::new(Geometry {
             shapes: if shapes_changed {
@@ -616,14 +855,48 @@ fn update_scene(
             shapes_version: state.store.version,
             ..geometry
         });
-    } else if any_moved {
-        // Only poses changed: rewrite the moved records and refit the tree.
+    } else {
+        // Only poses or looks changed: rewrite those records, refitting the tree for poses.
+        // A changed body is restyled; a changed mesh under a body restyles the body.
+        let slots = &state.slots;
+        let tracked = |entity: Entity| slots.contains_key(&entity).then_some(entity);
+        let mut restyle: HashSet<Entity> = changes
+            .2
+            .iter()
+            .filter_map(|entity| tracked(entity).or_else(|| tracked(parents.get(entity).ok()?.parent())))
+            .collect();
+        if textures_changed {
+            restyle.extend(state.items.iter().map(|item| item.entity));
+        } else {
+            for id in &material_changed {
+                restyle.extend(state.material_users.get(id).into_iter().flatten().copied());
+            }
+        }
+        let mut geometry_changed = false;
         let geometry = Arc::make_mut(&mut state.geometry);
-        let mut refit = false;
-        for (entity, transform) in &moved {
-            let Some(&slot) = state.slots.get(&entity) else {
+        for entity in restyle {
+            let slot = state.slots[&entity];
+            let look = if let Ok((_, _, _, body, own, material, children)) = colliders.get(entity) {
+                state.items[slot].fixed = matches!(body, None | Some(RigidBody::Static));
+                body_look(&mut reader, own, material, children, &child_looks).0
+            } else if let Ok((_, _, _, material, _, _)) = proxies.get(entity) {
+                reader.material(material.id()).unwrap_or(GREY)
+            } else {
                 continue;
             };
+            let item = &mut state.items[slot];
+            // An emitter switched on or off changes the sampled emissives: found again.
+            if (luminance(look.emission) > 0.0) != (luminance(item.look.emission) > 0.0) {
+                state.pending_rescan = true;
+            }
+            item.look = look;
+            let at = slot * PRIMITIVE_VEC4S;
+            geometry.primitives[at + 4..at + 6].copy_from_slice(&item.look_rows());
+            geometry_changed = true;
+        }
+        let mut refit = false;
+        for (entity, transform) in &tracked_moves {
+            let slot = state.slots[entity];
             let item = &mut state.items[slot];
             item.place(transform);
             let at = slot * PRIMITIVE_VEC4S;
@@ -633,8 +906,9 @@ fn update_scene(
         }
         if refit {
             refit_nodes(&mut geometry.nodes, &state.bounds);
+        }
+        if refit || geometry_changed {
             geometry.version += 1;
-            state.refits += 1;
         }
     }
 
@@ -649,11 +923,13 @@ fn update_scene(
                 Vec3::from_slice(&light.color.to_linear().to_f32_array()[..3]) * light.illuminance,
             )
         });
-    // Of the lights, those whose reach comes nearest the camera.
+    // Of the lights, those whose reach comes nearest the camera (all those
+    // whose range holds it alike).
     let nearest = |mut lights: Vec<(f32, Light)>| {
         lights.sort_by(|a, b| a.0.total_cmp(&b.0));
         lights.into_iter().take(MAX_LIGHTS).map(|(_, light)| light).collect::<Vec<_>>()
     };
+    let gap = |transform: &GlobalTransform, range: f32| (transform.translation().distance(eye) - range).max(0.0);
     let light = |color: Color, lumens: f32, range: f32, transform: &GlobalTransform| Light {
         position: transform.translation(),
         inv_range2: 1.0 / (range * range).max(1e-8),
@@ -667,10 +943,7 @@ fn update_scene(
             .iter()
             .filter(|(light, _, visible)| visible.get() && light.intensity > 0.0)
             .map(|(point, transform, _)| {
-                (
-                    transform.translation().distance(eye) - point.range,
-                    light(point.color, point.intensity, point.range, transform),
-                )
+                (gap(transform, point.range), light(point.color, point.intensity, point.range, transform))
             })
             .collect(),
     );
@@ -686,7 +959,7 @@ fn update_scene(
                     cone_offset: -cos_outer * cone_scale,
                     ..light(spot.color, spot.intensity, spot.range, transform)
                 };
-                (transform.translation().distance(eye) - spot.range, light)
+                (gap(transform, spot.range), light)
             })
             .collect(),
     );
@@ -694,8 +967,56 @@ fn update_scene(
     emissives.sort_by(|a, b| a.center.distance_squared(eye).total_cmp(&b.center.distance_squared(eye)));
     emissives.truncate(MAX_EMISSIVES);
 
-    // What gives off light, not where: a change lets the cache follow quickly.
+    // Reflection probes, nearest the camera first.
+    let mut probes: Vec<(f32, Probe)> = probes
+        .iter()
+        .filter(|(_, environment, _, _, _, visible)| visible.get() && environment.intensity > 0.0)
+        .map(|(probe, environment, transform, parallax, overrides, _)| {
+            let affine = transform.affine();
+            let (scale, _, translation) = transform.to_scale_rotation_translation();
+            let size = scale.abs().max(Vec3::splat(1e-4));
+            let falloff = probe.falloff.clamp(Vec3::ZERO, Vec3::ONE);
+            // Godot's core: the box less the blend distance and a quarter metre.
+            let core = Vec3::splat(0.5) * (Vec3::ONE - falloff) - Vec3::splat(0.25) / size;
+            let overrides = overrides.copied().unwrap_or_default();
+            let flags = if core.min_element() > 0.0 {
+                u32::from(overrides.overrides_ambient) | (u32::from(overrides.overrides_reflections) << 1)
+            } else {
+                0
+            };
+            let parallax = match parallax.copied().unwrap_or_default() {
+                ParallaxCorrection::None => None,
+                ParallaxCorrection::Auto => Some(Vec3::splat(0.5)),
+                ParallaxCorrection::Custom(half) => Some(half),
+            };
+            let local_eye = affine.inverse().transform_point3(eye);
+            let outside = (local_eye.abs() - Vec3::splat(0.5)).max(Vec3::ZERO) * size;
+            (
+                outside.length(),
+                Probe {
+                    to_local: affine.inverse(),
+                    to_world_dir: Mat3::from(affine.matrix3),
+                    parallax,
+                    core: core.max(Vec3::ZERO),
+                    falloff,
+                    volume: size.x * size.y * size.z,
+                    capture: translation,
+                    specular: environment.specular_map.id(),
+                    intensity: environment.intensity,
+                    rotation: environment.rotation,
+                    overrides: flags,
+                },
+            )
+        })
+        .collect();
+    probes.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let probes: Vec<Probe> = probes.into_iter().take(MAX_PROBES).map(|(_, probe)| probe).collect();
+
+    // What gives off light, not where: a change lets the cache follow quickly,
+    // from the next frame on, for FRESH_FRAMES frames.
+    let sources_changed = state.fresh_frames > 0;
     let mut hasher = DefaultHasher::new();
+    (omnis.len(), spots.len(), emissives.len()).hash(&mut hasher);
     let mut hash_vec = |v: Vec3| v.to_array().map(f32::to_bits).hash(&mut hasher);
     if let Some((_, color)) = sun {
         hash_vec(color);
@@ -706,8 +1027,10 @@ fn update_scene(
     if hash != state.sources_hash {
         state.sources_hash = hash;
         state.fresh_frames = FRESH_FRAMES;
+        state.lighting_revision += 1;
+    } else {
+        state.fresh_frames = state.fresh_frames.saturating_sub(1);
     }
-    state.fresh_frames = state.fresh_frames.saturating_sub(1);
 
     scene.0 = Arc::new(SceneData {
         geometry: state.geometry.clone(),
@@ -715,7 +1038,9 @@ fn update_scene(
         omnis,
         spots,
         emissives,
-        sources_changed: state.fresh_frames > 0,
+        probes,
+        sources_changed,
+        lighting_revision: state.lighting_revision,
     });
 }
 
@@ -869,20 +1194,51 @@ fn refit_nodes(nodes: &mut [[f32; 4]], bounds: &[(Vec3, Vec3)]) {
 
 // ---------------------------------------------------------------- render world
 
-fn extract_environment(
+/// Each PXTGI camera's background (environment map, else skybox) and ambient
+/// light (its own `AmbientLight`, else the global one).
+fn extract_view_sources(
     mut commands: Commands,
-    cameras: Extract<Query<(RenderEntity, Option<&EnvironmentMapLight>), With<Pxtgi>>>,
+    cameras: Extract<
+        Query<(
+            RenderEntity,
+            &RadianceCascades,
+            Option<&EnvironmentMapLight>,
+            Option<&Skybox>,
+            Option<&AmbientLight>,
+        )>,
+    >,
+    global_ambient: Extract<Option<Res<GlobalAmbientLight>>>,
 ) {
-    for (entity, environment) in &cameras {
+    for (entity, settings, environment, skybox, ambient) in &cameras {
         let mut entity = commands.entity(entity);
-        match environment {
-            Some(environment) => entity.insert(PxtgiEnvironment {
-                specular: environment.specular_map.id(),
-                intensity: environment.intensity,
-                rotation: environment.rotation,
-            }),
-            None => entity.remove::<PxtgiEnvironment>(),
+        if settings.method != GiMethod::Pxtgi {
+            entity.remove::<PxtgiViewSources>();
+            continue;
+        }
+        let environment_source = environment.map(|environment| CubeSource {
+            specular: environment.specular_map.id(),
+            intensity: environment.intensity,
+            rotation: environment.rotation,
+        });
+        let skybox_source = skybox.and_then(|skybox| {
+            Some(CubeSource {
+                specular: skybox.image.as_ref()?.id(),
+                intensity: skybox.brightness,
+                // Bevy rotates the skybox by its rotation; sampled with the inverse.
+                rotation: skybox.rotation,
+            })
+        });
+        let (color, brightness) = match (ambient, global_ambient.as_deref()) {
+            (Some(ambient), _) => (ambient.color, ambient.brightness),
+            (None, Some(global)) => (global.color, global.brightness),
+            (None, None) => (Color::BLACK, 0.0),
         };
+        let linear = color.to_linear();
+        entity.insert(PxtgiViewSources {
+            background: environment_source.or(skybox_source),
+            environment_lights: environment_source.is_some(),
+            ambient: Vec3::new(linear.red, linear.green, linear.blue) * brightness,
+        });
     }
 }
 
@@ -898,8 +1254,11 @@ struct PxtgiPipelines {
     reflect: [CachedComputePipelineId; 4],
     composite: CachedRenderPipelineId,
     composite_debug: CachedRenderPipelineId,
+    // Writes the raw diffuse estimate for `RadianceCascadesRawOutput`.
+    raw: CachedComputePipelineId,
+    raw_layout: BindGroupLayoutDescriptor,
     sampler: Sampler,
-    // Bound in place of an environment map the camera doesn't have.
+    // Bound in place of an environment map or probe capture that is missing.
     no_environment: TextureView,
 }
 
@@ -939,6 +1298,8 @@ struct PxtgiView {
     reflect_depth: [Target; 2],
     reflect_filtered: [Target; 2],
     prev_color: Target,
+    // The raw diffuse estimate at a `RadianceCascadesRawOutput` image's size.
+    raw: Option<Target>,
     frame: Buffer,
     current: usize,
     history: bool,
@@ -953,6 +1314,8 @@ struct PxtgiBindGroups {
     // reflect_trace, reflect_temporal, two filter passes.
     reflect: [BindGroup; 4],
     composite: BindGroup,
+    // The raw output pass's inputs and target, and the image it is copied to.
+    raw: Option<(BindGroup, AssetId<Image>)>,
 }
 
 fn storage_buffer(device: &RenderDevice, label: &'static str, bytes: u64) -> Buffer {
@@ -992,6 +1355,14 @@ fn init_pipelines(
                 storage_buffer_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
                 texture_cube(TextureSampleType::Float { filterable: true }).visibility(both),
+                texture_cube(TextureSampleType::Float { filterable: true }).visibility(both),
+                texture_cube(TextureSampleType::Float { filterable: true }).visibility(both),
+                texture_cube(TextureSampleType::Float { filterable: true }).visibility(both),
+                texture_cube(TextureSampleType::Float { filterable: true }).visibility(both),
+                texture_cube(TextureSampleType::Float { filterable: true }).visibility(both),
+                texture_cube(TextureSampleType::Float { filterable: true }).visibility(both),
+                texture_cube(TextureSampleType::Float { filterable: true }).visibility(both),
+                texture_cube(TextureSampleType::Float { filterable: true }).visibility(both),
             ),
         ),
     );
@@ -1024,6 +1395,24 @@ fn init_pipelines(
             ),
         ),
     );
+    let raw_layout = BindGroupLayoutDescriptor::new(
+        "pxtgi_raw",
+        &BindGroupLayoutEntries::with_indices(
+            ShaderStages::COMPUTE,
+            (
+                (8, unfiltered()),
+                (9, unfiltered()),
+                (12, texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly)),
+            ),
+        ),
+    );
+    let raw = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("pxtgi_raw_output".into()),
+        layout: vec![scene_layout.clone(), raw_layout.clone()],
+        shader: shader.0.clone(),
+        entry_point: Some("raw_output".into()),
+        ..default()
+    });
     let compute = |entry: &'static str| {
         cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some(format!("pxtgi_{entry}").into()),
@@ -1088,6 +1477,8 @@ fn init_pipelines(
         reflect: ["reflect_trace", "reflect_temporal", "reflect_filter1", "reflect_filter2"].map(compute),
         composite: composite(Some(additive)),
         composite_debug: composite(None),
+        raw,
+        raw_layout,
         sampler: device.create_sampler(&SamplerDescriptor {
             label: Some("pxtgi_linear"),
             mag_filter: FilterMode::Linear,
@@ -1201,6 +1592,7 @@ impl PxtgiView {
                 usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
+            raw: None,
             current: 0,
             history: false,
             prev_clip_from_world: clip_from_world,
@@ -1209,20 +1601,41 @@ impl PxtgiView {
 }
 
 // Matrices (12), scalars (9), reflections and environment (6), point and spot
-// lights (40), emissives (80).
-const FRAME_VEC4S: usize = 12 + 9 + 6 + MAX_LIGHTS * 5 + MAX_EMISSIVES * 5;
+// lights (40), emissives (80), ambient and probe count (2), probes (13 each).
+const FRAME_VEC4S: usize = 12 + 9 + 6 + MAX_LIGHTS * 5 + MAX_EMISSIVES * 5 + 2 + MAX_PROBES * 13;
 
-/// The camera's environment map as the shader takes it: strength (exposed),
-/// roughest mip, and the world-to-map rotation.
+/// The camera's background cube as the shader takes it: strength (exposed),
+/// roughest mip, the map's rotation, and whether it is an environment map
+/// lighting the scene (a skybox only shows).
 struct Environment {
     strength: f32,
     roughest_mip: f32,
     rotation: Quat,
+    lights: bool,
+}
+
+/// The shader's number for a debug view (1 to 5 as Godot's).
+fn debug_index(debug: PxtgiDebug) -> f32 {
+    match debug {
+        PxtgiDebug::Off => 0.0,
+        PxtgiDebug::LastFrame => 1.0,
+        PxtgiDebug::RoundTrip => 2.0,
+        PxtgiDebug::WorldOnly => 3.0,
+        PxtgiDebug::WorldHits => 4.0,
+        PxtgiDebug::WorldPosition => 5.0,
+        PxtgiDebug::BounceLight => 6.0,
+        PxtgiDebug::Reflections => 7.0,
+    }
+}
+
+/// Debug views that replace the image rather than adding to it.
+fn debug_replaces_image(debug: PxtgiDebug) -> bool {
+    !matches!(debug, PxtgiDebug::Off | PxtgiDebug::WorldOnly)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn frame_uniform(
-    settings: &Pxtgi,
+    settings: &RadianceCascades,
     scene: &SceneData,
     gpu: &PxtgiGpu,
     clip_from_world: Mat4,
@@ -1231,8 +1644,12 @@ fn frame_uniform(
     view: &PxtgiView,
     exposure: f32,
     environment: Option<&Environment>,
+    ambient: Vec3,
+    // The probes whose captures are bound, and each capture's roughest mip.
+    probes: &[(&Probe, f32)],
     frame: u32,
 ) -> Vec<[f32; 4]> {
+    let px: &PxtgiSettings = &settings.pxtgi;
     let bits = |v: [u32; 4]| v.map(f32::from_bits);
     let flag = |on: bool| f32::from(u8::from(on));
     // Light as the GI holds it: irradiance / pi, exposed like the lit image.
@@ -1243,38 +1660,32 @@ fn frame_uniform(
     }
     u.push(eye.extend(near).to_array());
     u.push(bits([view.size.x, view.size.y, view.trace_size.x, view.trace_size.y]));
-    u.push([
-        (frame % 4096) as f32,
-        settings.max_distance.max(0.1),
-        settings.intensity.max(0.0),
-        settings.debug as f32,
-    ]);
+    u.push([(frame % 4096) as f32, px.max_distance, settings.intensity, debug_index(px.debug)]);
     let (sun_direction, sun_color) = scene.sun.unwrap_or_default();
     u.push(sun_direction.extend(flag(scene.sun.is_some())).to_array());
     u.push((sun_color * lit).extend(exposure).to_array());
-    let sky = settings.sky;
-    u.push((Vec3::new(sky.red, sky.green, sky.blue) * exposure).extend(settings.world_ray_distance.max(0.1)).to_array());
+    let sky = settings.environment;
+    u.push((Vec3::new(sky.red, sky.green, sky.blue) * exposure).extend(px.world_ray_distance).to_array());
     u.push(bits([gpu.primitive_count, gpu.node_count, scene.omnis.len() as u32, scene.spots.len() as u32]));
-    u.push(bits([
-        frame,
-        CACHE_SLOTS - 1,
-        u32::from(settings.multi_bounce),
-        settings.rays_per_texel.clamp(1, 4),
-    ]));
+    u.push(bits([frame, CACHE_SLOTS - 1, u32::from(px.multi_bounce), px.rays_per_texel]));
     u.push([scene.emissives.len() as f32, flag(scene.sources_changed), flag(view.history), 0.0]);
-    let mode = match settings.reflections {
+    let mode = match px.reflections {
         PxtgiReflections::Off => 0.0,
         PxtgiReflections::ScreenSpace => 1.0,
         PxtgiReflections::Traced => 2.0,
+        PxtgiReflections::TracedAndProbes => 3.0,
     };
-    u.push([mode, settings.reflection_roughness_cutoff.clamp(0.0, 1.0), 0.0, 0.0]);
+    u.push([mode, px.reflection_roughness_cutoff, 0.0, 0.0]);
     u.push(bits([view.reflect_size.x, view.reflect_size.y, 0, 0]));
-    let (strength, roughest_mip, rotation) =
-        environment.map_or((0.0, 0.0, Quat::IDENTITY), |e| (e.strength, e.roughest_mip, e.rotation));
-    u.push([strength, roughest_mip, flag(environment.is_some()), 0.0]);
-    // Bevy samples its environment map with the inverse of the light's rotation.
-    let rows = Mat3::from_quat(rotation.inverse()).transpose();
-    u.extend((0..3).map(|r| rows.col(r).extend(0.0).to_array()));
+    let (strength, roughest_mip, rotation, lights) = environment
+        .map_or((0.0, 0.0, Quat::IDENTITY, false), |e| (e.strength, e.roughest_mip, e.rotation, e.lights));
+    u.push([strength, roughest_mip, flag(environment.is_some()), flag(lights)]);
+    // Bevy samples its cube maps with the inverse of their rotation.
+    let rotation_rows = |rotation: Quat| {
+        let rows = Mat3::from_quat(rotation.inverse()).transpose();
+        [0, 1, 2].map(|r| rows.col(r).extend(0.0).to_array())
+    };
+    u.extend(rotation_rows(rotation));
     let pad = |u: &mut Vec<[f32; 4]>, values: &mut dyn Iterator<Item = [f32; 4]>, len: usize| {
         let start = u.len();
         u.extend(values.take(len));
@@ -1292,9 +1703,71 @@ fn frame_uniform(
     for axis in 0..3 {
         pad(&mut u, &mut emissives.iter().map(|e| e.axes[axis].extend(0.0).to_array()), MAX_EMISSIVES);
     }
-    pad(&mut u, &mut emissives.iter().map(|e| (e.color * exposure).extend(0.0).to_array()), MAX_EMISSIVES);
+    // Bevy weights each emission by the exposure by its exposure weight.
+    pad(
+        &mut u,
+        &mut emissives
+            .iter()
+            .map(|e| (e.color * (1.0 + (exposure - 1.0) * e.exposure_weight)).extend(0.0).to_array()),
+        MAX_EMISSIVES,
+    );
+    u.push((ambient * exposure).extend(0.0).to_array());
+    let sources = px.reflections == PxtgiReflections::TracedAndProbes && !probes.is_empty();
+    u.push(bits([probes.len() as u32, u32::from(sources), 0, 0]));
+    let affine_rows = |a: &Affine3A| {
+        let rows = Mat3::from(a.matrix3).transpose();
+        [0, 1, 2].map(|r| rows.col(r).extend(a.translation[r]).to_array())
+    };
+    let mat_rows = |m: &Mat3| {
+        let rows = m.transpose();
+        [0, 1, 2].map(|r| rows.col(r).extend(0.0).to_array())
+    };
+    for row in 0..3 {
+        pad(&mut u, &mut probes.iter().map(|(p, _)| affine_rows(&p.to_local)[row]), MAX_PROBES);
+    }
+    for row in 0..3 {
+        pad(&mut u, &mut probes.iter().map(|(p, _)| mat_rows(&p.to_world_dir)[row]), MAX_PROBES);
+    }
+    pad(
+        &mut u,
+        &mut probes.iter().map(|(p, _)| {
+            let flags = p.overrides | if p.parallax.is_some() { 4 } else { 0 };
+            p.parallax.unwrap_or_default().extend(flags as f32).to_array()
+        }),
+        MAX_PROBES,
+    );
+    pad(&mut u, &mut probes.iter().map(|(p, _)| p.core.extend(p.volume).to_array()), MAX_PROBES);
+    pad(&mut u, &mut probes.iter().map(|(p, _)| p.falloff.extend(0.0).to_array()), MAX_PROBES);
+    pad(
+        &mut u,
+        &mut probes.iter().map(|(p, _)| p.capture.extend(p.intensity * exposure).to_array()),
+        MAX_PROBES,
+    );
+    for row in 0..3 {
+        pad(
+            &mut u,
+            &mut probes.iter().map(|(p, mip)| {
+                let mut r = rotation_rows(p.rotation)[row];
+                if row == 0 {
+                    r[3] = *mip;
+                }
+                r
+            }),
+            MAX_PROBES,
+        );
+    }
     debug_assert_eq!(u.len(), FRAME_VEC4S);
     u
+}
+
+/// A loaded cube map, and its roughest mip.
+fn cube_image(images: &RenderAssets<GpuImage>, id: AssetId<Image>) -> Option<(&GpuImage, f32)> {
+    let image = images.get(id)?;
+    let cube = image
+        .texture_view_descriptor
+        .as_ref()
+        .is_some_and(|d| d.dimension == Some(TextureViewDimension::Cube));
+    cube.then(|| (image, image.texture_descriptor.mip_level_count.saturating_sub(1) as f32))
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -1314,8 +1787,9 @@ fn prepare_views(
         &ExtractedCamera,
         &ViewTarget,
         &ViewPrepassTextures,
-        &Pxtgi,
-        Option<&PxtgiEnvironment>,
+        &RadianceCascades,
+        Option<&PxtgiViewSources>,
+        Option<&RadianceCascadesRawOutput>,
         Option<&mut PxtgiView>,
     )>,
 ) {
@@ -1323,7 +1797,20 @@ fn prepare_views(
         return;
     };
     *frame = frame.wrapping_add(1);
-    for (entity, view, camera, target, prepass, settings, environment, existing) in &mut views {
+    // The probes whose captures have loaded, bound in this order.
+    let probes: Vec<(&Probe, &GpuImage, f32)> = scene
+        .0
+        .probes
+        .iter()
+        .filter_map(|probe| cube_image(&images, probe.specular).map(|(image, mip)| (probe, image, mip)))
+        .collect();
+    for (entity, view, camera, target, prepass, settings, sources, raw_output, existing) in &mut views {
+        let settings = settings.sanitized();
+        if !settings.pxtgi_active() {
+            // The view runs another method, or none: its targets go too.
+            commands.entity(entity).remove::<(PxtgiBindGroups, PxtgiView)>();
+            continue;
+        }
         let (Some(size), Some(depth), Some(gbuffer)) =
             (camera.physical_viewport_size, prepass.depth_only_view(), prepass.deferred_view())
         else {
@@ -1334,7 +1821,6 @@ fn prepare_views(
         // shortcut: the history copy assumes the viewport covers the whole
         // target; offset viewports (split screen) would copy the wrong region.
         if view.clip_from_view.w_axis.w == 1.0
-            || settings.intensity <= 0.0
             || target.main_texture_format() != TextureFormat::Rgba16Float
             || UVec2::new(main_size.width, main_size.height) != size
         {
@@ -1342,22 +1828,19 @@ fn prepare_views(
             commands.entity(entity).remove::<PxtgiBindGroups>();
             continue;
         }
-        // A loaded cube map only; until then (or for a 2D one) the sky colour.
-        let environment = environment.and_then(|environment| {
-            let image = images.get(environment.specular)?;
-            let cube = image
-                .texture_view_descriptor
-                .as_ref()
-                .is_some_and(|d| d.dimension == Some(TextureViewDimension::Cube));
-            cube.then(|| {
-                let settings = Environment {
-                    strength: environment.intensity * camera.exposure,
-                    roughest_mip: image.texture_descriptor.mip_level_count.saturating_sub(1) as f32,
-                    rotation: environment.rotation,
-                };
-                (settings, &image.texture_view)
-            })
+        // A loaded cube map only; until then the sky colour.
+        let environment = sources.and_then(|sources| {
+            let background = sources.background?;
+            let (image, roughest_mip) = cube_image(&images, background.specular)?;
+            let settings = Environment {
+                strength: background.intensity * camera.exposure,
+                roughest_mip,
+                rotation: background.rotation,
+                lights: sources.environment_lights,
+            };
+            Some((settings, &image.texture_view))
         });
+        let ambient = sources.map_or(Vec3::ZERO, |sources| sources.ambient);
         let clip_from_world = view
             .clip_from_world
             .unwrap_or_else(|| view.clip_from_view * view.world_from_view.to_matrix().inverse());
@@ -1369,8 +1852,9 @@ fn prepare_views(
         let prev = state.current;
         state.current = 1 - prev;
         let cur = state.current;
+        let probe_settings: Vec<(&Probe, f32)> = probes.iter().map(|(probe, _, mip)| (*probe, *mip)).collect();
         let uniform = frame_uniform(
-            settings,
+            &settings,
             &scene.0,
             &gpu,
             clip_from_world,
@@ -1380,12 +1864,16 @@ fn prepare_views(
             state,
             camera.exposure,
             environment.as_ref().map(|(settings, _)| settings),
+            ambient,
+            &probe_settings,
             *frame,
         );
         queue.write_buffer(&state.frame, 0, &bytes(&uniform));
         state.prev_clip_from_world = clip_from_world;
         state.history = true;
 
+        let probe_map =
+            |i: usize| probes.get(i).map_or(&pipelines.no_environment, |(_, image, _)| &image.texture_view);
         let scene_group = device.create_bind_group(
             "pxtgi_scene",
             &cache.get_bind_group_layout(&pipelines.scene_layout),
@@ -1401,6 +1889,14 @@ fn prepare_views(
                 gpu.cells.as_entire_binding(),
                 gpu.shapes.as_entire_binding(),
                 environment.map_or(&pipelines.no_environment, |(_, view)| view),
+                probe_map(0),
+                probe_map(1),
+                probe_map(2),
+                probe_map(3),
+                probe_map(4),
+                probe_map(5),
+                probe_map(6),
+                probe_map(7),
             )),
         );
         let io_layout = cache.get_bind_group_layout(&pipelines.io_layout);
@@ -1462,6 +1958,43 @@ fn prepare_views(
                 [&s.reflect_filtered[1], spare[0], spare[1], spare[2]],
             ),
         ];
+        // The raw output, into a target the size of the application's image.
+        let raw_image = raw_output.and_then(|output| {
+            let image = images.get(&output.0)?;
+            let usable = image.texture_descriptor.format == TextureFormat::Rgba32Float
+                && image.texture_descriptor.usage.contains(TextureUsages::COPY_DST);
+            if !usable {
+                warn_once!("PXTGI raw output needs an Rgba32Float image with COPY_DST usage");
+            }
+            usable.then(|| (output.0.id(), image.texture_descriptor.size))
+        });
+        match raw_image {
+            Some((_, size)) if s.raw.as_ref().is_none_or(|raw| raw.texture.size() != size) => {
+                let target = self::target(
+                    &device,
+                    "pxtgi_raw_output",
+                    UVec2::new(size.width, size.height),
+                    TextureFormat::Rgba32Float,
+                    TextureUsages::STORAGE_BINDING | TextureUsages::COPY_SRC,
+                );
+                state.raw = Some(target);
+            }
+            None => state.raw = None,
+            _ => {}
+        }
+        let s = &*state;
+        let raw = raw_image.zip(s.raw.as_ref()).map(|((id, _), raw)| {
+            let group = device.create_bind_group(
+                "pxtgi_raw",
+                &cache.get_bind_group_layout(&pipelines.raw_layout),
+                &BindGroupEntries::with_indices((
+                    (8, &s.filtered[0].view),
+                    (9, &s.accum_depth[cur].view),
+                    (12, &raw.view),
+                )),
+            );
+            (group, id)
+        });
         let composite = device.create_bind_group(
             "pxtgi_composite",
             &cache.get_bind_group_layout(&pipelines.composite_layout),
@@ -1478,6 +2011,7 @@ fn prepare_views(
             diffuse,
             reflect,
             composite,
+            raw,
         });
         if let Some(state) = fresh {
             entity_commands.insert(state);
@@ -1486,17 +2020,26 @@ fn prepare_views(
 }
 
 fn render(
-    view: ViewQuery<(&ViewTarget, &Pxtgi, &PxtgiView, &PxtgiBindGroups)>,
+    view: ViewQuery<(&ViewTarget, &RadianceCascades, &PxtgiView, &PxtgiBindGroups)>,
     pipelines: Res<PxtgiPipelines>,
     gpu: Res<PxtgiGpu>,
     cache: Res<PipelineCache>,
+    status: Option<Res<RadianceCascadesStatus>>,
+    scene: Res<PxtgiScene>,
+    images: Res<RenderAssets<GpuImage>>,
+    mut frame_id: Local<u64>,
     mut context: RenderContext,
 ) {
     let (target, settings, state, groups) = view.into_inner();
+    let settings = settings.sanitized();
+    if !settings.pxtgi_active() {
+        return;
+    }
+    let px = settings.pxtgi;
     let compute = |id| cache.get_compute_pipeline(id);
     let diffuse: Option<Vec<_>> = pipelines.diffuse.iter().map(|&id| compute(id)).collect();
     let reflect: Option<Vec<_>> = pipelines.reflect.iter().map(|&id| compute(id)).collect();
-    let composite = cache.get_render_pipeline(if matches!(settings.debug, 1 | 2 | 4 | 5) {
+    let composite = cache.get_render_pipeline(if debug_replaces_image(px.debug) {
         pipelines.composite_debug
     } else {
         pipelines.composite
@@ -1506,37 +2049,51 @@ fn render(
     else {
         return;
     };
+    let diagnostics = context.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+    let total = diagnostics.time_span(context.command_encoder(), "pxtgi");
     let groups_for = |size: UVec2| (size.x.div_ceil(8), size.y.div_ceil(8));
-    let encoder = context.command_encoder();
-    {
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("pxtgi"),
+    // One compute pass per stage, so each gets its own GPU timing.
+    let dispatch = |context: &mut RenderContext,
+                    name: &'static str,
+                    pipeline: &ComputePipeline,
+                    group: &BindGroup,
+                    (x, y): (u32, u32)| {
+        let span = diagnostics.time_span(context.command_encoder(), name);
+        let mut pass = context.command_encoder().begin_compute_pass(&ComputePassDescriptor {
+            label: Some(name),
             timestamp_writes: None,
         });
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &groups.scene, &[]);
-        if settings.multi_bounce && gpu.primitive_count > 0 {
-            pass.set_pipeline(cache_update);
-            // Any io group: the cache pass reads none of it.
-            pass.set_bind_group(1, &groups.diffuse[0], &[]);
-            pass.dispatch_workgroups(CACHE_ROW / 8, CACHE_SLOTS / CACHE_ROW / 4 / 8, 1);
-        }
-        let (x, y) = groups_for(state.trace_size);
-        for (pipeline, group) in diffuse.into_iter().zip(&groups.diffuse) {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(1, group, &[]);
-            pass.dispatch_workgroups(x, y, 1);
-        }
-        if settings.reflections != PxtgiReflections::Off {
-            let (x, y) = groups_for(state.reflect_size);
-            for (pipeline, group) in reflect.into_iter().zip(&groups.reflect) {
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(1, group, &[]);
-                pass.dispatch_workgroups(x, y, 1);
-            }
+        pass.set_bind_group(1, group, &[]);
+        pass.dispatch_workgroups(x, y, 1);
+        drop(pass);
+        span.end(context.command_encoder());
+    };
+    if px.multi_bounce && gpu.primitive_count > 0 {
+        // Any io group: the cache pass reads none of it.
+        dispatch(
+            &mut context,
+            "cache",
+            cache_update,
+            &groups.diffuse[0],
+            (CACHE_ROW / 8, CACHE_SLOTS / CACHE_ROW / 4 / 8),
+        );
+    }
+    let names = ["trace", "temporal", "atrous1", "atrous2", "atrous4"];
+    for ((pipeline, group), name) in diffuse.into_iter().zip(&groups.diffuse).zip(names) {
+        dispatch(&mut context, name, pipeline, group, groups_for(state.trace_size));
+    }
+    if px.reflections != PxtgiReflections::Off {
+        let names = ["reflect_trace", "reflect_temporal", "reflect_filter1", "reflect_filter2"];
+        for ((pipeline, group), name) in reflect.into_iter().zip(&groups.reflect).zip(names) {
+            dispatch(&mut context, name, pipeline, group, groups_for(state.reflect_size));
         }
     }
     {
-        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+        let span = diagnostics.time_span(context.command_encoder(), "composite");
+        let mut pass = context.command_encoder().begin_render_pass(&RenderPassDescriptor {
             label: Some("pxtgi_composite"),
             color_attachments: &[Some(RenderPassColorAttachment {
                 view: target.main_texture_view(),
@@ -1553,9 +2110,11 @@ fn render(
         pass.set_bind_group(0, &groups.scene, &[]);
         pass.set_bind_group(1, &groups.composite, &[]);
         pass.draw(0..3, 0..1);
+        drop(pass);
+        span.end(context.command_encoder());
     }
     // Next frame's screen rays read this frame's lit image.
-    encoder.copy_texture_to_texture(
+    context.command_encoder().copy_texture_to_texture(
         target.main_texture().as_image_copy(),
         state.prev_color.texture.as_image_copy(),
         Extent3d {
@@ -1564,6 +2123,42 @@ fn render(
             depth_or_array_layers: 1,
         },
     );
+    // The raw diffuse estimate, copied into the application's image.
+    let raw_copied = match (&groups.raw, &state.raw, compute(pipelines.raw)) {
+        (Some((group, image)), Some(raw), Some(pipeline)) => match images.get(*image) {
+            Some(destination) => {
+                let size = raw.texture.size();
+                dispatch(&mut context, "raw_output", pipeline, group, (size.width.div_ceil(8), size.height.div_ceil(8)));
+                context.command_encoder().copy_texture_to_texture(
+                    raw.texture.as_image_copy(),
+                    destination.texture.as_image_copy(),
+                    size,
+                );
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    };
+    total.end(context.command_encoder());
+    *frame_id += 1;
+    if let Some(status) = status {
+        status.set_active_method(GiMethod::Pxtgi);
+        status.set_hardware_ray_queries_active(false);
+        let version = scene.0.geometry.version;
+        let dispatch = status.record_dispatch(crate::RadianceCascadesRevisions {
+            scene: version,
+            geometry: version,
+            lighting: scene.0.lighting_revision,
+        });
+        if groups.raw.is_some() {
+            status.record_raw_frame(raw_copied.then(|| crate::RadianceCascadesRawFrame {
+                frame_id: *frame_id,
+                dispatch,
+                submitted_at: std::time::Instant::now(),
+            }));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1580,8 +2175,8 @@ mod tests {
             shape,
             lower,
             upper,
-            albedo: LinearRgba::WHITE,
-            emission: LinearRgba::BLACK,
+            look: GREY,
+            fixed: true,
         };
         item.place(&GlobalTransform::from(Transform::from_translation(at)));
         item
@@ -1643,6 +2238,82 @@ mod tests {
         for entry in ENTRY_POINTS {
             assert!(module.entry_points.iter().any(|point| point.name == entry), "{entry}");
         }
+        // The frame uniform the CPU writes must be exactly the shader's `Frame`.
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        let frame = module
+            .global_variables
+            .iter()
+            .find(|(_, global)| global.space == naga::AddressSpace::Uniform)
+            .expect("the frame uniform");
+        assert_eq!(layouter[frame.1.ty].size as usize, FRAME_VEC4S * 16);
+    }
+
+    #[test]
+    fn body_look_prefers_its_override_then_its_material_then_its_children() {
+        use bevy::ecs::system::SystemState;
+        let mut materials = Assets::<StandardMaterial>::default();
+        let mut images = Assets::<Image>::default();
+        // A 2x2 texture whose mean is a mid red: it scales the base colour.
+        let texture = images.add(Image::new_fill(
+            Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
+            TextureDimension::D2,
+            &[255, 0, 0, 255],
+            TextureFormat::Rgba8Unorm,
+            bevy::asset::RenderAssetUsages::default(),
+        ));
+        let textured = materials.add(StandardMaterial {
+            base_color: Color::linear_rgb(0.5, 0.5, 0.5),
+            base_color_texture: Some(texture),
+            ..default()
+        });
+        let dim = materials.add(StandardMaterial {
+            base_color: Color::linear_rgb(0.2, 0.3, 0.4),
+            emissive: LinearRgba::rgb(1.0, 0.0, 0.0),
+            ..default()
+        });
+        let bright = materials.add(StandardMaterial {
+            base_color: Color::linear_rgb(0.9, 0.9, 0.9),
+            emissive: LinearRgba::rgb(0.0, 8.0, 0.0),
+            emissive_exposure_weight: 0.5,
+            ..default()
+        });
+        let mut world = World::new();
+        let first = world.spawn(MeshMaterial3d(dim.clone())).id();
+        let second = world.spawn(MeshMaterial3d(bright)).id();
+        let parent = world.spawn_empty().add_children(&[first, second]).id();
+        let mut state: SystemState<(
+            Query<&Children>,
+            Query<(Option<&PxtgiLook>, Option<&MeshMaterial3d<StandardMaterial>>), Without<Collider>>,
+        )> = SystemState::new(&mut world);
+        let (children, child_looks) = state.get(&world).unwrap();
+        let (mut means, mut missing) = (HashMap::new(), HashSet::new());
+        let mut reader = LookReader {
+            materials: &materials,
+            images: &images,
+            means: &mut means,
+            missing: &mut missing,
+        };
+        // Children: the first one's albedo, the brightest one's emission.
+        let (look, used) = body_look(&mut reader, None, None, children.get(parent).ok(), &child_looks);
+        assert_eq!(look.albedo, LinearRgba::rgb(0.2, 0.3, 0.4));
+        assert_eq!(look.emission, LinearRgba::rgb(0.0, 8.0, 0.0));
+        assert_eq!(look.exposure_weight, 0.5);
+        assert_eq!(used.len(), 2);
+        // Its own material wins over its children, its texture's mean included.
+        let own = MeshMaterial3d(textured);
+        let (look, _) = body_look(&mut reader, None, Some(&own), children.get(parent).ok(), &child_looks);
+        assert!((look.albedo.red - 0.5).abs() < 1e-4 && look.albedo.green.abs() < 1e-4);
+        // Its own PxtgiLook wins over everything.
+        let override_look = PxtgiLook {
+            albedo: LinearRgba::rgb(0.1, 0.1, 0.1),
+            emission: LinearRgba::BLACK,
+        };
+        let (look, used) = body_look(&mut reader, Some(&override_look), Some(&own), None, &child_looks);
+        assert_eq!(look.albedo, override_look.albedo);
+        assert!(used.is_empty());
+        // Nothing readable: neutral grey.
+        assert_eq!(body_look(&mut reader, None, None, None, &child_looks).0, GREY);
     }
 
     #[test]

@@ -68,7 +68,7 @@ const COLD_RANK_PHASES: [usize; 3] = [1, 2, 3];
 pub(crate) const PROBE_SIZE: u64 = 1792;
 const PACK_PROBE_GROUPS_PER_ROW: u64 = 256;
 const CACHE_COMMIT: usize = 14;
-const COMPUTE_ENTRIES: [&str; 30] = [
+const COMPUTE_ENTRIES: [&str; 37] = [
     "clear",
     "seed",
     "parents",
@@ -99,6 +99,13 @@ const COMPUTE_ENTRIES: [&str; 30] = [
     "rtgiCacheVisibility",
     "rtgiCacheShade",
     "rtgiCacheBounce",
+    "rtgiVolumeTrace",
+    "rtgiVolumeUpdate",
+    "rtgiDenoiseX",
+    "rtgiDenoiseY",
+    "rtgiTemporal",
+    "rtgiCacheSnapshot",
+    "rtgiCacheInvalidate",
 ];
 const SLANG_OPTIMIZATION_LEVEL: u8 = 2;
 const HISTORY_DIAGNOSTIC_WORDS: u64 = 26;
@@ -216,6 +223,8 @@ fn history_settings_changed(previous: RadianceCascades, next: RadianceCascades) 
     comparable.environment = next.environment;
     comparable.hardware_ray_queries = next.hardware_ray_queries;
     comparable.ray_traced_sun_shadows = next.ray_traced_sun_shadows;
+    // PXTGI's controls do not touch this renderer's history.
+    comparable.pxtgi = next.pxtgi;
     comparable != next
 }
 
@@ -227,6 +236,7 @@ fn world_cache_settings_changed(mut previous: RadianceCascades, next: RadianceCa
     previous.sampling.resolve_scale = next.sampling.resolve_scale;
     previous.hardware_ray_queries = next.hardware_ray_queries;
     previous.ray_traced_sun_shadows = next.ray_traced_sun_shadows;
+    previous.pxtgi = next.pxtgi;
     previous != next
 }
 
@@ -352,6 +362,10 @@ fn view_fits_device(
         && cache_history_bytes(buckets) <= binding_limit
         && cache_head_bytes(buckets, pixels) <= binding_limit
         && irradiance_probe_bytes(pixels, settings.multi_bounce) <= binding_limit
+        && rtgi_reservoir_bytes(shading_size, settings) <= binding_limit
+        && rtgi_cache_bytes(shading_size, settings)
+            .into_iter()
+            .all(|bytes| bytes <= binding_limit)
 }
 
 fn view_device_max_rays(viewport: UVec2, settings: RadianceCascades, limits: &WgpuLimits) -> u32 {
@@ -444,8 +458,8 @@ const HARDWARE_TRACE_VISIBILITY: usize = 22;
 const SUN_SHADOWS_HARDWARE: usize = 23;
 /// Directional lights a sun shadow mask covers; mirrors common.slang.
 const SUN_SHADOW_LIGHTS: usize = 1;
-/// Ray-traced GI (`GiMethod::RayTraced`): path sampling with temporal reuse,
-/// then spatial reuse and resolve.
+/// Ray-traced GI (`GiMethod::RayTraced`), after idTech 8 and AMD GI-1.2: the
+/// final gather with temporal reuse, then spatial reuse and the SH resolve.
 const RTGI_SAMPLE: usize = 24;
 const RTGI_RESOLVE: usize = 25;
 /// World radiance cache shading: record shadow rays, trace them in hardware,
@@ -453,22 +467,40 @@ const RTGI_RESOLVE: usize = 25;
 const RTGI_CACHE_RECORD: usize = 26;
 const RTGI_CACHE_VISIBILITY: usize = 27;
 const RTGI_CACHE_SHADE: usize = 28;
-/// Multi-bounce: one gather ray per shaded cell, read by its next shading.
+/// Multi-bounce: one bounce ray per shaded cell into its indirect estimator.
 const RTGI_CACHE_BOUNCE: usize = 29;
+/// Irradiance volumes: probe rays into the world cache, then their update.
+const RTGI_VOLUME_TRACE: usize = 30;
+const RTGI_VOLUME_UPDATE: usize = 31;
+/// Separable bilateral denoise of the gather SH, then its temporal filter.
+const RTGI_DENOISE_X: usize = 32;
+const RTGI_DENOISE_Y: usize = 33;
+const RTGI_TEMPORAL: usize = 34;
+const RTGI_CACHE_SNAPSHOT: usize = 35;
+const RTGI_CACHE_INVALIDATE: usize = 36;
 /// Bytes of one `RtgiReservoir` in cascades.slang.
 const RTGI_RESERVOIR_BYTES: u64 = 64;
 // Mirror RTGI_CACHE_* in cascades.slang.
 const RTGI_CACHE_CAPACITY: u64 = 1 << 18;
-const RTGI_CACHE_CELL_BYTES: u64 = 80;
-const RTGI_CACHE_QUEUE: u64 = 8192;
-const RTGI_CACHE_REFRESH: u64 = 8192;
+const RTGI_CACHE_CELL_BYTES: u64 = 128;
+const RTGI_CACHE_WORK: u64 = 16384;
+const RTGI_CACHE_QUEUE: u64 = RTGI_CACHE_WORK - RTGI_CACHE_WORK / 4;
+// Mirror RTGI_VOLUME_* and the field layout in rtgi_field.slang.
+const RTGI_VOLUME_PROBES: u64 = 16 * 16 * 16;
+const RTGI_VOLUME_CASCADES: u64 = 4;
+const RTGI_VOLUME_RAYS: u64 = 32;
+const RTGI_VOLUME_BATCH: u64 = RTGI_VOLUME_PROBES / 2;
+const RTGI_PROBE_WORDS: u64 = 7 + 8 * 8 / 2;
+/// Gather images (two) and temporal histories (two), in float4 words per texel.
+const RTGI_PIXEL_WORDS: u64 = 2 * 6 + 2 * 6;
 const HARDWARE_TRAVERSAL_PIPELINES: u64 = (1 << HARDWARE_TRACE_DEFERRED)
     | (1 << HARDWARE_TRACE_VISIBILITY)
     | (1 << SUN_SHADOWS_HARDWARE)
     | (1 << RTGI_SAMPLE)
     | (1 << RTGI_RESOLVE)
     | (1 << RTGI_CACHE_VISIBILITY)
-    | (1 << RTGI_CACHE_BOUNCE);
+    | (1 << RTGI_CACHE_BOUNCE)
+    | (1 << RTGI_VOLUME_TRACE);
 const RAY_QUERY_DEFINE: &str = "PENUMBRA_HARDWARE_RAY_QUERY";
 
 fn hardware_traversal_entry(entry: &str) -> bool {
@@ -481,6 +513,7 @@ fn hardware_traversal_entry(entry: &str) -> bool {
             | "rtgiResolve"
             | "rtgiCacheVisibility"
             | "rtgiCacheBounce"
+            | "rtgiVolumeTrace"
     )
 }
 
@@ -490,7 +523,14 @@ const RTGI_PIPELINES: u64 = (1 << RTGI_SAMPLE)
     | (1 << RTGI_CACHE_RECORD)
     | (1 << RTGI_CACHE_VISIBILITY)
     | (1 << RTGI_CACHE_SHADE)
-    | (1 << RTGI_CACHE_BOUNCE);
+    | (1 << RTGI_CACHE_BOUNCE)
+    | (1 << RTGI_VOLUME_TRACE)
+    | (1 << RTGI_VOLUME_UPDATE)
+    | (1 << RTGI_DENOISE_X)
+    | (1 << RTGI_DENOISE_Y)
+    | (1 << RTGI_TEMPORAL)
+    | (1 << RTGI_CACHE_SNAPSHOT)
+    | (1 << RTGI_CACHE_INVALIDATE);
 
 /// The deferred primary trace: closest hits, record, visibility, resolve.
 /// Optional: until all four are built, the immediate `trace` kernel takes
@@ -498,10 +538,10 @@ const RTGI_PIPELINES: u64 = (1 << RTGI_SAMPLE)
 /// to compile cold, and `trace` about ten seconds.
 const DEFERRED_TRACE_PIPELINES: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
 
-/// The cascades' pipelines, which every view can fall back to. Hardware
-/// traversal and the deferred trace are optional: software traversal and the
-/// immediate trace produce the same transport while they are unavailable.
-fn required_pipelines(settings: RadianceCascades) -> u64 {
+/// Split Radiance Cascades' pipelines. Hardware traversal and the deferred
+/// trace are optional: software traversal and the immediate trace produce the
+/// same transport while they are unavailable.
+fn split_pipelines(settings: RadianceCascades) -> u64 {
     let mut required = ((1u64 << COMPUTE_ENTRIES.len()) - 1)
         & !HARDWARE_TRAVERSAL_PIPELINES
         & !RTGI_PIPELINES
@@ -512,59 +552,81 @@ fn required_pipelines(settings: RadianceCascades) -> u64 {
     required
 }
 
-/// Ray-traced GI's pipelines: its own passes plus clear, temporal and denoise.
+/// Ray-traced GI's pipelines: its own passes plus the counter clear. It has
+/// its own denoise and temporal filter; the cascades' are not needed.
 fn ray_traced_pipelines(settings: RadianceCascades) -> u64 {
-    let mut required = RTGI_PIPELINES | 1 | (1 << 12) | (1 << 13);
+    let mut required = RTGI_PIPELINES | 1;
     if settings.spatial_filter_steps == 0 {
-        required &= !(1 << 13);
+        required &= !((1 << RTGI_DENOISE_X) | (1 << RTGI_DENOISE_Y));
     }
     required
 }
 
+/// The view selected ray-traced GI. It always traces in hardware and never
+/// runs the cascades in its place.
 fn ray_traced_requested(settings: RadianceCascades) -> bool {
-    settings.method == crate::GiMethod::RayTraced && settings.hardware_ray_queries
+    settings.method == crate::GiMethod::RayTraced
 }
 
-/// Whether the pipelines in `ready` let a view render: the cascades', or
-/// ray-traced GI's when the view selects it, so neither method waits for
-/// the other's kernels to compile.
+/// Whether the view traces any rays with hardware ray queries: ray-traced GI
+/// always does; the cascades and sun shadows when `hardware_ray_queries` is set.
+fn hardware_traversal_requested(settings: RadianceCascades) -> bool {
+    settings.hardware_ray_queries || ray_traced_requested(settings)
+}
+
+/// The pipelines the view's selected method needs before it can render.
+fn required_pipelines(settings: RadianceCascades) -> u64 {
+    if ray_traced_requested(settings) {
+        ray_traced_pipelines(settings)
+    } else {
+        split_pipelines(settings)
+    }
+}
+
 fn view_pipelines_ready(settings: RadianceCascades, ready: u64) -> bool {
     required_pipelines(settings) & !ready == 0
-        || ray_traced_requested(settings) && ray_traced_pipelines(settings) & !ready == 0
 }
 
-/// Pipelines to build for a view: the cascades with their deferred trace,
-/// their hardware traversal variants when requested, and ray-traced GI when
-/// selected.
+/// Pipelines to build for a view: its method's, the cascades' optional
+/// deferred trace and hardware variants, and the sun-shadow kernel.
 fn wanted_pipelines(settings: RadianceCascades) -> u64 {
-    required_pipelines(settings)
-        | DEFERRED_TRACE_PIPELINES
-        | if settings.hardware_ray_queries {
-            HARDWARE_TRAVERSAL_PIPELINES & !RTGI_PIPELINES
-        } else {
-            0
-        }
-        | if ray_traced_requested(settings) {
-            ray_traced_pipelines(settings)
-        } else {
-            0
-        }
+    let split_extras = if ray_traced_requested(settings) {
+        0
+    } else {
+        DEFERRED_TRACE_PIPELINES
+            | if settings.hardware_ray_queries {
+                HARDWARE_TRAVERSAL_PIPELINES & !RTGI_PIPELINES
+            } else {
+                0
+            }
+    };
+    let sun_shadows = if settings.ray_traced_sun_shadows && hardware_traversal_requested(settings) {
+        1 << SUN_SHADOWS_HARDWARE
+    } else {
+        0
+    };
+    required_pipelines(settings) | split_extras | sun_shadows
 }
 
 /// Compile order: ray-traced GI's kernels first when any view selects it,
 /// then the long ray-tracing kernels, so their pipeline creation overlaps
 /// the smaller stages instead of extending the end of startup.
 fn compile_priority(ray_traced_first: bool) -> impl Iterator<Item = usize> {
-    const RTGI: [usize; 9] = [
+    const RTGI: [usize; 14] = [
         RTGI_CACHE_SHADE,
         RTGI_CACHE_RECORD,
         RTGI_SAMPLE,
         RTGI_CACHE_BOUNCE,
+        RTGI_VOLUME_TRACE,
         RTGI_RESOLVE,
         RTGI_CACHE_VISIBILITY,
-        12,
+        RTGI_CACHE_SNAPSHOT,
+        RTGI_CACHE_INVALIDATE,
+        RTGI_VOLUME_UPDATE,
+        RTGI_TEMPORAL,
+        RTGI_DENOISE_X,
+        RTGI_DENOISE_Y,
         0,
-        13,
     ];
     // The immediate trace first: the cascades can start on it alone.
     const SPLIT: [usize; 6] = [7, 12, 16, 17, 18, 20];
@@ -582,7 +644,16 @@ fn compile_priority(ray_traced_first: bool) -> impl Iterator<Item = usize> {
 
 const MODULES: [(&str, &[&str]); 4] = [
     ("cascades.slang", &COMPUTE_ENTRIES),
-    ("composite.slang", &["vertex", "fragment", "compositeAnchors", "sunShadowDepth"]),
+    (
+        "composite.slang",
+        &[
+            "vertex",
+            "fragment",
+            "rtgiFragment",
+            "compositeAnchors",
+            "sunShadowDepth",
+        ],
+    ),
     ("acceleration.slang", &["refitTlas"]),
     ("deformation.slang", &["deformVertices", "refitBlas"]),
 ];
@@ -614,6 +685,10 @@ const SOURCES: &[(&str, &str)] = &[
     (
         "receiver_metadata.slang",
         include_str!("../shaders/receiver_metadata.slang"),
+    ),
+    (
+        "rtgi_field.slang",
+        include_str!("../shaders/rtgi_field.slang"),
     ),
     ("cascades.slang", include_str!("../shaders/cascades.slang")),
     (
@@ -913,7 +988,7 @@ struct Parameters {
     emissive_dirty_max: Vec4,
     light_dirty_min: Vec4,
     light_dirty_max: Vec4,
-    /// Ray-traced GI: multi-bounce, spatial samples, reservoir history, reserved.
+    /// Ray-traced GI: multi-bounce, spatial samples, reservoir history, previous frame ray traced (history valid).
     ray_traced: UVec4,
 }
 
@@ -934,6 +1009,8 @@ struct Pipelines {
     driver_cache_save: Option<std::thread::JoinHandle<Result<(), String>>>,
     driver_cache_dirty: bool,
     composite: CachedRenderPipelineId,
+    /// Ray-traced GI's composition: upsamples its SH instead of the cascades' irradiance.
+    composite_rtgi: CachedRenderPipelineId,
     sun_shadow_depth: CachedRenderPipelineId,
     composite_anchors: CachedComputePipelineId,
     refit: CachedComputePipelineId,
@@ -1222,7 +1299,7 @@ struct ShaderCompilation {
 fn required_shader_modules(settings: impl Iterator<Item = RadianceCascades>) -> u64 {
     let mut required = 0;
     for settings in settings {
-        if settings.intensity <= 0.0 {
+        if !settings.radiance_transport_active() {
             continue;
         }
         required |= wanted_pipelines(settings);
@@ -1371,6 +1448,24 @@ impl GiPreparedView {
     }
 }
 
+/// The composition pipelines the view's selected method needs.
+fn composite_pipelines_ready(
+    cache: &PipelineCache,
+    pipelines: &Pipelines,
+    settings: RadianceCascades,
+) -> bool {
+    cache
+        .get_compute_pipeline(pipelines.composite_anchors)
+        .is_some()
+        && cache
+            .get_render_pipeline(if ray_traced_requested(settings) {
+                pipelines.composite_rtgi
+            } else {
+                pipelines.composite
+            })
+            .is_some()
+}
+
 // Keep native preparation intact. Ownership is decided after this frame's
 // identity draw and GPU refits, before any native lighting pass consumes uniforms.
 #[allow(clippy::type_complexity)]
@@ -1393,6 +1488,7 @@ fn finalize_view_lighting(
     cache: Res<PipelineCache>,
     environments: Option<Res<crate::environment::EnvironmentTables>>,
     budget: Option<Res<SceneBudget>>,
+    hardware: Option<Res<hardware::HardwareTraversal>>,
     mut startup: Local<HashMap<Entity, String>>,
 ) {
     let entity = view.entity();
@@ -1401,7 +1497,7 @@ fn finalize_view_lighting(
             .get(&entity)
             .is_none_or(|previous| previous != status)
         {
-            info!(?entity, status, "Split Radiance Cascades startup");
+            info!(?entity, status, "GI startup");
             startup.insert(entity, status.to_owned());
         }
     };
@@ -1415,13 +1511,26 @@ fn finalize_view_lighting(
         report("disabled by camera intensity");
         return;
     };
-    commands.entity(entity).insert(GiLightingState(false));
-    if !view_pipelines_ready(settings, pipelines.ready_mask()) {
-        let required = if ray_traced_requested(settings) {
-            ray_traced_pipelines(settings)
+    if settings.method == crate::GiMethod::Pxtgi {
+        // PXTGI adds its light after Bevy's deferred lighting; this renderer
+        // leaves the view's native lighting alone.
+        commands.entity(entity).remove::<GiLightingState>();
+        report(if cfg!(feature = "pxtgi") {
+            "PXTGI owns this view"
         } else {
-            required_pipelines(settings)
-        };
+            "PXTGI unavailable: bevy_lux was built without its `pxtgi` feature"
+        });
+        return;
+    }
+    commands.entity(entity).insert(GiLightingState(false));
+    // Ray-traced GI never substitutes the cascades; without hardware ray
+    // queries the view keeps Bevy's native lighting.
+    if ray_traced_requested(settings) && !pipelines.ray_query {
+        report("ray-traced GI unavailable: device lacks hardware ray queries");
+        return;
+    }
+    if !view_pipelines_ready(settings, pipelines.ready_mask()) {
+        let required = required_pipelines(settings);
         let pending: Vec<_> = (0..COMPUTE_ENTRIES.len())
             .filter_map(|i| {
                 (required & (1 << i) != 0 && pipelines.pipeline(i).is_none())
@@ -1485,9 +1594,16 @@ fn finalize_view_lighting(
         report("waiting for current scene snapshot");
         return;
     }
+    if ray_traced_requested(settings)
+        && hardware
+            .as_deref()
+            .is_none_or(|hardware| !hardware.ready_for(scene.revision))
+    {
+        report("waiting for hardware ray traversal");
+        return;
+    }
     if !view_pipelines_ready(buffers.settings, pipelines.ready_mask())
-        || cache.get_render_pipeline(pipelines.composite).is_none()
-        || cache.get_compute_pipeline(pipelines.composite_anchors).is_none()
+        || !composite_pipelines_ready(&cache, &pipelines, buffers.settings)
     {
         report("waiting for composite pipeline");
         return;
@@ -1509,7 +1625,7 @@ fn cleanup_view_allocations(
     >,
 ) {
     for (entity, settings, active) in &views {
-        if !active || settings.is_none_or(|settings| settings.sanitized().intensity <= 0.0) {
+        if !active || settings.is_none_or(|settings| !settings.sanitized().radiance_transport_active()) {
             commands.entity(entity).remove::<(
                 ViewBuffers,
                 ViewBindings,
@@ -1807,40 +1923,45 @@ fn init_pipelines(
     composite_layout
         .entries
         .retain(|entry| !matches!(entry.binding, 1 | 4 | 14 | 15));
+    // Ray-traced GI's temporal SH and irradiance volumes, read by rtgiFragment.
+    composite_layout
+        .entries
+        .push(storage_buffer_read_only_sized(false, None).build(17, ShaderStages::VERTEX_FRAGMENT));
     let composite_pipeline = |label: &'static str, entry: &'static str| {
         cache.queue_render_pipeline(RenderPipelineDescriptor {
-        label: Some(label.into()),
-        layout: vec![composite_layout.clone()],
-        vertex: VertexState {
-            shader: handles[COMPUTE_ENTRIES.len()].clone(),
-            entry_point: Some("vertex".into()),
+            label: Some(label.into()),
+            layout: vec![composite_layout.clone()],
+            vertex: VertexState {
+                shader: handles[COMPUTE_ENTRIES.len()].clone(),
+                entry_point: Some("vertex".into()),
+                ..default()
+            },
+            fragment: Some(FragmentState {
+                shader: handles[COMPUTE_ENTRIES.len()].clone(),
+                entry_point: Some(entry.into()),
+                targets: vec![Some(ColorTargetState {
+                    format: TextureFormat::Rgba16Float,
+                    blend: Some(BlendState {
+                        color: BlendComponent {
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::One,
+                            operation: BlendOperation::Add,
+                        },
+                        alpha: BlendComponent {
+                            src_factor: BlendFactor::Zero,
+                            dst_factor: BlendFactor::One,
+                            operation: BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: ColorWrites::ALL,
+                })],
+                ..default()
+            }),
             ..default()
-        },
-        fragment: Some(FragmentState {
-            shader: handles[COMPUTE_ENTRIES.len()].clone(),
-            entry_point: Some(entry.into()),
-            targets: vec![Some(ColorTargetState {
-                format: TextureFormat::Rgba16Float,
-                blend: Some(BlendState {
-                    color: BlendComponent {
-                        src_factor: BlendFactor::One,
-                        dst_factor: BlendFactor::One,
-                        operation: BlendOperation::Add,
-                    },
-                    alpha: BlendComponent {
-                        src_factor: BlendFactor::Zero,
-                        dst_factor: BlendFactor::One,
-                        operation: BlendOperation::Add,
-                    },
-                }),
-                write_mask: ColorWrites::ALL,
-            })],
-            ..default()
-        }),
-        ..default()
-    })
+        })
     };
     let composite = composite_pipeline("split_rc_composite", "fragment");
+    let composite_rtgi = composite_pipeline("split_rc_composite_rtgi", "rtgiFragment");
     // Writes traced sun visibility as depth into Bevy's directional shadow texture.
     let sun_shadow_depth = cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("split_rc_sun_shadow_depth".into()),
@@ -1896,6 +2017,7 @@ fn init_pipelines(
         driver_cache_save: None,
         driver_cache_dirty: false,
         composite,
+        composite_rtgi,
         sun_shadow_depth,
         composite_anchors,
         refit,
@@ -2103,7 +2225,7 @@ fn filter_raster_visibility(
     }
     let mut active_camera_layers = Vec::new();
     for (layers, mut visible, settings) in &mut cameras {
-        if settings.sanitized().intensity > 0.0 {
+        if settings.sanitized().radiance_transport_active() {
             let layers = layers.cloned().unwrap_or_default();
             active_camera_layers.push(layers.clone());
             filter_raster_entities(&mut visible, Some(&layers), &gate, &gpu_entities);
@@ -3626,9 +3748,15 @@ fn composite_anchor_layout() -> BindGroupLayoutDescriptor {
             ShaderStages::COMPUTE,
             (
                 (0, uniform_buffer::<Parameters>(false)),
-                (2, texture_2d(TextureSampleType::Float { filterable: false })),
+                (
+                    2,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ),
                 (5, texture_2d(TextureSampleType::Uint)),
-                (6, texture_2d(TextureSampleType::Float { filterable: false })),
+                (
+                    6,
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                ),
                 (7, texture_2d(TextureSampleType::Uint)),
                 (
                     14,
@@ -4976,12 +5104,18 @@ struct ViewBuffers {
     rtgi_reservoirs: [Buffer; 2],
     /// Ray-traced GI world radiance cache keys, cells and shading queue.
     rtgi_cache: [Buffer; 3],
+    /// Pending RTGI invalidation survives skipped render frames.
+    rtgi_cache_reset: AtomicBool,
+    /// Bounded geometry motion needs dependency-tested cache invalidation.
+    rtgi_cache_invalidate: AtomicBool,
     /// Last frame's composed image over the viewport, read by ray-traced GI
     /// for on-screen hits; one texel unless the view uses `GiMethod::RayTraced`.
     _rtgi_lit_history: Texture,
     rtgi_lit_history_view: TextureView,
-    /// The lit history holds the previous ray-traced frame.
-    rtgi_lit_history_valid: AtomicBool,
+    /// The previous frame ran ray-traced GI on these buffers: its lit image,
+    /// reservoirs and SH history are current, and the cascades' screen
+    /// history is not.
+    rtgi_history_valid: AtomicBool,
     /// Packed hard sun-shadow bits; see `sun_shadow_mask_size`.
     _sun_shadow_mask: Texture,
     sun_shadow_mask_view: TextureView,
@@ -5339,26 +5473,33 @@ fn own_sun_shadows(
         && hardware.is_some_and(|hardware| hardware.ready_for(scene.revision))
         && pipelines.is_some_and(|pipelines| {
             pipelines.pipeline(SUN_SHADOWS_HARDWARE).is_some()
-                && cache.get_render_pipeline(pipelines.sun_shadow_depth).is_some()
+                && cache
+                    .get_render_pipeline(pipelines.sun_shadow_depth)
+                    .is_some()
         });
     // A camera on Bevy's shadow maps would lose them, so every 3D camera must
     // trace the sun. Its bindings come from the previous frame's prepare.
     // shortcut: a view whose bindings are dropped later this frame shows one
     // unshadowed frame; move the decision after prepare if that becomes visible.
     let views_ready = !cameras.is_empty()
-        && cameras.iter().all(|(_, settings, bindings, buffers, receiver)| {
-            settings.is_some_and(|settings| {
-                let settings = settings.sanitized();
-                settings.ray_traced_sun_shadows && settings.hardware_ray_queries
-            }) && bindings.is_some_and(|bindings| bindings.sun_shadows.is_some())
-                && buffers
-                && receiver
-        });
+        && cameras
+            .iter()
+            .all(|(_, settings, bindings, buffers, receiver)| {
+                settings.is_some_and(|settings| {
+                    let settings = settings.sanitized();
+                    settings.ray_traced_sun_shadows && hardware_traversal_requested(settings)
+                }) && bindings.is_some_and(|bindings| bindings.sun_shadows.is_some())
+                    && buffers
+                    && receiver
+            });
     // Without cascades, shadowed spot lights would take layer 0 as well.
     let spot_shadows = punctual
         .iter()
         .any(|light| light.shadow_maps_enabled && light.spot_light_angles.is_some());
-    let shadowed = lights.iter().filter(|light| light.shadow_maps_enabled).count();
+    let shadowed = lights
+        .iter()
+        .filter(|light| light.shadow_maps_enabled)
+        .count();
     ownership.0 = ready && views_ready && !spot_shadows && shadowed <= SUN_SHADOW_LIGHTS;
     if let Some(status) = status {
         status.set_ray_traced_sun_shadows(ownership.0);
@@ -5458,15 +5599,23 @@ fn rtgi_reservoir_bytes(shading_size: UVec2, settings: RadianceCascades) -> u64 
     }
 }
 
-/// Cache keys, cells and the two-parity shading queue in ray-traced mode;
-/// one word each otherwise. Buffers start zeroed, so every key is empty.
-fn rtgi_cache_bytes(settings: RadianceCascades) -> [u64; 3] {
+/// Ray-traced GI's cache words (keys, request and last-use stamps, valid-hit
+/// flags, queue counts, two parity queues and work slots), cache cells, and
+/// float4 field (irradiance
+/// volumes, probe ray scratch, gather and temporal SH per resolve sample);
+/// one word each when the view uses the cascades. Buffers start zeroed, so
+/// every key, probe and history texel starts empty.
+fn rtgi_cache_bytes(shading_size: UVec2, settings: RadianceCascades) -> [u64; 3] {
     if settings.method == crate::GiMethod::RayTraced {
+        let pixels = u64::from(shading_size.x) * u64::from(shading_size.y);
         [
-            RTGI_CACHE_CAPACITY * 4,
+            (4 * RTGI_CACHE_CAPACITY + 2 + 2 * RTGI_CACHE_QUEUE + RTGI_CACHE_WORK) * 4,
             RTGI_CACHE_CAPACITY * RTGI_CACHE_CELL_BYTES,
-            // Counts, two parity queues, then one work slot per update lane.
-            (2 + 2 * RTGI_CACHE_QUEUE + RTGI_CACHE_QUEUE + RTGI_CACHE_REFRESH) * 4,
+            (RTGI_VOLUME_CASCADES * RTGI_VOLUME_PROBES * RTGI_PROBE_WORDS
+                + RTGI_VOLUME_BATCH * RTGI_VOLUME_RAYS * 2
+                + pixels * RTGI_PIXEL_WORDS
+                + RTGI_CACHE_CAPACITY * 8)
+                * 16,
         ]
     } else {
         [16, RTGI_CACHE_CELL_BYTES, 16]
@@ -5489,7 +5638,7 @@ fn view_bytes(size: UVec2, shading_size: UVec2, settings: RadianceCascades) -> u
     let image_bytes = shading_pixels * 15 * 16
         + u64::from(mask.x) * u64::from(mask.y) * 16
         + 2 * rtgi_reservoir_bytes(shading_size, settings)
-        + rtgi_cache_bytes(settings).iter().sum::<u64>();
+        + rtgi_cache_bytes(shading_size, settings).iter().sum::<u64>();
     image_bytes
         + 12
         + (LEVELS as u64 + 2) * std::mem::size_of::<Parameters>() as u64
@@ -5918,11 +6067,11 @@ impl ViewBuffers {
                 mapped_at_creation: false,
             })
         });
-        let rtgi_cache = rtgi_cache_bytes(settings).map(|size| {
+        let rtgi_cache = rtgi_cache_bytes(shading_size, settings).map(|size| {
             device.create_buffer(&BufferDescriptor {
                 label: Some("split_rc_rtgi_cache"),
                 size,
-                usage: BufferUsages::STORAGE,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
         });
@@ -5945,8 +6094,7 @@ impl ViewBuffers {
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let rtgi_lit_history_view =
-            rtgi_lit_history.create_view(&TextureViewDescriptor::default());
+        let rtgi_lit_history_view = rtgi_lit_history.create_view(&TextureViewDescriptor::default());
         let sun_shadow_mask = make_texture(sun_shadow_mask_size(viewport_size));
         let sun_shadow_mask_view = sun_shadow_mask.create_view(&TextureViewDescriptor::default());
         Self {
@@ -5978,9 +6126,11 @@ impl ViewBuffers {
             composite_anchor_views,
             rtgi_reservoirs,
             rtgi_cache,
+            rtgi_cache_reset: AtomicBool::new(false),
+            rtgi_cache_invalidate: AtomicBool::new(false),
             _rtgi_lit_history: rtgi_lit_history,
             rtgi_lit_history_view,
-            rtgi_lit_history_valid: AtomicBool::new(false),
+            rtgi_history_valid: AtomicBool::new(false),
             _sun_shadow_mask: sun_shadow_mask,
             sun_shadow_mask_view,
             uniforms: std::array::from_fn(|_| UniformBuffer::default()),
@@ -6179,7 +6329,7 @@ fn prepare(
         .iter()
         .fold(0u64, |mask, (_, _, _, _, _, (settings, _), ..)| {
             let settings = settings.sanitized();
-            mask | if settings.intensity > 0.0 {
+            mask | if settings.radiance_transport_active() {
                 required_pipelines(settings)
             } else {
                 0
@@ -6190,7 +6340,7 @@ fn prepare(
         .iter()
         .fold(0u64, |mask, (_, _, _, _, _, (settings, _), ..)| {
             let settings = settings.sanitized();
-            mask | if settings.intensity > 0.0 {
+            mask | if settings.radiance_transport_active() {
                 wanted_pipelines(settings)
             } else {
                 0
@@ -6357,6 +6507,10 @@ fn prepare(
             (
                 "composite",
                 cache.get_render_pipeline_state(pipelines.composite),
+            ),
+            (
+                "compositeRtgi",
+                cache.get_render_pipeline_state(pipelines.composite_rtgi),
             ),
             (
                 "compositeAnchors",
@@ -7634,7 +7788,7 @@ fn prepare(
             } else {
                 (None, fallback_view, Vec4::W, 1.0)
             };
-        if settings.intensity <= 0.0 {
+        if !settings.radiance_transport_active() {
             if let Some(buffers) = existing {
                 buffers.screen_history_valid.store(false, Ordering::Relaxed);
             }
@@ -7973,6 +8127,19 @@ fn prepare(
             world_cache_settings_changed,
             viewport_changed,
         );
+        if settings.method == crate::GiMethod::RayTraced {
+            if reset_cache {
+                // Scene indices or global cache semantics changed.
+                buffers.rtgi_cache_reset.store(true, Ordering::Relaxed);
+            } else if geometry_changed {
+                // Bounded rigid motion keeps cells whose complete retained
+                // visibility dependencies do not cross the dirty region.
+                buffers.rtgi_cache_invalidate.store(true, Ordering::Relaxed);
+            }
+            if geometry_changed || reset_cache {
+                buffers.screen_history_valid.store(false, Ordering::Relaxed);
+            }
+        }
         if scene_changed || scene_changed_since_history {
             debug!(
                 entity = ?entity,
@@ -8288,7 +8455,9 @@ fn prepare(
                 settings.temporal_blend,
                 // The deferred trace is still compiling: the immediate trace
                 // takes every receiver.
-                f32::from(pipelines.ready_mask() & DEFERRED_TRACE_PIPELINES != DEFERRED_TRACE_PIPELINES),
+                f32::from(
+                    pipelines.ready_mask() & DEFERRED_TRACE_PIPELINES != DEFERRED_TRACE_PIPELINES,
+                ),
                 if buffers.history_valid.load(Ordering::Relaxed) {
                     1.0
                 } else {
@@ -8324,7 +8493,10 @@ fn prepare(
                 u32::from(secondary_enabled && settings.cached_hit_sky),
             ),
             stability: Vec4::new(
-                if buffers.screen_history_valid.load(Ordering::Relaxed) {
+                // After a ray-traced frame the cascades' screen history is stale.
+                if buffers.screen_history_valid.load(Ordering::Relaxed)
+                    && !buffers.rtgi_history_valid.load(Ordering::Relaxed)
+                {
                     1.0
                 } else {
                     0.0
@@ -8420,7 +8592,10 @@ fn prepare(
                 u32::from(settings.ray_traced.multi_bounce),
                 settings.ray_traced.spatial_samples.min(16),
                 settings.ray_traced.reservoir_history.clamp(1, 255),
-                u32::from(buffers.rtgi_lit_history_valid.load(Ordering::Relaxed)),
+                u32::from(
+                    buffers.rtgi_history_valid.load(Ordering::Relaxed)
+                        && buffers.screen_history_valid.load(Ordering::Relaxed),
+                ),
             ),
         };
         for (level, uniform) in buffers.uniforms.iter_mut().enumerate() {
@@ -8508,8 +8683,7 @@ fn prepare(
                 bindings: bindings.clone(),
             });
             let pipelines_ready = view_pipelines_ready(settings, pipelines.ready_mask())
-                && cache.get_render_pipeline(pipelines.composite).is_some()
-                && cache.get_compute_pipeline(pipelines.composite_anchors).is_some();
+                && composite_pipelines_ready(&cache, &pipelines, settings);
             let (target_size, viewport) = camera_descriptor(Some(camera));
             commands.entity(entity).insert(GiPreparedView {
                 settings: requested_settings,
@@ -8827,6 +9001,10 @@ fn prepare(
         .iter()
         .filter(|entry| !matches!(entry.binding, 1 | 4 | 14 | 15))
         .cloned()
+        .chain(std::iter::once(BindGroupEntry {
+            binding: 17,
+            resource: buffers.rtgi_cache[2].as_entire_binding(),
+        }))
         .collect::<Vec<_>>();
         let composite = device.create_bind_group(
             "split_rc_composite",
@@ -8834,8 +9012,7 @@ fn prepare(
             &composite_entries,
         );
         let pipelines_ready = view_pipelines_ready(settings, pipelines.ready_mask())
-            && cache.get_render_pipeline(pipelines.composite).is_some()
-            && cache.get_compute_pipeline(pipelines.composite_anchors).is_some();
+            && composite_pipelines_ready(&cache, &pipelines, settings);
         let (target_size, viewport) = camera_descriptor(Some(camera));
         commands.entity(entity).insert(GiPreparedView {
             settings: requested_settings,
@@ -8971,8 +9148,9 @@ fn render(
     buffers
         .history_diagnostics_requested
         .store(raw_output.is_some(), Ordering::Relaxed);
-    if settings.intensity <= 0.0 {
-        if raw_output.is_some() {
+    if !settings.radiance_transport_active() {
+        // PXTGI records its own raw frames.
+        if raw_output.is_some() && settings.method != crate::GiMethod::Pxtgi {
             shaders.status.record_raw_frame(None);
         }
         return;
@@ -9007,21 +9185,25 @@ fn render(
     }
     let compute: [Option<&ComputePipeline>; COMPUTE_ENTRIES.len()] =
         std::array::from_fn(|i| pipelines.pipeline(i));
-    // Ray-traced GI replaces every cascade pass with path sampling and ReSTIR
-    // GI reuse; the outputs feed the same temporal filter and composition.
-    // Until hardware traversal is ready the view falls back to the cascades,
-    // and waits for their pipelines if those are still compiling.
+    // Ray-traced GI replaces every cascade pass with its final gather, world
+    // radiance cache, irradiance volumes and SH denoise, and composes with its
+    // own upsampling pass. The two methods never substitute for each other:
+    // until its hardware traversal and pipelines are ready, a ray-traced view
+    // dispatches nothing and keeps native lighting.
     let ready = pipelines.ready_mask();
-    let ray_traced = ray_traced_requested(buffers.settings)
+    let ray_traced = ray_traced_requested(buffers.settings);
+    if ray_traced
         && hardware
             .as_ref()
-            .is_some_and(|hardware| hardware.ready_for(scene.revision))
-        && ray_traced_pipelines(buffers.settings) & !ready == 0;
-    let required = if ray_traced {
-        ray_traced_pipelines(buffers.settings)
-    } else {
-        required_pipelines(buffers.settings)
-    };
+            .is_none_or(|hardware| !hardware.ready_for(scene.revision))
+    {
+        buffers.screen_history_valid.store(false, Ordering::Relaxed);
+        if raw_output.is_some() {
+            shaders.status.record_raw_frame(None);
+        }
+        return;
+    }
+    let required = required_pipelines(buffers.settings);
     let missing = required & !ready;
     if missing != 0 {
         buffers.screen_history_valid.store(false, Ordering::Relaxed);
@@ -9037,7 +9219,11 @@ fn render(
     }
     *pending_pipelines = 0;
     let (Some(composite), Some(composite_anchors)) = (
-        cache.get_render_pipeline(pipelines.composite),
+        cache.get_render_pipeline(if ray_traced {
+            pipelines.composite_rtgi
+        } else {
+            pipelines.composite
+        }),
         cache.get_compute_pipeline(pipelines.composite_anchors),
     ) else {
         buffers.screen_history_valid.store(false, Ordering::Relaxed);
@@ -9057,6 +9243,19 @@ fn render(
     let diagnostics = context.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     let total_span = diagnostics.time_span(context.command_encoder(), "split_rc");
+    let invalidate_rtgi =
+        ray_traced && buffers.rtgi_cache_invalidate.swap(false, Ordering::Relaxed);
+    if ray_traced && buffers.rtgi_cache_reset.swap(false, Ordering::Relaxed) {
+        for buffer in &buffers.rtgi_cache {
+            context.command_encoder().clear_buffer(buffer, 0, None);
+        }
+    } else if invalidate_rtgi {
+        // Volumes do not yet retain transitive geometry dependencies.
+        let volume_bytes = RTGI_VOLUME_CASCADES * RTGI_VOLUME_PROBES * RTGI_PROBE_WORDS * 16;
+        context
+            .command_encoder()
+            .clear_buffer(&buffers.rtgi_cache[2], 0, Some(volume_bytes));
+    }
     let mut clear_dispatch_index = 0usize;
     let mut secondary_clear_dispatch_index = 0usize;
     let skip_passes: Vec<String> = std::env::var("PENUMBRA_SKIP_PASSES")
@@ -9161,11 +9360,21 @@ fn render(
                 | "traceResolve" | "traceOverflow" => {
                     bindings.trace.as_ref().unwrap_or(&bindings.compute[level])
                 }
-                // Ray-traced GI writes worldResolve's outputs.
-                "worldResolve" | "rtgiSample" | "rtgiResolve" | "rtgiCacheRecord"
-                | "rtgiCacheVisibility" | "rtgiCacheShade" | "rtgiCacheBounce" => {
-                    &bindings.world_resolve
-                }
+                // Ray-traced GI writes worldResolve's raw output.
+                "worldResolve"
+                | "rtgiSample"
+                | "rtgiResolve"
+                | "rtgiCacheRecord"
+                | "rtgiCacheVisibility"
+                | "rtgiCacheShade"
+                | "rtgiCacheBounce"
+                | "rtgiVolumeTrace"
+                | "rtgiVolumeUpdate"
+                | "rtgiDenoiseX"
+                | "rtgiDenoiseY"
+                | "rtgiTemporal"
+                | "rtgiCacheSnapshot"
+                | "rtgiCacheInvalidate" => &bindings.world_resolve,
                 _ => &bindings.compute[level],
             },
         };
@@ -9254,10 +9463,8 @@ fn render(
     });
     if ray_traced {
         shaders.status.set_hardware_ray_queries_active(true);
-        // Empties the cascades' probe directory, so the composite's world-probe
-        // fallback finds nothing instead of scanning stale probes, and resets
-        // the per-frame counters.
-        // shortcut: sub-resolve facets then get no GI; give them an RTGI fallback if it shows.
+        // Resets the per-frame counters of the shared heads buffer and empties
+        // the cascades' probe directory, which this method does not fill.
         dispatch(
             "clear",
             compute[0].expect("cascade pipeline ready"),
@@ -9265,12 +9472,37 @@ fn render(
             clear_groups,
             1,
         );
-        for (name, stage) in [("rtgiSample", RTGI_SAMPLE), ("rtgiResolve", RTGI_RESOLVE)] {
-            dispatch(name, compute[stage].expect("checked"), 0, shading_x, shading_y);
+        if invalidate_rtgi {
+            dispatch(
+                "rtgiCacheInvalidate",
+                compute[RTGI_CACHE_INVALIDATE].expect("checked"),
+                0,
+                RTGI_CACHE_CAPACITY.div_ceil(64) as u32,
+                1,
+            );
         }
-        // Shades cells queued by this frame's gather, then traces their bounce rays;
-        // the next gather reads the cells.
-        let work_groups = (RTGI_CACHE_QUEUE + RTGI_CACHE_REFRESH).div_ceil(64) as u32;
+        // Final gather, temporal then spatial path reuse, SH projection.
+        for (name, stage) in [("rtgiSample", RTGI_SAMPLE), ("rtgiResolve", RTGI_RESOLVE)] {
+            dispatch(
+                name,
+                compute[stage].expect("checked"),
+                0,
+                shading_x,
+                shading_y,
+            );
+        }
+        // Probe rays of this frame's irradiance volume batch; their hits queue
+        // cache cells after the gather's, which take priority.
+        dispatch(
+            "rtgiVolumeTrace",
+            compute[RTGI_VOLUME_TRACE].expect("checked"),
+            0,
+            (RTGI_VOLUME_BATCH * RTGI_VOLUME_RAYS).div_ceil(64) as u32,
+            1,
+        );
+        // Shades the requested cells, then traces their bounce rays; the
+        // probe update and the next gather read the cells.
+        let work_groups = RTGI_CACHE_WORK.div_ceil(64) as u32;
         for (name, stage, groups) in [
             ("rtgiCacheRecord", RTGI_CACHE_RECORD, work_groups),
             (
@@ -9279,10 +9511,42 @@ fn render(
                 work_groups * DEFERRED_VISIBILITY_QUERIES as u32,
             ),
             ("rtgiCacheShade", RTGI_CACHE_SHADE, work_groups),
+            (
+                "rtgiCacheSnapshot",
+                RTGI_CACHE_SNAPSHOT,
+                RTGI_CACHE_CAPACITY.div_ceil(64) as u32,
+            ),
             ("rtgiCacheBounce", RTGI_CACHE_BOUNCE, work_groups),
+            (
+                "rtgiVolumeUpdate",
+                RTGI_VOLUME_UPDATE,
+                RTGI_VOLUME_BATCH as u32,
+            ),
         ] {
             dispatch(name, compute[stage].expect("checked"), 0, groups, 1);
         }
+        // Separable bilateral denoise of the gather SH, then the temporal filter.
+        if buffers.settings.spatial_filter_steps > 0 {
+            for (name, stage) in [
+                ("rtgiDenoiseX", RTGI_DENOISE_X),
+                ("rtgiDenoiseY", RTGI_DENOISE_Y),
+            ] {
+                dispatch(
+                    name,
+                    compute[stage].expect("checked"),
+                    0,
+                    shading_x,
+                    shading_y,
+                );
+            }
+        }
+        dispatch(
+            "rtgiTemporal",
+            compute[RTGI_TEMPORAL].expect("checked"),
+            0,
+            shading_x,
+            shading_y,
+        );
     } else {
         dispatch(
             "clear",
@@ -9566,103 +9830,107 @@ fn render(
     } else {
         false
     };
-    let temporal_span = diagnostics.time_span(context.command_encoder(), "temporal");
-    let mut pass = context
-        .command_encoder()
-        .begin_compute_pass(&ComputePassDescriptor {
-            label: Some("split_rc_temporal"),
-            ..default()
-        });
-    pass.set_pipeline(compute[12].expect("temporal pipeline ready"));
-    pass.set_bind_group(0, &bindings.temporal, &[]);
-    pass.dispatch_workgroups(shading_x, shading_y, 1);
-    drop(pass);
-
-    // Only temporal results become history; spatially filtered display values
-    // never feed back and spread lighting recursively across contacts.
-    context.command_encoder().copy_texture_to_texture(
-        buffers.irradiance_textures[2].as_image_copy(),
-        buffers.irradiance_textures[(frame & 1) as usize].as_image_copy(),
-        Extent3d {
-            width: buffers.shading_size.x,
-            height: buffers.shading_size.y,
-            depth_or_array_layers: 1,
-        },
-    );
-    temporal_span.end(context.command_encoder());
-    if let Some(diagnostics) = diagnostics.filter(|_| raw_output.is_some()) {
-        let heads = &buffers.caches[(frame & 1) as usize].heads;
-        // Confidence is fractional observed kernel mass, not a frame count.
-        const CONFIDENCE: [&str; 8] = [
-            "none",
-            "up_to_one",
-            "1_to_4",
-            "4_to_8",
-            "8_to_16",
-            "16_to_32",
-            "32_to_64",
-            "64_plus",
-        ];
-        const LUMINANCE: [&str; 9] = [
-            "unsupported",
-            "invalid",
-            "black",
-            "below_1",
-            "1_10",
-            "10_100",
-            "100_1000",
-            "1000_10000",
-            "10000_plus",
-        ];
-        for word in 0..HISTORY_DIAGNOSTIC_WORDS {
-            let (category, bin) = if word < 8 {
-                ("history_length", CONFIDENCE[word as usize])
-            } else if word < 17 {
-                ("raw_luminance", LUMINANCE[(word - 8) as usize])
-            } else {
-                ("temporal_luminance", LUMINANCE[(word - 17) as usize])
-            };
-            let offset = (u64::from(buffers.buckets) * 2 + 10 + word) * 4;
-            diagnostics.record_u32(
-                context.command_encoder(),
-                &heads.slice(offset..offset + 4),
-                format!("penumbra/view_{diagnostic_view}/diffuse/{category}/{bin}"),
-            );
-        }
-    }
-    let steps = buffers.settings.spatial_filter_steps;
-    for level in 0..steps as usize {
-        let span = diagnostics.time_span(
-            context.command_encoder(),
-            ["denoise_0", "denoise_1", "denoise_2", "denoise_3"][level],
-        );
+    // Ray-traced GI ran its own denoise and temporal filter, and its
+    // composition reads its SH directly.
+    if !ray_traced {
+        let temporal_span = diagnostics.time_span(context.command_encoder(), "temporal");
         let mut pass = context
             .command_encoder()
             .begin_compute_pass(&ComputePassDescriptor {
-                label: Some("split_rc_denoise"),
+                label: Some("split_rc_temporal"),
                 ..default()
             });
-        pass.set_pipeline(compute[13].expect("denoise pipeline ready"));
-        pass.set_bind_group(0, &bindings.denoise[level], &[]);
+        pass.set_pipeline(compute[12].expect("temporal pipeline ready"));
+        pass.set_bind_group(0, &bindings.temporal, &[]);
         pass.dispatch_workgroups(shading_x, shading_y, 1);
         drop(pass);
 
+        // Only temporal results become history; spatially filtered display values
+        // never feed back and spread lighting recursively across contacts.
+        context.command_encoder().copy_texture_to_texture(
+            buffers.irradiance_textures[2].as_image_copy(),
+            buffers.irradiance_textures[(frame & 1) as usize].as_image_copy(),
+            Extent3d {
+                width: buffers.shading_size.x,
+                height: buffers.shading_size.y,
+                depth_or_array_layers: 1,
+            },
+        );
+        temporal_span.end(context.command_encoder());
+        if let Some(diagnostics) = diagnostics.filter(|_| raw_output.is_some()) {
+            let heads = &buffers.caches[(frame & 1) as usize].heads;
+            // Confidence is fractional observed kernel mass, not a frame count.
+            const CONFIDENCE: [&str; 8] = [
+                "none",
+                "up_to_one",
+                "1_to_4",
+                "4_to_8",
+                "8_to_16",
+                "16_to_32",
+                "32_to_64",
+                "64_plus",
+            ];
+            const LUMINANCE: [&str; 9] = [
+                "unsupported",
+                "invalid",
+                "black",
+                "below_1",
+                "1_10",
+                "10_100",
+                "100_1000",
+                "1000_10000",
+                "10000_plus",
+            ];
+            for word in 0..HISTORY_DIAGNOSTIC_WORDS {
+                let (category, bin) = if word < 8 {
+                    ("history_length", CONFIDENCE[word as usize])
+                } else if word < 17 {
+                    ("raw_luminance", LUMINANCE[(word - 8) as usize])
+                } else {
+                    ("temporal_luminance", LUMINANCE[(word - 17) as usize])
+                };
+                let offset = (u64::from(buffers.buckets) * 2 + 10 + word) * 4;
+                diagnostics.record_u32(
+                    context.command_encoder(),
+                    &heads.slice(offset..offset + 4),
+                    format!("penumbra/view_{diagnostic_view}/diffuse/{category}/{bin}"),
+                );
+            }
+        }
+        let steps = buffers.settings.spatial_filter_steps;
+        for level in 0..steps as usize {
+            let span = diagnostics.time_span(
+                context.command_encoder(),
+                ["denoise_0", "denoise_1", "denoise_2", "denoise_3"][level],
+            );
+            let mut pass = context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("split_rc_denoise"),
+                    ..default()
+                });
+            pass.set_pipeline(compute[13].expect("denoise pipeline ready"));
+            pass.set_bind_group(0, &bindings.denoise[level], &[]);
+            pass.dispatch_workgroups(shading_x, shading_y, 1);
+            drop(pass);
+
+            span.end(context.command_encoder());
+        }
+
+        // Add diffuse light to the current HDR attachment without swapping the view target.
+        let span = diagnostics.time_span(context.command_encoder(), "compositeAnchors");
+        let mut pass = context
+            .command_encoder()
+            .begin_compute_pass(&ComputePassDescriptor {
+                label: Some("split_rc_composite_anchors"),
+                ..default()
+            });
+        pass.set_pipeline(composite_anchors);
+        pass.set_bind_group(0, &bindings.composite_anchors, &[]);
+        pass.dispatch_workgroups(shading_x, shading_y, 1);
+        drop(pass);
         span.end(context.command_encoder());
     }
-
-    // Add diffuse light to the current HDR attachment without swapping the view target.
-    let span = diagnostics.time_span(context.command_encoder(), "compositeAnchors");
-    let mut pass = context
-        .command_encoder()
-        .begin_compute_pass(&ComputePassDescriptor {
-            label: Some("split_rc_composite_anchors"),
-            ..default()
-        });
-    pass.set_pipeline(composite_anchors);
-    pass.set_bind_group(0, &bindings.composite_anchors, &[]);
-    pass.dispatch_workgroups(shading_x, shading_y, 1);
-    drop(pass);
-    span.end(context.command_encoder());
 
     let composition_span = diagnostics.time_span(context.command_encoder(), "composition");
     let mut pass = context
@@ -9687,7 +9955,8 @@ fn render(
     composition_span.end(context.command_encoder());
     // Ray-traced GI's screen-space cache reads this frame's lit image next frame.
     let lit_history = buffers._rtgi_lit_history.size();
-    if ray_traced && lit_history.width == buffers.viewport_size.x
+    if ray_traced
+        && lit_history.width == buffers.viewport_size.x
         && lit_history.height == buffers.viewport_size.y
     {
         context.command_encoder().copy_texture_to_texture(
@@ -9709,9 +9978,9 @@ fn render(
             },
             lit_history,
         );
-        buffers.rtgi_lit_history_valid.store(true, Ordering::Relaxed);
+        buffers.rtgi_history_valid.store(true, Ordering::Relaxed);
     } else {
-        buffers.rtgi_lit_history_valid.store(false, Ordering::Relaxed);
+        buffers.rtgi_history_valid.store(false, Ordering::Relaxed);
     }
     if required & (1 << CACHE_COMMIT) != 0 && !ray_traced {
         // Publish once, after composition has finished reading the live table.
@@ -9929,9 +10198,11 @@ mod tests {
     fn compute_layout_is_in_binding_order() {
         // The SPIR-V passthrough binding map relies on it; see compute_layout.
         for ray_query in [false, true] {
-            assert!(compute_layout(ray_query)
-                .entries
-                .is_sorted_by_key(|entry| entry.binding));
+            assert!(
+                compute_layout(ray_query)
+                    .entries
+                    .is_sorted_by_key(|entry| entry.binding)
+            );
         }
     }
 
@@ -10018,6 +10289,31 @@ mod tests {
             UVec2::ONE,
             settings,
             &insufficient
+        ));
+    }
+
+    #[test]
+    fn ray_traced_field_respects_storage_binding_limit() {
+        let limits = WgpuLimits {
+            max_storage_buffer_binding_size: 128 * 1024 * 1024,
+            max_buffer_size: 128 * 1024 * 1024,
+            ..default()
+        };
+        let viewport = UVec2::new(1920, 1080);
+        let settings = RadianceCascades {
+            method: crate::GiMethod::RayTraced,
+            ..default()
+        };
+        let receivers = UVec2::new(80, 45);
+        assert!(!view_fits_device(
+            receivers, viewport, viewport, settings, &limits
+        ));
+        assert!(view_fits_device(
+            receivers,
+            UVec2::new(480, 270),
+            viewport,
+            settings,
+            &limits,
         ));
     }
 
@@ -13283,8 +13579,16 @@ mod tests {
             + view.entries.size()
             + view.history_entries.size()
             + view.irradiance_probes.size()
-            + view.rtgi_reservoirs.iter().map(|buffer| buffer.size()).sum::<u64>()
-            + view.rtgi_cache.iter().map(|buffer| buffer.size()).sum::<u64>()
+            + view
+                .rtgi_reservoirs
+                .iter()
+                .map(|buffer| buffer.size())
+                .sum::<u64>()
+            + view
+                .rtgi_cache
+                .iter()
+                .map(|buffer| buffer.size())
+                .sum::<u64>()
             + (LEVELS as u64 + 2) * std::mem::size_of::<Parameters>() as u64;
         assert!(
             view_bytes(view.size, view.shading_size, view.settings) >= texture_bytes + buffer_bytes,
@@ -13370,7 +13674,9 @@ mod tests {
             &options,
         ));
         let device = &resources.0;
-        let ray_query = device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+        let ray_query = device
+            .features()
+            .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
         let layout = compute_layout(ray_query);
         let layouts =
             [device.create_bind_group_layout(Some(layout.label.as_ref()), &layout.entries)];
@@ -13387,8 +13693,15 @@ mod tests {
                 .unwrap()
                 .as_nanos()
                 % 1_000_000;
-            let header = format!("fn {entry}(@builtin(global_invocation_id) thread_0 : vec3<u32>)\r\n{{");
-            assert!(source.contains(&header), "{entry}: {:?}", source.find(&format!("fn {entry}(")).map(|at| &source[at..at + 120]));
+            let header =
+                format!("fn {entry}(@builtin(global_invocation_id) thread_0 : vec3<u32>)\r\n{{");
+            assert!(
+                source.contains(&header),
+                "{entry}: {:?}",
+                source
+                    .find(&format!("fn {entry}("))
+                    .map(|at| &source[at..at + 120])
+            );
             let source = source.replacen(
                 &header,
                 &format!("{header}\n    if (params_0.frame_0.x == {nonce}u) {{ return; }}"),
@@ -13405,7 +13718,11 @@ mod tests {
                 ray_query,
             )
             .unwrap();
-            eprintln!("PIPELINE {entry} {:.2}s wgsl_bytes={}", start.elapsed().as_secs_f64(), source.len());
+            eprintln!(
+                "PIPELINE {entry} {:.2}s wgsl_bytes={}",
+                start.elapsed().as_secs_f64(),
+                source.len()
+            );
         }
     }
 

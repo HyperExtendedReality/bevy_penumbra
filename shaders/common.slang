@@ -56,7 +56,7 @@ struct Parameters {
     float4 emissiveDirtyMax; // changed emitter source AABB maximum.xyz
     float4 lightDirtyMin; // finite punctual-light influence union; w > 0 marks local change
     float4 lightDirtyMax;
-    uint4 rayTraced;      // multi-bounce, spatial samples, reservoir history, lit history valid
+    uint4 rayTraced;      // multi-bounce, spatial samples, reservoir history, previous frame ray traced (history valid)
 };
 
 [ForceInline]
