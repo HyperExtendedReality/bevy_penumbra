@@ -39,7 +39,7 @@ use bevy::{
 };
 
 const CORNELL_CAMERA_EV100: f32 = 0.0;
-use bevy_penumbra::{
+use bevy_lux::{
     RadianceCascades, RadianceCascadesGeometry, RadianceCascadesPlugin, RadianceCascadesRawOutput,
 };
 
@@ -468,7 +468,7 @@ fn main() -> AppExit {
 
     app.add_plugins(RenderDiagnosticsPlugin);
     if benchmark {
-        app.add_plugins(bevy_penumbra::FrameTimingPlugin);
+        app.add_plugins(bevy_lux::FrameTimingPlugin);
         app.insert_resource(Benchmark {
             started_at: None,
             warmup_frames: number(&args, "--warmup-frames=", 300),

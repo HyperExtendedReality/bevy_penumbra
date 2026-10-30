@@ -28,7 +28,7 @@ use bevy::{
     window::ExitCondition,
     winit::WinitPlugin,
 };
-use bevy_penumbra::{
+use bevy_lux::{
     RadianceCascades, RadianceCascadesGeometry, RadianceCascadesPlugin, RadianceCascadesRawOutput,
 };
 use std::sync::{Arc, Mutex};

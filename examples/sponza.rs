@@ -1,11 +1,13 @@
 //! Local Sponza courtyard, curtains, ivy, and a controllable 24-hour sun.
 //! Brackets scrub time; Space animates; 1/2/3/4 select dawn/noon/dusk/night.
-//! G toggles GI. Right mouse + WASD/QE flies.
+//! G toggles GI; M cycles split radiance cascades / ray traced / PXTGI.
+//! B drops physics bodies, N blasts them, C clears them. Right mouse + WASD/QE flies.
 //! P captures; Escape exits.
 //! `--benchmark-windowed` measures normal rendering/presentation without draining
 //! the GPU each frame. Add `--benchmark-vsync` to request synchronized presentation.
 #![recursion_limit = "256"]
 
+use bevy::mesh::PrimitiveTopology;
 use bevy::{
     app::{AppExit, ScheduleRunnerPlugin},
     asset::{RenderAssetUsages, UntypedAssetLoadFailedEvent},
@@ -28,10 +30,14 @@ use bevy::{
     winit::WinitPlugin,
     world_serialization::{WorldInstanceReady, WorldInstanceSpawner},
 };
-use bevy_penumbra::{
-    FrameTimingPlugin, GiMethod, HardwareRayQueries, RadianceCascades, RadianceCascadesDispatch,
-    RadianceCascadesGeometry, RadianceCascadesPlugin, RadianceCascadesRawOutput,
-    RadianceCascadesRevisions, RadianceCascadesStatus, RayTracedSettings,
+use bevy_box3d::{
+    Box3dPlugin, Collider, ExternalImpulse, PhysicsMaterial, RigidBody, TriMesh, Velocity,
+};
+use bevy_lux::{
+    FrameTimingPlugin, GiMethod, HardwareRayQueries, PxtgiDebug, PxtgiReflections, PxtgiSettings,
+    RadianceCascades, RadianceCascadesDispatch, RadianceCascadesGeometry, RadianceCascadesPlugin,
+    RadianceCascadesRawOutput, RadianceCascadesRevisions, RadianceCascadesStatus,
+    RayTracedSettings,
 };
 use bevy_texture_cache::{TextureCachePlugin, TextureCacheStats};
 use std::{
@@ -111,7 +117,15 @@ const VIEW_GPU_BUDGET: u64 = 1024 * 1024 * 1024;
 const SPONZA_SPLIT_MAX_RECEIVER_CELLS: u32 = 32_768;
 const SPONZA_SPLIT_MAX_CACHE_ENTRIES: u32 = 262_144;
 const CAMERA_CURSOR_GRAB_TOGGLE_KEY: KeyCode = KeyCode::F12;
-const CONTROLS: &str = "[ / ] time | Space play | 1 dawn 2 noon 3 dusk 4 night | G GI | H hardware rays | RMB hold + WASD/QE fly | F12 cursor grab toggle | P screenshot";
+const CONTROLS: &str = "[ / ] time | Space play | 1 dawn 2 noon 3 dusk 4 night | G GI | M method | H hardware rays | B drop bodies | N blast | C clear bodies | RMB hold + WASD/QE fly | F12 cursor grab toggle | P screenshot";
+/// Where dropped bodies fall and blasts push from: the courtyard floor centre.
+const COURTYARD_CENTRE: Vec3 = Vec3::ZERO;
+const DROP_BODY_COUNT: u32 = 48;
+const DROP_HEIGHT: f32 = 6.0;
+/// Blast reach (metres), as the Godot physics playground's right-click blast.
+const BLAST_RADIUS: f32 = 8.0;
+/// Velocity change (m/s) a blast gives a body at the centre.
+const BLAST_SPEED: f32 = 14.0;
 
 #[derive(Resource)]
 struct Demo {
@@ -147,8 +161,13 @@ struct Demo {
     hardware_ray_queries: bool,
     /// Ray-traced sun shadows; `--shadow-maps` keeps Bevy's cascades.
     ray_traced_sun_shadows: bool,
-    /// `--rtgi`: ray-traced GI instead of Split Radiance Cascades.
-    ray_traced_gi: bool,
+    /// `--rtgi` / `--pxtgi` select ray-traced GI or PXTGI instead of Split Radiance Cascades.
+    method: GiMethod,
+    pxtgi: PxtgiSettings,
+    /// The Sponza scenes' static PXTGI colliders exist.
+    colliders_built: bool,
+    /// Physics requests from keys or the menu, applied by `physics_actions`.
+    physics_actions: Vec<PhysicsAction>,
     ray_traced: RayTracedSettings,
     resolution_divisor: u32,
     max_rays: u32,
@@ -346,7 +365,7 @@ fn main() -> AppExit {
     let mut cached_hit_sky = false;
     let mut hardware_ray_queries = true;
     let mut ray_traced_sun_shadows = true;
-    let mut ray_traced_gi = false;
+    let mut method = GiMethod::SplitRadianceCascades;
     let mut resolution_divisor = SPONZA_GRID_DIVISOR;
     let mut max_rays = SPONZA_UPDATE_BUDGET;
     let mut max_traversal_queries = SPONZA_TRAVERSAL_QUERY_BUDGET;
@@ -436,7 +455,9 @@ fn main() -> AppExit {
         } else if arg == "--shadow-maps" {
             ray_traced_sun_shadows = false;
         } else if arg == "--rtgi" {
-            ray_traced_gi = true;
+            method = GiMethod::RayTraced;
+        } else if arg == "--pxtgi" {
+            method = GiMethod::Pxtgi;
         } else if let Some(value) = arg.strip_prefix("--max-rays=") {
             max_rays = value.parse().expect("--max-rays requires an integer");
             assert!(
@@ -475,7 +496,7 @@ fn main() -> AppExit {
             // Parsed below once capture/benchmark mode is known.
         } else {
             panic!(
-                "Unknown argument {arg}; use --scene=path.gltf, --time=10, --max-rays=1024, --max-traversal-queries=131072, --resolution-divisor=8, --width=160, --height=120, --camera-pose-frame=88 with --capture-stability, --capture-prefix=path, --capture, --capture-motion, --capture-camera-motion, --capture-moving-sun, --capture-stability, --multi-bounce, --no-vsync, --benchmark, or --benchmark-offscreen-no-gi"
+                "Unknown argument {arg}; use --scene=path.gltf, --time=10, --max-rays=1024, --max-traversal-queries=131072, --resolution-divisor=8, --width=160, --height=120, --camera-pose-frame=88 with --capture-stability, --capture-prefix=path, --capture, --capture-motion, --capture-camera-motion, --capture-moving-sun, --capture-stability, --multi-bounce, --rtgi, --pxtgi, --no-vsync, --benchmark, or --benchmark-offscreen-no-gi"
             );
         }
     }
@@ -614,7 +635,14 @@ fn main() -> AppExit {
             hardware_ray_queries,
             ray_traced_sun_shadows,
             ray_traced: RayTracedSettings::default(),
-            ray_traced_gi,
+            method,
+            // As the Godot courtyard demo: two rays a texel.
+            pxtgi: PxtgiSettings {
+                rays_per_texel: 2,
+                ..default()
+            },
+            colliders_built: false,
+            physics_actions: Vec::new(),
             resolution_divisor,
             max_rays,
             max_traversal_queries,
@@ -652,6 +680,9 @@ fn main() -> AppExit {
             cache_dir: "tmp/texture-cache".into(),
             ..default()
         })
+        // PXTGI traces the scene's static colliders and the dropped bodies.
+        .add_plugins(Box3dPlugin)
+        .insert_resource(Time::<Fixed>::from_hz(60.0))
         .add_observer(scene_ready)
         .add_observer(on_menu_activate)
         .add_systems(Startup, setup)
@@ -661,6 +692,8 @@ fn main() -> AppExit {
                 prepare_scene,
                 fail_capture_on_gi_error,
                 controls,
+                build_sponza_colliders,
+                physics_actions,
                 update_debug_menu,
                 lighting,
                 capture_frame,
@@ -706,11 +739,8 @@ fn apply_sponza_profile(settings: &mut RadianceCascades, demo: &Demo) {
     settings.cached_hit_sky = demo.cached_hit_sky;
     settings.hardware_ray_queries = demo.hardware_ray_queries;
     settings.ray_traced_sun_shadows = demo.ray_traced_sun_shadows;
-    settings.method = if demo.ray_traced_gi {
-        GiMethod::RayTraced
-    } else {
-        GiMethod::SplitRadianceCascades
-    };
+    settings.method = demo.method;
+    settings.pxtgi = demo.pxtgi;
     settings.probe_spacing = SPONZA_PROBE_SPACING_METERS;
     settings.interval_length = SPONZA_INTERVAL_LENGTH_METERS;
     settings.emissive_samples = SPONZA_LIGHT_SAMPLES;
@@ -984,7 +1014,19 @@ fn setup(
                     demo.gi_frames = 0;
                     demo.gi_ready = false;
                 }
+                // Do not count frames toward a capture or benchmark until the
+                // requested GI method and sun-shadow path are the ones running,
+                // and PXTGI has the scene's colliders to trace. Ray-traced sun
+                // shadows come from the cascades' hardware scene, which PXTGI
+                // views don't build: they keep Bevy's shadow maps.
+                let requested_method_active = status.active_method()
+                    == Some(requested_method(&demo))
+                    && (demo.method != GiMethod::Pxtgi || demo.colliders_built)
+                    && (!demo.ray_traced_sun_shadows
+                        || demo.method == GiMethod::Pxtgi
+                        || status.ray_traced_sun_shadows());
                 demo.gi_frames = if dispatch.is_some()
+                    && requested_method_active
                     && eligible_pixels > 0
                     && support_ratio >= 0.95
                 {
@@ -1162,7 +1204,7 @@ fn setup(
                     required_frames
                 };
                 demo.gi_ready = gi_capture_ready(
-                    demo.loaded == demo.scenes.len(),
+                    demo.loaded == demo.scenes.len() && requested_method_active,
                     dispatch,
                     eligible_pixels,
                     support_ratio,
@@ -1307,6 +1349,218 @@ fn prepare_scene(
     }
 }
 
+/// Builds the Sponza scenes' static PXTGI colliders once, when PXTGI or the
+/// physics bodies first need them and every scene has loaded: one world-space
+/// triangle-mesh body per mesh primitive, carrying its material for PXTGI's colour.
+#[allow(clippy::type_complexity)]
+fn build_sponza_colliders(
+    mut demo: ResMut<Demo>,
+    mut commands: Commands,
+    meshes: Res<Assets<Mesh>>,
+    roots: Query<(), With<WorldAssetRoot>>,
+    parents: Query<&ChildOf>,
+    scene_meshes: Query<(
+        Entity,
+        &Mesh3d,
+        &GlobalTransform,
+        Option<&MeshMaterial3d<StandardMaterial>>,
+    )>,
+    bodies: Query<(), With<PhysicsBody>>,
+) {
+    let wanted = demo.method == GiMethod::Pxtgi || !bodies.is_empty();
+    if demo.colliders_built || !wanted || demo.loaded < demo.scenes.len() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut sources = Vec::new();
+    for (entity, mesh, transform, material) in &scene_meshes {
+        // Only the Sponza scenes: debug geometry and dropped bodies are top level.
+        if !parents
+            .iter_ancestors(entity)
+            .any(|ancestor| roots.contains(ancestor))
+        {
+            continue;
+        }
+        // Retry next frame while a primitive's mesh is still loading.
+        let Some(mesh) = meshes.get(&mesh.0) else {
+            return;
+        };
+        sources.push((mesh, transform, material));
+    }
+    let (mut built, mut skipped, mut triangles) = (0usize, 0usize, 0usize);
+    for (mesh, transform, material) in sources {
+        let Some((vertices, indices)) = world_triangles(mesh, transform) else {
+            skipped += 1;
+            continue;
+        };
+        let Some(collider) = TriMesh::new(&vertices, &indices) else {
+            skipped += 1;
+            continue;
+        };
+        triangles += indices.len();
+        let mut body = commands.spawn((
+            Name::new("Sponza collider"),
+            SponzaCollider,
+            RigidBody::Static,
+            Collider::TriMesh(collider),
+            Transform::IDENTITY,
+        ));
+        if let Some(material) = material {
+            body.insert(material.clone());
+        }
+        built += 1;
+    }
+    demo.colliders_built = true;
+    // Frames rendered before the colliders existed don't count toward a capture.
+    demo.gi_frames = 0;
+    demo.gi_ready = false;
+    info!(
+        "PXTGI colliders: {built} static triangle meshes ({triangles} triangles, {skipped} skipped) built in {:.1} ms",
+        started.elapsed().as_secs_f64() * 1_000.0
+    );
+}
+
+/// A triangle-list mesh's vertices in world space and its triangles, wound
+/// counter-clockwise; `None` for other topologies or meshes without positions.
+fn world_triangles(mesh: &Mesh, transform: &GlobalTransform) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
+    if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
+        return None;
+    }
+    let positions = mesh
+        .try_attribute(Mesh::ATTRIBUTE_POSITION)
+        .ok()?
+        .as_float3()?;
+    let affine = transform.affine();
+    let vertices: Vec<Vec3> = positions
+        .iter()
+        .map(|&position| affine.transform_point3(position.into()))
+        .collect();
+    // A mirrored transform flips the winding; swap two corners to restore it.
+    let mirrored = affine.matrix3.determinant() < 0.0;
+    let triangle = |a: u32, b: u32, c: u32| if mirrored { [a, c, b] } else { [a, b, c] };
+    let triangles = match mesh.indices() {
+        Some(indices) => {
+            let mut indices = indices.iter().map(|index| index as u32);
+            std::iter::from_fn(|| Some(triangle(indices.next()?, indices.next()?, indices.next()?)))
+                .collect()
+        }
+        None => (0..vertices.len() as u32 / 3)
+            .map(|t| triangle(3 * t, 3 * t + 1, 3 * t + 2))
+            .collect(),
+    };
+    Some((vertices, triangles))
+}
+
+/// A deterministic value in [-1, 1) for `seed`.
+fn jitter(seed: u32) -> f32 {
+    let mut x = seed.wrapping_mul(0x9E37_79B9) ^ 0x85EB_CA6B;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846C_A68B);
+    x ^= x >> 16;
+    (x >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+}
+
+/// Applies queued physics requests: drop bodies over the courtyard, blast them
+/// away from its centre, or clear them, as the Godot physics playground.
+fn physics_actions(
+    mut demo: ResMut<Demo>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    bodies: Query<(Entity, &Transform, &PhysicsBody)>,
+) {
+    let density = PhysicsMaterial::default().density;
+    for action in std::mem::take(&mut demo.physics_actions) {
+        match action {
+            PhysicsAction::Drop => {
+                for i in 0..DROP_BODY_COUNT {
+                    // Two layers of an 8 x 3 grid, jittered so stacks topple.
+                    let (column, row, layer) = (i % 8, (i / 8) % 3, i / 24);
+                    let position = COURTYARD_CENTRE
+                        + Vec3::new(
+                            (column as f32 - 3.5) * 1.2 + jitter(4 * i) * 0.1,
+                            DROP_HEIGHT + layer as f32 * 1.2,
+                            (row as f32 - 1.0) * 1.2 + jitter(4 * i + 1) * 0.1,
+                        );
+                    // Half extent or radius, 0.25 to 0.5 m.
+                    let size = 0.375 + 0.125 * jitter(4 * i + 2);
+                    let color = Color::hsv((i as f32 * 0.618_034).fract() * 360.0, 0.85, 0.9);
+                    // Every eighth body glows and lights the courtyard.
+                    let emissive = if i % 8 == 0 {
+                        let linear = LinearRgba::from(color);
+                        LinearRgba::rgb(linear.red * 30.0, linear.green * 30.0, linear.blue * 30.0)
+                    } else {
+                        LinearRgba::BLACK
+                    };
+                    let material = materials.add(StandardMaterial {
+                        base_color: color,
+                        emissive,
+                        perceptual_roughness: 0.6,
+                        ..default()
+                    });
+                    let (mesh, collider, volume) = if i % 2 == 0 {
+                        (
+                            meshes.add(Sphere::new(size)),
+                            Collider::Sphere { radius: size },
+                            4.0 / 3.0 * std::f32::consts::PI * size.powi(3),
+                        )
+                    } else {
+                        (
+                            meshes.add(Cuboid::from_size(Vec3::splat(2.0 * size))),
+                            Collider::Cuboid {
+                                half_extents: Vec3::splat(size),
+                            },
+                            (2.0 * size).powi(3),
+                        )
+                    };
+                    let rotation = Quat::from_euler(
+                        EulerRot::XYZ,
+                        jitter(4 * i + 3) * std::f32::consts::PI,
+                        jitter(4 * i + 5) * std::f32::consts::PI,
+                        0.0,
+                    );
+                    commands.spawn((
+                        Name::new("Physics body"),
+                        PhysicsBody {
+                            mass: density * volume,
+                        },
+                        RigidBody::Dynamic,
+                        collider,
+                        Velocity::default(),
+                        Mesh3d(mesh),
+                        MeshMaterial3d(material),
+                        Transform::from_translation(position).with_rotation(rotation),
+                        RadianceCascadesGeometry,
+                    ));
+                }
+            }
+            PhysicsAction::Blast => {
+                for (entity, transform, body) in &bodies {
+                    let offset = transform.translation - COURTYARD_CENTRE;
+                    let distance = offset.length();
+                    if distance >= BLAST_RADIUS {
+                        continue;
+                    }
+                    let away = Vec3::new(offset.x, 0.0, offset.z).normalize_or(Vec3::X);
+                    let direction = (away + Vec3::Y).normalize();
+                    let speed = BLAST_SPEED * (1.0 - distance / BLAST_RADIUS);
+                    commands.entity(entity).try_insert(ExternalImpulse {
+                        linear: direction * speed * body.mass,
+                        angular: Vec3::ZERO,
+                    });
+                }
+            }
+            PhysicsAction::Clear => {
+                for (entity, _, _) in &bodies {
+                    commands.entity(entity).try_despawn();
+                }
+            }
+        }
+    }
+}
+
 fn sun_direction(hour: f32) -> Vec3 {
     let angle = (hour.rem_euclid(24.0) - 6.0) * std::f32::consts::TAU / 24.0;
     Vec3::new(angle.cos(), 0.9 * angle.sin(), 0.4 * angle.sin()).normalize()
@@ -1376,7 +1630,20 @@ fn controls(
         demo.hardware_ray_queries = !demo.hardware_ray_queries;
     }
     if keys.just_pressed(KeyCode::KeyM) {
-        demo.ray_traced_gi = !demo.ray_traced_gi;
+        demo.method = match demo.method {
+            GiMethod::SplitRadianceCascades => GiMethod::RayTraced,
+            GiMethod::RayTraced => GiMethod::Pxtgi,
+            GiMethod::Pxtgi => GiMethod::SplitRadianceCascades,
+        };
+    }
+    for (key, action) in [
+        (KeyCode::KeyB, PhysicsAction::Drop),
+        (KeyCode::KeyN, PhysicsAction::Blast),
+        (KeyCode::KeyC, PhysicsAction::Clear),
+    ] {
+        if keys.just_pressed(key) {
+            demo.physics_actions.push(action);
+        }
     }
     if keys.just_pressed(KeyCode::F1) {
         for mut visibility in &mut menus {
@@ -1387,18 +1654,17 @@ fn controls(
             };
         }
     }
-    let method = if demo.ray_traced_gi {
-        GiMethod::RayTraced
-    } else {
-        GiMethod::SplitRadianceCascades
-    };
     for mut gi in &mut cameras {
         // Change detection: only write settings that differ.
         if gi.hardware_ray_queries != demo.hardware_ray_queries {
             gi.hardware_ray_queries = demo.hardware_ray_queries;
         }
-        if gi.method != method {
-            gi.method = method;
+        if gi.method != demo.method {
+            gi.method = demo.method;
+        }
+        // PXTGI settings take effect without resetting history.
+        if gi.pxtgi != demo.pxtgi {
+            gi.pxtgi = demo.pxtgi;
         }
         if gi.ray_traced_sun_shadows != demo.ray_traced_sun_shadows {
             gi.ray_traced_sun_shadows = demo.ray_traced_sun_shadows;
@@ -1408,7 +1674,9 @@ fn controls(
         }
         if gi.multi_bounce != demo.multi_bounce {
             gi.multi_bounce = demo.multi_bounce;
-            gi.cached_hit_sky = demo.multi_bounce && demo.cached_hit_sky;
+        }
+        if gi.cached_hit_sky != demo.cached_hit_sky {
+            gi.cached_hit_sky = demo.cached_hit_sky;
         }
         if keys.just_pressed(KeyCode::KeyG) {
             gi.intensity = if gi.intensity > 0.0 { 0.0 } else { 1.0 };
@@ -1420,13 +1688,22 @@ fn controls(
     }
 }
 
-/// In-window debug menu: live status, GPU pass timings and GI controls. F1 hides it.
+/// In-window debug menu, F1 hides it: live status, a method selector with
+/// only the selected method's controls, lighting, time of day and GPU pass
+/// timings.
 #[derive(Component)]
 struct DebugMenu;
 
-/// The menu's live status text.
+/// A live text block of the menu.
+#[derive(Component, Clone, Copy, PartialEq)]
+enum DebugMenuText {
+    Status,
+    Timings,
+}
+
+/// Controls that belong to one GI method, shown only while it is selected.
 #[derive(Component)]
-struct DebugMenuStatus;
+struct MethodSection(GiMethod);
 
 /// A menu button and the setting it changes.
 #[derive(Component, Clone, Copy, PartialEq)]
@@ -1434,62 +1711,161 @@ enum MenuAction {
     ToggleGi,
     Method(GiMethod),
     HardwareRays,
-    MultiBounce,
+    SecondaryCache,
+    CachedHitSky,
     RtMultiBounce,
     RtSpatialSamples,
     RtHistory,
+    PxRays,
+    PxMultiBounce,
+    PxReflections,
+    PxRoughness,
+    PxDebug,
+    DropBodies,
+    Blast,
+    ClearBodies,
     SunShadows,
     Hour(f32),
     Play,
 }
 
-const MENU_BACKGROUND: Color = Color::srgba(0.02, 0.02, 0.02, 0.82);
+/// A physics request from a key or the menu, applied by `physics_actions`.
+#[derive(Clone, Copy, PartialEq)]
+enum PhysicsAction {
+    Drop,
+    Blast,
+    Clear,
+}
+
+/// A static collider built from one Sponza mesh primitive for PXTGI.
+#[derive(Component)]
+struct SponzaCollider;
+
+/// A dropped dynamic body and its mass (kg), to scale blast impulses.
+#[derive(Component)]
+struct PhysicsBody {
+    mass: f32,
+}
+
+const PXTGI_REFLECTIONS: [(PxtgiReflections, &str); 4] = [
+    (PxtgiReflections::Off, "Off"),
+    (PxtgiReflections::ScreenSpace, "Screen space"),
+    (PxtgiReflections::Traced, "Traced"),
+    (PxtgiReflections::TracedAndProbes, "Traced + probes"),
+];
+
+const PXTGI_DEBUG_VIEWS: [(PxtgiDebug, &str); 8] = [
+    (PxtgiDebug::Off, "Lit scene"),
+    (PxtgiDebug::LastFrame, "Last frame"),
+    (PxtgiDebug::RoundTrip, "Reprojection error"),
+    (PxtgiDebug::WorldOnly, "Colliders only"),
+    (PxtgiDebug::WorldHits, "Collider hits"),
+    (PxtgiDebug::WorldPosition, "World position"),
+    (PxtgiDebug::BounceLight, "Bounce light"),
+    (PxtgiDebug::Reflections, "Reflections"),
+];
+
+/// The display name of `value` in a `(value, name)` table.
+fn option_name<T: PartialEq>(value: T, options: &[(T, &'static str)]) -> &'static str {
+    options
+        .iter()
+        .find(|(option, _)| *option == value)
+        .map_or("?", |&(_, name)| name)
+}
+
+const MENU_BACKGROUND: Color = Color::srgba(0.02, 0.02, 0.02, 0.85);
+const MENU_SECTION: Color = Color::srgba(1.0, 1.0, 1.0, 0.04);
+const MENU_HEADER: Color = Color::srgb(0.55, 0.75, 1.0);
+const MENU_MUTED: Color = Color::srgb(0.68, 0.68, 0.72);
 const MENU_BUTTON: Color = Color::srgb(0.16, 0.16, 0.18);
 const MENU_BUTTON_HOVER: Color = Color::srgb(0.26, 0.26, 0.30);
 const MENU_BUTTON_ACTIVE: Color = Color::srgb(0.18, 0.34, 0.52);
 
-fn spawn_debug_menu(commands: &mut Commands) {
-    let text = |value: &str, size: f32| {
-        (
-            Text::new(value),
-            TextFont {
-                font_size: FontSize::Px(size),
-                ..default()
-            },
-            TextColor(Color::WHITE),
-        )
-    };
-    let row = || Node {
-        flex_direction: FlexDirection::Row,
-        flex_wrap: FlexWrap::Wrap,
-        align_items: AlignItems::Center,
-        column_gap: Val::Px(4.0),
-        ..default()
-    };
-    let rows: [(&str, &[MenuAction]); 6] = [
-        ("GI", &[MenuAction::ToggleGi]),
-        (
-            "Method",
-            &[
-                MenuAction::Method(GiMethod::SplitRadianceCascades),
-                MenuAction::Method(GiMethod::RayTraced),
-            ],
-        ),
-        (
-            "Split",
-            &[MenuAction::HardwareRays, MenuAction::MultiBounce],
-        ),
-        (
-            "Ray traced",
-            &[
-                MenuAction::RtMultiBounce,
-                MenuAction::RtSpatialSamples,
-                MenuAction::RtHistory,
-            ],
-        ),
-        ("Lighting", &[MenuAction::SunShadows]),
-        (
-            "Time",
+fn method_name(method: GiMethod) -> &'static str {
+    match method {
+        GiMethod::SplitRadianceCascades => "Split radiance cascades",
+        GiMethod::RayTraced => "Ray traced (idTech 8 / GI-1.2)",
+        GiMethod::Pxtgi => "PXTGI (physics colliders)",
+    }
+}
+
+fn requested_method(demo: &Demo) -> GiMethod {
+    demo.method
+}
+
+/// One menu section: its title, the method it belongs to (shown only while
+/// that method is selected), and labelled rows of buttons.
+type MenuSection = (
+    &'static str,
+    Option<GiMethod>,
+    &'static [(&'static str, &'static [MenuAction])],
+);
+
+const MENU_SECTIONS: [MenuSection; 6] = [
+    (
+        "Global illumination",
+        None,
+        &[
+            ("", &[MenuAction::ToggleGi]),
+            (
+                "Method",
+                &[
+                    MenuAction::Method(GiMethod::SplitRadianceCascades),
+                    MenuAction::Method(GiMethod::RayTraced),
+                    MenuAction::Method(GiMethod::Pxtgi),
+                ],
+            ),
+        ],
+    ),
+    (
+        "Split radiance cascades",
+        Some(GiMethod::SplitRadianceCascades),
+        &[
+            ("Traversal", &[MenuAction::HardwareRays]),
+            (
+                "Bounces",
+                &[MenuAction::SecondaryCache, MenuAction::CachedHitSky],
+            ),
+        ],
+    ),
+    (
+        "Ray traced (idTech 8 / GI-1.2)",
+        Some(GiMethod::RayTraced),
+        &[
+            ("Bounces", &[MenuAction::RtMultiBounce]),
+            (
+                "ReSTIR",
+                &[MenuAction::RtSpatialSamples, MenuAction::RtHistory],
+            ),
+        ],
+    ),
+    (
+        "PXTGI (physics colliders)",
+        Some(GiMethod::Pxtgi),
+        &[
+            ("Rays", &[MenuAction::PxRays]),
+            ("Bounces", &[MenuAction::PxMultiBounce]),
+            (
+                "Reflections",
+                &[MenuAction::PxReflections, MenuAction::PxRoughness],
+            ),
+            ("Debug view", &[MenuAction::PxDebug]),
+            (
+                "Physics",
+                &[
+                    MenuAction::DropBodies,
+                    MenuAction::Blast,
+                    MenuAction::ClearBodies,
+                ],
+            ),
+        ],
+    ),
+    ("Lighting", None, &[("Sun", &[MenuAction::SunShadows])]),
+    (
+        "Time of day",
+        None,
+        &[(
+            "",
             &[
                 MenuAction::Hour(6.0),
                 MenuAction::Hour(12.0),
@@ -1497,8 +1873,39 @@ fn spawn_debug_menu(commands: &mut Commands) {
                 MenuAction::Hour(0.0),
                 MenuAction::Play,
             ],
-        ),
-    ];
+        )],
+    ),
+];
+
+fn menu_text(value: &str, size: f32, color: Color) -> impl Bundle {
+    (
+        Text::new(value),
+        TextFont {
+            font_size: FontSize::Px(size),
+            ..default()
+        },
+        TextColor(color),
+    )
+}
+
+fn menu_section_node() -> Node {
+    Node {
+        flex_direction: FlexDirection::Column,
+        padding: UiRect::all(Val::Px(6.0)),
+        row_gap: Val::Px(4.0),
+        ..default()
+    }
+}
+
+fn spawn_debug_menu(commands: &mut Commands) {
+    let row = || Node {
+        flex_direction: FlexDirection::Row,
+        flex_wrap: FlexWrap::Wrap,
+        align_items: AlignItems::Center,
+        column_gap: Val::Px(4.0),
+        row_gap: Val::Px(4.0),
+        ..default()
+    };
     commands
         .spawn((
             DebugMenu,
@@ -1506,8 +1913,8 @@ fn spawn_debug_menu(commands: &mut Commands) {
                 position_type: PositionType::Absolute,
                 top: Val::Px(12.0),
                 left: Val::Px(12.0),
-                max_width: Val::Px(460.0),
-                padding: UiRect::all(Val::Px(10.0)),
+                width: Val::Px(470.0),
+                padding: UiRect::all(Val::Px(8.0)),
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(6.0),
                 ..default()
@@ -1515,34 +1922,51 @@ fn spawn_debug_menu(commands: &mut Commands) {
             BackgroundColor(MENU_BACKGROUND),
         ))
         .with_children(|menu| {
-            menu.spawn((DebugMenuStatus, text("", 14.0)));
-            for (label, actions) in rows {
-                menu.spawn(row()).with_children(|row| {
-                    row.spawn((
-                        text(label, 13.0),
-                        Node {
-                            width: Val::Px(70.0),
-                            ..default()
-                        },
-                    ));
-                    for &action in actions {
-                        row.spawn((
-                            bevy::ui_widgets::Button,
-                            bevy::picking::hover::Hovered::default(),
-                            action,
-                            Node {
-                                padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
-                                ..default()
-                            },
-                            BackgroundColor(MENU_BUTTON),
-                        ))
-                        .with_child(text("", 13.0));
+            menu.spawn((DebugMenuText::Status, menu_text("", 14.0, Color::WHITE)));
+            for (title, method, rows) in MENU_SECTIONS {
+                let mut section = menu.spawn((menu_section_node(), BackgroundColor(MENU_SECTION)));
+                if let Some(method) = method {
+                    section.insert(MethodSection(method));
+                }
+                section.with_children(|section| {
+                    section.spawn(menu_text(title, 13.0, MENU_HEADER));
+                    for &(label, actions) in rows {
+                        section.spawn(row()).with_children(|row| {
+                            if !label.is_empty() {
+                                row.spawn((
+                                    menu_text(label, 12.0, MENU_MUTED),
+                                    Node {
+                                        width: Val::Px(70.0),
+                                        ..default()
+                                    },
+                                ));
+                            }
+                            for &action in actions {
+                                row.spawn((
+                                    bevy::ui_widgets::Button,
+                                    bevy::picking::hover::Hovered::default(),
+                                    action,
+                                    Node {
+                                        padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(MENU_BUTTON),
+                                ))
+                                .with_child(menu_text("", 13.0, Color::WHITE));
+                            }
+                        });
                     }
                 });
             }
-            menu.spawn(text(
-                "F1 menu | M method | G GI | H hardware rays | [ ] time | Space play\nRMB + WASD/QE fly | F12 cursor grab | P screenshot",
+            menu.spawn((menu_section_node(), BackgroundColor(MENU_SECTION)))
+                .with_children(|section| {
+                    section.spawn(menu_text("GPU passes (ms)", 13.0, MENU_HEADER));
+                    section.spawn((DebugMenuText::Timings, menu_text("", 12.0, Color::WHITE)));
+                });
+            menu.spawn(menu_text(
+                "F1 menu | M method | G GI | H hardware rays\n[ ] time | Space play | 1-4 dawn/noon/dusk/night\nB drop bodies | N blast | C clear bodies\nRMB + WASD/QE fly | F12 cursor grab | P screenshot",
                 12.0,
+                MENU_MUTED,
             ));
         });
 }
@@ -1553,17 +1977,46 @@ fn menu_label(action: MenuAction, demo: &Demo, gi_on: bool) -> String {
         MenuAction::ToggleGi => format!("GI: {}", on(gi_on)),
         MenuAction::Method(GiMethod::SplitRadianceCascades) => "Split radiance cascades".into(),
         MenuAction::Method(GiMethod::RayTraced) => "Ray traced".into(),
+        MenuAction::Method(GiMethod::Pxtgi) => "PXTGI".into(),
         MenuAction::HardwareRays => format!("Hardware rays: {}", on(demo.hardware_ray_queries)),
-        MenuAction::MultiBounce => format!("Multi-bounce: {}", on(demo.multi_bounce)),
+        MenuAction::SecondaryCache => format!("Secondary cache: {}", on(demo.multi_bounce)),
+        MenuAction::CachedHitSky => format!(
+            "Cached hit sky: {}{}",
+            on(demo.cached_hit_sky),
+            if demo.cached_hit_sky && !demo.multi_bounce {
+                " (needs cache)"
+            } else {
+                ""
+            }
+        ),
         MenuAction::RtMultiBounce => {
             format!("Multi-bounce: {}", on(demo.ray_traced.multi_bounce))
         }
         MenuAction::RtSpatialSamples => {
             format!("Spatial samples: {}", demo.ray_traced.spatial_samples)
         }
-        MenuAction::RtHistory => format!("History: {}", demo.ray_traced.reservoir_history),
+        MenuAction::RtHistory => {
+            format!("Reservoir history: {}", demo.ray_traced.reservoir_history)
+        }
+        MenuAction::PxRays => format!("{} per texel", demo.pxtgi.rays_per_texel),
+        MenuAction::PxMultiBounce => format!("Multi-bounce: {}", on(demo.pxtgi.multi_bounce)),
+        MenuAction::PxReflections => format!(
+            "Reflections: {}",
+            option_name(demo.pxtgi.reflections, &PXTGI_REFLECTIONS)
+        ),
+        MenuAction::PxRoughness => format!(
+            "Roughness cutoff: {:.2}",
+            demo.pxtgi.reflection_roughness_cutoff
+        ),
+        MenuAction::PxDebug => format!(
+            "View: {}",
+            option_name(demo.pxtgi.debug, &PXTGI_DEBUG_VIEWS)
+        ),
+        MenuAction::DropBodies => format!("Drop {DROP_BODY_COUNT} bodies"),
+        MenuAction::Blast => "Blast".into(),
+        MenuAction::ClearBodies => "Clear bodies".into(),
         MenuAction::SunShadows => format!(
-            "Sun shadows: {}",
+            "Shadows: {}",
             if demo.ray_traced_sun_shadows {
                 "ray traced"
             } else {
@@ -1581,16 +2034,33 @@ fn menu_label(action: MenuAction, demo: &Demo, gi_on: bool) -> String {
     }
 }
 
-fn menu_selected(action: MenuAction, demo: &Demo) -> bool {
+/// Highlighted buttons: the selected method and hour, and enabled toggles.
+fn menu_selected(action: MenuAction, demo: &Demo, gi_on: bool) -> bool {
     match action {
-        MenuAction::Method(method) => (method == GiMethod::RayTraced) == demo.ray_traced_gi,
+        MenuAction::ToggleGi => gi_on,
+        MenuAction::Method(method) => method == requested_method(demo),
+        MenuAction::HardwareRays => demo.hardware_ray_queries,
+        MenuAction::SecondaryCache => demo.multi_bounce,
+        MenuAction::CachedHitSky => demo.cached_hit_sky && demo.multi_bounce,
+        MenuAction::RtMultiBounce => demo.ray_traced.multi_bounce,
+        MenuAction::SunShadows => demo.ray_traced_sun_shadows,
         MenuAction::Hour(hour) => (demo.hour - hour).abs() < 0.01,
-        _ => false,
+        MenuAction::Play => demo.playing,
+        MenuAction::PxMultiBounce => demo.pxtgi.multi_bounce,
+        MenuAction::PxReflections => demo.pxtgi.reflections != PxtgiReflections::Off,
+        MenuAction::PxDebug => demo.pxtgi.debug != PxtgiDebug::Off,
+        MenuAction::RtSpatialSamples
+        | MenuAction::RtHistory
+        | MenuAction::PxRays
+        | MenuAction::PxRoughness
+        | MenuAction::DropBodies
+        | MenuAction::Blast
+        | MenuAction::ClearBodies => false,
     }
 }
 
 /// The step after `value` in `steps`, wrapping; the first step when `value` is not one.
-fn next_step(value: u32, steps: &[u32]) -> u32 {
+fn next_step<T: Copy + PartialEq>(value: T, steps: &[T]) -> T {
     let index = steps.iter().position(|&step| step == value);
     steps[index.map_or(0, |index| (index + 1) % steps.len())]
 }
@@ -1605,49 +2075,70 @@ fn on_menu_activate(
     let Ok(action) = actions.get(activate.entity) else {
         return;
     };
-    {
-        match *action {
-            MenuAction::ToggleGi => {
-                for mut gi in &mut cameras {
-                    gi.intensity = if gi.intensity > 0.0 { 0.0 } else { 1.0 };
-                    gi.reset_history();
-                }
+    match *action {
+        MenuAction::ToggleGi => {
+            for mut gi in &mut cameras {
+                gi.intensity = if gi.intensity > 0.0 { 0.0 } else { 1.0 };
+                gi.reset_history();
             }
-            MenuAction::Method(method) => demo.ray_traced_gi = method == GiMethod::RayTraced,
-            MenuAction::HardwareRays => demo.hardware_ray_queries = !demo.hardware_ray_queries,
-            MenuAction::MultiBounce => demo.multi_bounce = !demo.multi_bounce,
-            MenuAction::RtMultiBounce => {
-                demo.ray_traced.multi_bounce = !demo.ray_traced.multi_bounce;
-            }
-            MenuAction::RtSpatialSamples => {
-                demo.ray_traced.spatial_samples =
-                    next_step(demo.ray_traced.spatial_samples, &[0, 2, 4, 8]);
-            }
-            MenuAction::RtHistory => {
-                demo.ray_traced.reservoir_history =
-                    next_step(demo.ray_traced.reservoir_history, &[5, 10, 20, 40]);
-            }
-            MenuAction::SunShadows => demo.ray_traced_sun_shadows = !demo.ray_traced_sun_shadows,
-            MenuAction::Hour(hour) => {
-                demo.hour = hour;
-                for mut gi in &mut cameras {
-                    gi.reset_history();
-                }
-            }
-            MenuAction::Play => demo.playing = !demo.playing,
         }
+        MenuAction::Method(method) => demo.method = method,
+        MenuAction::PxRays => {
+            demo.pxtgi.rays_per_texel = next_step(demo.pxtgi.rays_per_texel, &[1, 2, 4]);
+        }
+        MenuAction::PxMultiBounce => demo.pxtgi.multi_bounce = !demo.pxtgi.multi_bounce,
+        MenuAction::PxReflections => {
+            demo.pxtgi.reflections = next_step(
+                demo.pxtgi.reflections,
+                &PXTGI_REFLECTIONS.map(|(value, _)| value),
+            );
+        }
+        MenuAction::PxRoughness => {
+            demo.pxtgi.reflection_roughness_cutoff =
+                next_step(demo.pxtgi.reflection_roughness_cutoff, &[0.25, 0.5, 0.75]);
+        }
+        MenuAction::PxDebug => {
+            demo.pxtgi.debug =
+                next_step(demo.pxtgi.debug, &PXTGI_DEBUG_VIEWS.map(|(value, _)| value));
+        }
+        MenuAction::DropBodies => demo.physics_actions.push(PhysicsAction::Drop),
+        MenuAction::Blast => demo.physics_actions.push(PhysicsAction::Blast),
+        MenuAction::ClearBodies => demo.physics_actions.push(PhysicsAction::Clear),
+        MenuAction::HardwareRays => demo.hardware_ray_queries = !demo.hardware_ray_queries,
+        MenuAction::SecondaryCache => demo.multi_bounce = !demo.multi_bounce,
+        MenuAction::CachedHitSky => demo.cached_hit_sky = !demo.cached_hit_sky,
+        MenuAction::RtMultiBounce => {
+            demo.ray_traced.multi_bounce = !demo.ray_traced.multi_bounce;
+        }
+        MenuAction::RtSpatialSamples => {
+            demo.ray_traced.spatial_samples =
+                next_step(demo.ray_traced.spatial_samples, &[0, 2, 4, 8]);
+        }
+        MenuAction::RtHistory => {
+            demo.ray_traced.reservoir_history =
+                next_step(demo.ray_traced.reservoir_history, &[5, 10, 20, 40]);
+        }
+        MenuAction::SunShadows => demo.ray_traced_sun_shadows = !demo.ray_traced_sun_shadows,
+        MenuAction::Hour(hour) => {
+            demo.hour = hour;
+            for mut gi in &mut cameras {
+                gi.reset_history();
+            }
+        }
+        MenuAction::Play => demo.playing = !demo.playing,
     }
 }
 
-/// Refreshes button labels every frame and the status text four times a second.
-#[allow(clippy::too_many_arguments)]
+/// Refreshes buttons and section visibility every frame and the status and
+/// timing text four times a second.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_debug_menu(
     time: Res<Time<Real>>,
     demo: Res<Demo>,
     status: Res<RadianceCascadesStatus>,
     diagnostics: Res<DiagnosticsStore>,
     cameras: Query<&RadianceCascades>,
-    mut status_text: Query<&mut Text, With<DebugMenuStatus>>,
+    mut sections: Query<(&MethodSection, &mut Node)>,
     mut buttons: Query<(
         &MenuAction,
         Has<bevy::ui::Pressed>,
@@ -1655,21 +2146,37 @@ fn update_debug_menu(
         &mut BackgroundColor,
         &Children,
     )>,
-    mut labels: Query<&mut Text, Without<DebugMenuStatus>>,
+    mut texts: Query<(&mut Text, Option<&DebugMenuText>)>,
+    static_colliders: Query<(), With<SponzaCollider>>,
+    bodies: Query<(), With<PhysicsBody>>,
     mut refreshed: Local<f64>,
 ) {
     let gi_on = cameras.iter().any(|gi| gi.intensity > 0.0);
+    let requested = requested_method(&demo);
+    for (section, mut node) in &mut sections {
+        let display = if section.0 == requested {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != display {
+            node.display = display;
+        }
+    }
     for (action, pressed, hovered, mut background, children) in &mut buttons {
-        background.0 = if pressed || menu_selected(*action, &demo) {
+        let color = if pressed || menu_selected(*action, &demo, gi_on) {
             MENU_BUTTON_ACTIVE
         } else if hovered.0 {
             MENU_BUTTON_HOVER
         } else {
             MENU_BUTTON
         };
+        if background.0 != color {
+            background.0 = color;
+        }
         let label = menu_label(*action, &demo, gi_on);
         for child in children.iter() {
-            if let Ok(mut text) = labels.get_mut(child)
+            if let Ok((mut text, None)) = texts.get_mut(child)
                 && text.0 != label
             {
                 text.0 = label.clone();
@@ -1690,30 +2197,62 @@ fn update_debug_menu(
             .and_then(|d| d.smoothed())
     };
     let ms = |value: Option<f64>| value.map_or("-".into(), |value| format!("{value:.2}"));
-    let method_name = |method: GiMethod| match method {
-        GiMethod::SplitRadianceCascades => "split cascades",
-        GiMethod::RayTraced => "ray traced",
-    };
-    let requested = if demo.ray_traced_gi {
-        GiMethod::RayTraced
+    let state = if !gi_on {
+        "off"
+    } else if status.active_method() == Some(requested) {
+        "running"
     } else {
-        GiMethod::SplitRadianceCascades
+        "starting; native lighting until ready"
     };
-    let traversal = match status.hardware_ray_queries() {
-        HardwareRayQueries::Active => "hardware",
-        HardwareRayQueries::Inactive if demo.hardware_ray_queries => "software (hardware pending)",
-        HardwareRayQueries::Inactive => "software",
-        HardwareRayQueries::Unsupported => "software (no hardware support)",
+    let traversal = match (requested, status.hardware_ray_queries()) {
+        (GiMethod::Pxtgi, _) => format!(
+            "screen + colliders ({} static, {} dynamic)",
+            static_colliders.iter().len(),
+            bodies.iter().len()
+        ),
+        (GiMethod::RayTraced, HardwareRayQueries::Unsupported) => {
+            "hardware (unsupported device)".into()
+        }
+        (GiMethod::RayTraced, _) => "hardware".into(),
+        (_, HardwareRayQueries::Active) => "hardware".into(),
+        (_, HardwareRayQueries::Inactive) if demo.hardware_ray_queries => {
+            "software (hardware pending)".into()
+        }
+        (_, HardwareRayQueries::Inactive) => "software".into(),
+        (_, HardwareRayQueries::Unsupported) => "software (no hardware support)".into(),
     };
+    let shadows = match (demo.ray_traced_sun_shadows, status.ray_traced_sun_shadows()) {
+        (_, true) => "ray traced",
+        (true, false) => "shadow maps (ray traced pending)",
+        (false, false) => "shadow maps",
+    };
+    let fps = smoothed(&FrameTimeDiagnosticsPlugin::FPS).unwrap_or(0.0);
+    let frame_ms = smoothed(&FrameTimeDiagnosticsPlugin::FRAME_TIME).unwrap_or(0.0);
+    let mut status_text = format!(
+        "{fps:.1} FPS  {frame_ms:.2} ms   {:02}:{:02} {}\n\
+         {}: {state}\n\
+         Rays: {traversal}   Sun shadows: {shadows}",
+        demo.hour as u32,
+        ((demo.hour.fract() * 60.0) as u32).min(59),
+        if demo.playing { "playing" } else { "paused" },
+        method_name(requested),
+    );
+    if let Some(failure) = status.failures().last() {
+        status_text.push_str("\nError: ");
+        status_text.push_str(failure.lines().next().unwrap_or_default());
+    }
     let mut passes: Vec<(String, f64)> = diagnostics
         .iter()
         .filter_map(|d| {
-            let name = d
-                .path()
-                .as_str()
-                .strip_prefix("render/split_rc/")?
+            let path = d.path().as_str();
+            let name = path
+                .strip_prefix("render/split_rc/")
+                .or_else(|| path.strip_prefix("render/pxtgi/"))?
                 .strip_suffix("/elapsed_gpu")?;
             (name != "elapsed_gpu").then_some(())?;
+            // Passes of the other method keep their last timing; skip them.
+            d.measurement()
+                .filter(|m| m.time.elapsed() < std::time::Duration::from_secs(1))?;
             Some((name.to_owned(), d.smoothed()?))
         })
         .collect();
@@ -1724,32 +2263,25 @@ fn update_debug_menu(
         .map(|(name, value)| format!("{name} {value:.2}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let fps = smoothed(&FrameTimeDiagnosticsPlugin::FPS).unwrap_or(0.0);
-    let frame_ms = smoothed(&FrameTimeDiagnosticsPlugin::FRAME_TIME).unwrap_or(0.0);
-    let text = format!(
-        "{fps:.1} FPS  {frame_ms:.2} ms   {:02}:{:02} {}\n\
-         GI: {} (running {}) | rays: {traversal}\n\
-         Sun shadows: {}\n\
-         GPU ms  GI {} | sun {} | prepass {} | receivers {}\n\
-         {top}",
-        demo.hour as u32,
-        ((demo.hour.fract() * 60.0) as u32).min(59),
-        if demo.playing { "playing" } else { "paused" },
-        method_name(requested),
-        status.active_method().map_or("-", method_name),
-        if status.ray_traced_sun_shadows() {
-            "ray traced"
+    let timings = format!(
+        "GI {} | sun shadows {} | prepass {} | receivers {}\n{top}",
+        ms(gpu(if requested == GiMethod::Pxtgi {
+            "render/pxtgi/elapsed_gpu"
         } else {
-            "shadow maps"
-        },
-        ms(gpu("render/split_rc/elapsed_gpu")),
+            "render/split_rc/elapsed_gpu"
+        })),
         ms(gpu("render/sun_shadows/elapsed_gpu")),
         ms(gpu("render/early deferred prepass/elapsed_gpu")),
         ms(gpu("render/gi_receiver_identity/elapsed_gpu")),
     );
-    for mut status_text in &mut status_text {
-        if status_text.0 != text {
-            status_text.0 = text.clone();
+    for (mut text, kind) in &mut texts {
+        let value = match kind {
+            Some(DebugMenuText::Status) => &status_text,
+            Some(DebugMenuText::Timings) => &timings,
+            None => continue,
+        };
+        if text.0 != *value {
+            text.0 = value.clone();
         }
     }
 }
@@ -3903,13 +4435,13 @@ fn capture_requires_gi(capture: bool, benchmark: bool, benchmark_no_gi: bool) ->
 mod tests {
     #[test]
     fn gi_readiness_requires_committed_revisions_support_and_warmup() {
-        let revisions = bevy_penumbra::RadianceCascadesRevisions {
+        let revisions = bevy_lux::RadianceCascadesRevisions {
             scene: 1,
             geometry: 2,
             lighting: 3,
         };
         let dispatch = |revisions| {
-            Some(bevy_penumbra::RadianceCascadesDispatch {
+            Some(bevy_lux::RadianceCascadesDispatch {
                 sequence: 4,
                 revisions,
             })
@@ -3925,7 +4457,7 @@ mod tests {
         assert!(!super::gi_capture_ready(true, None, 95, 1.0, 32, 32));
         assert!(!super::gi_capture_ready(
             true,
-            dispatch(bevy_penumbra::RadianceCascadesRevisions {
+            dispatch(bevy_lux::RadianceCascadesRevisions {
                 lighting: 0,
                 ..revisions
             }),
@@ -4511,7 +5043,10 @@ mod tests {
             cached_hit_sky: false,
             hardware_ray_queries: false,
             ray_traced_sun_shadows: false,
-            ray_traced_gi: false,
+            method: GiMethod::SplitRadianceCascades,
+            pxtgi: PxtgiSettings::default(),
+            colliders_built: false,
+            physics_actions: Vec::new(),
             ray_traced: RayTracedSettings::default(),
             resolution_divisor: RadianceCascades::low_end().sampling.grid_divisor,
             max_rays: 32_768,
