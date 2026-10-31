@@ -126,10 +126,9 @@ pub(super) fn build_hardware_traversal(
         return;
     };
     // Nothing is built until a view asks for hardware traversal.
-    if !views
-        .iter()
-        .any(|settings| super::hardware_traversal_requested(*settings) && settings.radiance_transport_active())
-    {
+    if !views.iter().any(|settings| {
+        super::hardware_traversal_requested(*settings) && settings.radiance_transport_active()
+    }) {
         hardware.built = None;
         return;
     }

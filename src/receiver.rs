@@ -283,9 +283,9 @@ fn extract(
         Local<bool>,
     ),
 ) {
-    let active = cameras
-        .iter()
-        .any(|(_, camera, settings)| camera.is_active && settings.sanitized().radiance_transport_active());
+    let active = cameras.iter().any(|(_, camera, settings)| {
+        camera.is_active && settings.sanitized().radiance_transport_active()
+    });
     if !active {
         if *was_active {
             // Clean up once on the transition, including identities whose

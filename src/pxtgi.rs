@@ -69,8 +69,8 @@ use bevy_box3d::{Collider, RigidBody};
 use bevy_slang::{SlangCompiler, SlangLoaderError, SlangSettings, SlangTarget};
 
 use crate::{
-    GiMethod, PxtgiDebug, PxtgiReflections, PxtgiSettings, RadianceCascades, RadianceCascadesRawOutput,
-    RadianceCascadesStatus,
+    GiMethod, PxtgiDebug, PxtgiReflections, PxtgiSettings, RadianceCascades,
+    RadianceCascadesRawOutput, RadianceCascadesStatus,
 };
 
 /// Radiance-cache slots shared by every PXTGI view (80 bytes each).
@@ -112,6 +112,9 @@ const ENTRY_POINTS: [&str; 12] = [
 /// Slang, compiled to WGSL in the background at startup; PXTGI starts drawing
 /// once that finishes.
 pub(crate) fn install(app: &mut App, compiler: SlangCompiler, status: RadianceCascadesStatus) {
+    if app.get_sub_app(RenderApp).is_none() {
+        return;
+    }
     // Pipelines are queued with this handle and wait until compilation fills it.
     let shader = app.world().resource::<Assets<Shader>>().reserve_handle();
     app.init_resource::<PxtgiScene>()
@@ -190,7 +193,8 @@ fn compile_pxtgi_shader(
         }
         compilation.started = true;
         let compiler = compilation.compiler.clone();
-        compilation.task = Some(AsyncComputeTaskPool::get().spawn(async move { compile_shader(&compiler) }));
+        compilation.task =
+            Some(AsyncComputeTaskPool::get().spawn(async move { compile_shader(&compiler) }));
     }
     let Some(task) = compilation.task.as_mut() else {
         return;
@@ -381,21 +385,28 @@ struct Item {
 }
 
 impl Item {
-    fn place(&mut self, transform: &GlobalTransform) {
+    fn placement(&self, transform: &GlobalTransform) -> Affine3A {
         let base = if self.scaled {
             transform.affine()
         } else {
             let (_, rotation, translation) = transform.to_scale_rotation_translation();
             Affine3A::from_rotation_translation(rotation, translation)
         };
-        self.to_world = base * Affine3A::from_translation(self.offset);
+        base * Affine3A::from_translation(self.offset)
+    }
+
+    fn place(&mut self, transform: &GlobalTransform) {
+        self.to_world = self.placement(transform);
     }
 
     fn world_bounds(&self) -> (Vec3, Vec3) {
-        let center = self.to_world.transform_point3((self.lower + self.upper) * 0.5);
+        let center = self
+            .to_world
+            .transform_point3((self.lower + self.upper) * 0.5);
         let half = (self.upper - self.lower) * 0.5;
         let m = self.to_world.matrix3;
-        let extent = Vec3::from(m.x_axis.abs() * half.x + m.y_axis.abs() * half.y + m.z_axis.abs() * half.z);
+        let extent =
+            Vec3::from(m.x_axis.abs() * half.x + m.y_axis.abs() * half.y + m.z_axis.abs() * half.z);
         (center - extent, center + extent)
     }
 
@@ -427,7 +438,9 @@ impl Item {
             let half = (self.upper - self.lower) * 0.5;
             let m = self.to_world.matrix3;
             Emissive {
-                center: self.to_world.transform_point3((self.lower + self.upper) * 0.5),
+                center: self
+                    .to_world
+                    .transform_point3((self.lower + self.upper) * 0.5),
                 axes: [
                     Vec3::from(m.x_axis) * half.x,
                     Vec3::from(m.y_axis) * half.y,
@@ -455,35 +468,50 @@ impl ShapeStore {
     fn shape(&mut self, collider: &Collider) -> ([f32; 4], Vec3, Vec3) {
         let bits = |(a, b): (u32, u32)| [f32::from_bits(a), f32::from_bits(b)];
         match collider {
-            Collider::Cuboid { half_extents } => {
-                ([0.0, half_extents.x, half_extents.y, half_extents.z], -*half_extents, *half_extents)
-            }
-            Collider::Sphere { radius } => ([1.0, *radius, 0.0, 0.0], Vec3::splat(-radius), Vec3::splat(*radius)),
-            Collider::Capsule { radius, half_height } => {
+            Collider::Cuboid { half_extents } => (
+                [0.0, half_extents.x, half_extents.y, half_extents.z],
+                -*half_extents,
+                *half_extents,
+            ),
+            Collider::Sphere { radius } => (
+                [1.0, *radius, 0.0, 0.0],
+                Vec3::splat(-radius),
+                Vec3::splat(*radius),
+            ),
+            Collider::Capsule {
+                radius,
+                half_height,
+            } => {
                 let half = Vec3::new(*radius, half_height + radius, *radius);
                 ([2.0, *radius, half.y, 0.0], -half, half)
             }
             Collider::ConvexHull(hull) => {
                 let planes = hull.planes();
-                let at = *self.index.entry(planes.as_ptr() as usize).or_insert_with(|| {
-                    self.version += 1;
-                    let first = self.data.len() as u32;
-                    self.data.extend_from_slice(planes);
-                    (first, planes.len() as u32)
-                });
+                let at = *self
+                    .index
+                    .entry(planes.as_ptr() as usize)
+                    .or_insert_with(|| {
+                        self.version += 1;
+                        let first = self.data.len() as u32;
+                        self.data.extend_from_slice(planes);
+                        (first, planes.len() as u32)
+                    });
                 let [a, b] = bits(at);
                 let (lower, upper) = hull.bounds();
                 ([4.0, a, b, 0.0], lower, upper)
             }
             Collider::TriMesh(mesh) => {
-                let at = *self.index.entry(mesh.nodes().as_ptr() as usize).or_insert_with(|| {
-                    self.version += 1;
-                    let nodes = self.data.len() as u32;
-                    self.data.extend_from_slice(mesh.nodes());
-                    let triangles = self.data.len() as u32;
-                    self.data.extend_from_slice(mesh.triangles());
-                    (nodes, triangles)
-                });
+                let at = *self
+                    .index
+                    .entry(mesh.nodes().as_ptr() as usize)
+                    .or_insert_with(|| {
+                        self.version += 1;
+                        let nodes = self.data.len() as u32;
+                        self.data.extend_from_slice(mesh.nodes());
+                        let triangles = self.data.len() as u32;
+                        self.data.extend_from_slice(mesh.triangles());
+                        (nodes, triangles)
+                    });
                 let [a, b] = bits(at);
                 let (lower, upper) = mesh.bounds();
                 ([5.0, a, b, 0.0], lower, upper)
@@ -526,7 +554,8 @@ impl LookReader<'_> {
         let mut sum = Vec3::ZERO;
         for y in 0..32 {
             for x in 0..32 {
-                let Ok(color) = image.get_color_at((x * 2 + 1) * w / 64, (y * 2 + 1) * h / 64) else {
+                let Ok(color) = image.get_color_at((x * 2 + 1) * w / 64, (y * 2 + 1) * h / 64)
+                else {
                     // Unreadable formats keep the material's own colour.
                     self.means.insert(id, Vec3::ONE);
                     return Vec3::ONE;
@@ -545,17 +574,32 @@ impl LookReader<'_> {
     fn material(&mut self, id: AssetId<StandardMaterial>) -> Option<Look> {
         let material = self.materials.get(id)?;
         let base = material.base_color.to_linear();
-        let albedo_mean = material.base_color_texture.as_ref().map_or(Vec3::ONE, |t| self.mean(t));
-        let emission_mean = material.emissive_texture.as_ref().map_or(Vec3::ONE, |t| self.mean(t));
+        let albedo_mean = material
+            .base_color_texture
+            .as_ref()
+            .map_or(Vec3::ONE, |t| self.mean(t));
+        let emission_mean = material
+            .emissive_texture
+            .as_ref()
+            .map_or(Vec3::ONE, |t| self.mean(t));
         let e = material.emissive;
         Some(Look {
-            albedo: LinearRgba::rgb(base.red * albedo_mean.x, base.green * albedo_mean.y, base.blue * albedo_mean.z),
-            emission: LinearRgba::rgb(e.red * emission_mean.x, e.green * emission_mean.y, e.blue * emission_mean.z),
+            albedo: LinearRgba::rgb(
+                base.red * albedo_mean.x,
+                base.green * albedo_mean.y,
+                base.blue * albedo_mean.z,
+            ),
+            emission: LinearRgba::rgb(
+                e.red * emission_mean.x,
+                e.green * emission_mean.y,
+                e.blue * emission_mean.z,
+            ),
             exposure_weight: material.emissive_exposure_weight,
         })
     }
 }
 
+#[allow(clippy::type_complexity)]
 /// A body's look, as Godot's `body_look`: its own [`PxtgiLook`], else its own
 /// material, else its child meshes' (the first one's albedo, the brightest
 /// one's emission, a child's own `PxtgiLook` before its material); grey when
@@ -565,7 +609,13 @@ fn body_look(
     own: Option<&PxtgiLook>,
     material: Option<&MeshMaterial3d<StandardMaterial>>,
     children: Option<&Children>,
-    child_looks: &Query<(Option<&PxtgiLook>, Option<&MeshMaterial3d<StandardMaterial>>), Without<Collider>>,
+    child_looks: &Query<
+        (
+            Option<&PxtgiLook>,
+            Option<&MeshMaterial3d<StandardMaterial>>,
+        ),
+        Without<Collider>,
+    >,
 ) -> (Look, Vec<AssetId<StandardMaterial>>) {
     let override_look = |look: &PxtgiLook| Look {
         albedo: look.albedo,
@@ -633,9 +683,33 @@ struct SceneState {
 }
 
 type LightQueries<'w, 's> = (
-    Query<'w, 's, (&'static DirectionalLight, &'static GlobalTransform, &'static InheritedVisibility)>,
-    Query<'w, 's, (&'static PointLight, &'static GlobalTransform, &'static InheritedVisibility)>,
-    Query<'w, 's, (&'static SpotLight, &'static GlobalTransform, &'static InheritedVisibility)>,
+    Query<
+        'w,
+        's,
+        (
+            &'static DirectionalLight,
+            &'static GlobalTransform,
+            &'static InheritedVisibility,
+        ),
+    >,
+    Query<
+        'w,
+        's,
+        (
+            &'static PointLight,
+            &'static GlobalTransform,
+            &'static InheritedVisibility,
+        ),
+    >,
+    Query<
+        'w,
+        's,
+        (
+            &'static SpotLight,
+            &'static GlobalTransform,
+            &'static InheritedVisibility,
+        ),
+    >,
 );
 
 type ProbeQuery<'w, 's> = Query<
@@ -703,7 +777,11 @@ type ChangeQueries<'w, 's> = (
         Entity,
         (
             Or<(With<Collider>, With<ChildOf>)>,
-            Or<(Changed<PxtgiLook>, Changed<MeshMaterial3d<StandardMaterial>>, Changed<RigidBody>)>,
+            Or<(
+                Changed<PxtgiLook>,
+                Changed<MeshMaterial3d<StandardMaterial>>,
+                Changed<RigidBody>,
+            )>,
         ),
     >,
 );
@@ -717,29 +795,43 @@ fn update_scene(
     proxies: ProxyQuery,
     has_collider: Query<(), With<Collider>>,
     parents: Query<&ChildOf>,
-    child_looks: Query<(Option<&PxtgiLook>, Option<&MeshMaterial3d<StandardMaterial>>), Without<Collider>>,
+    child_looks: Query<
+        (
+            Option<&PxtgiLook>,
+            Option<&MeshMaterial3d<StandardMaterial>>,
+        ),
+        Without<Collider>,
+    >,
     changes: ChangeQueries,
-    moved: Query<(Entity, &GlobalTransform), (Or<(With<Collider>, With<Mesh3d>)>, Changed<GlobalTransform>)>,
+    moved: Query<
+        (Entity, &GlobalTransform),
+        (Or<(With<Collider>, With<Mesh3d>)>, Changed<GlobalTransform>),
+    >,
     mut removed: (RemovedComponents<Collider>, RemovedComponents<Mesh3d>),
     materials: Res<Assets<StandardMaterial>>,
     images: Res<Assets<Image>>,
-    mut events: (MessageReader<AssetEvent<StandardMaterial>>, MessageReader<AssetEvent<Image>>),
+    mut events: (
+        MessageReader<AssetEvent<StandardMaterial>>,
+        MessageReader<AssetEvent<Image>>,
+    ),
     lights: LightQueries,
     probes: ProbeQuery,
 ) {
     let removed = removed.0.read().count() + removed.1.read().count() > 0;
     let mut material_changed: HashSet<AssetId<StandardMaterial>> = HashSet::new();
     for event in events.0.read() {
-        if let AssetEvent::Modified { id } | AssetEvent::LoadedWithDependencies { id } | AssetEvent::Added { id } =
-            event
+        if let AssetEvent::Modified { id }
+        | AssetEvent::LoadedWithDependencies { id }
+        | AssetEvent::Added { id } = event
         {
             material_changed.insert(*id);
         }
     }
     let mut textures_changed = false;
     for event in events.1.read() {
-        if let AssetEvent::Modified { id } | AssetEvent::LoadedWithDependencies { id } | AssetEvent::Added { id } =
-            event
+        if let AssetEvent::Modified { id }
+        | AssetEvent::LoadedWithDependencies { id }
+        | AssetEvent::Added { id } = event
         {
             let known = state.texture_means.remove(id).is_some();
             textures_changed |= known || state.missing_textures.remove(id);
@@ -766,7 +858,14 @@ fn update_scene(
     if state.pending_rescan {
         state.frames_since_rescan += 1;
     }
-    let tracked_moves: Vec<_> = moved.iter().filter(|(entity, _)| state.slots.contains_key(entity)).collect();
+    let tracked_moves: Vec<_> = moved
+        .iter()
+        .filter_map(|(entity, transform)| {
+            let item = &state.items[*state.slots.get(&entity)?];
+            let placement = item.placement(transform);
+            (placement != item.to_world).then_some((entity, placement))
+        })
+        .collect();
     if !tracked_moves.is_empty() {
         state.moves_since_build += 1;
     }
@@ -785,7 +884,10 @@ fn update_scene(
         let live: HashSet<usize> = colliders.iter().filter_map(|c| shape_key(c.1)).collect();
         if state.store.index.len() > 2 * live.len().max(8) {
             let version = state.store.version + 1;
-            state.store = ShapeStore { version, ..default() };
+            state.store = ShapeStore {
+                version,
+                ..default()
+            };
         }
         let mut items = Vec::new();
         let mut material_users: HashMap<AssetId<StandardMaterial>, Vec<Entity>> = HashMap::new();
@@ -821,7 +923,10 @@ fn update_scene(
             {
                 continue;
             }
-            material_users.entry(material.id()).or_default().push(entity);
+            material_users
+                .entry(material.id())
+                .or_default()
+                .push(entity);
             let half = Vec3::from(aabb.half_extents).max(Vec3::splat(1e-3));
             let mut item = Item {
                 entity,
@@ -839,7 +944,11 @@ fn update_scene(
         }
         let geometry = build_geometry(&mut items, state.geometry.version + 1);
         state.bounds = items.iter().map(Item::world_bounds).collect();
-        state.slots = items.iter().enumerate().map(|(slot, item)| (item.entity, slot)).collect();
+        state.slots = items
+            .iter()
+            .enumerate()
+            .map(|(slot, item)| (item.entity, slot))
+            .collect();
         state.items = items;
         state.material_users = material_users;
         state.pending_rescan = false;
@@ -863,7 +972,9 @@ fn update_scene(
         let mut restyle: HashSet<Entity> = changes
             .2
             .iter()
-            .filter_map(|entity| tracked(entity).or_else(|| tracked(parents.get(entity).ok()?.parent())))
+            .filter_map(|entity| {
+                tracked(entity).or_else(|| tracked(parents.get(entity).ok()?.parent()))
+            })
             .collect();
         if textures_changed {
             restyle.extend(state.items.iter().map(|item| item.entity));
@@ -873,7 +984,6 @@ fn update_scene(
             }
         }
         let mut geometry_changed = false;
-        let geometry = Arc::make_mut(&mut state.geometry);
         for entity in restyle {
             let slot = state.slots[&entity];
             let look = if let Ok((_, _, _, body, own, material, children)) = colliders.get(entity) {
@@ -891,24 +1001,25 @@ fn update_scene(
             }
             item.look = look;
             let at = slot * PRIMITIVE_VEC4S;
-            geometry.primitives[at + 4..at + 6].copy_from_slice(&item.look_rows());
+            Arc::make_mut(&mut state.geometry).primitives[at + 4..at + 6]
+                .copy_from_slice(&item.look_rows());
             geometry_changed = true;
         }
         let mut refit = false;
         for (entity, transform) in &tracked_moves {
             let slot = state.slots[entity];
             let item = &mut state.items[slot];
-            item.place(transform);
+            item.to_world = *transform;
             let at = slot * PRIMITIVE_VEC4S;
-            geometry.primitives[at..at + 3].copy_from_slice(&item.rows());
+            Arc::make_mut(&mut state.geometry).primitives[at..at + 3].copy_from_slice(&item.rows());
             state.bounds[slot] = item.world_bounds();
             refit = true;
         }
         if refit {
-            refit_nodes(&mut geometry.nodes, &state.bounds);
+            refit_nodes(&mut Arc::make_mut(&mut state.geometry).nodes, &state.bounds);
         }
         if refit || geometry_changed {
-            geometry.version += 1;
+            Arc::make_mut(&mut state.geometry).version += 1;
         }
     }
 
@@ -927,9 +1038,15 @@ fn update_scene(
     // whose range holds it alike).
     let nearest = |mut lights: Vec<(f32, Light)>| {
         lights.sort_by(|a, b| a.0.total_cmp(&b.0));
-        lights.into_iter().take(MAX_LIGHTS).map(|(_, light)| light).collect::<Vec<_>>()
+        lights
+            .into_iter()
+            .take(MAX_LIGHTS)
+            .map(|(_, light)| light)
+            .collect::<Vec<_>>()
     };
-    let gap = |transform: &GlobalTransform, range: f32| (transform.translation().distance(eye) - range).max(0.0);
+    let gap = |transform: &GlobalTransform, range: f32| {
+        (transform.translation().distance(eye) - range).max(0.0)
+    };
     let light = |color: Color, lumens: f32, range: f32, transform: &GlobalTransform| Light {
         position: transform.translation(),
         inv_range2: 1.0 / (range * range).max(1e-8),
@@ -943,7 +1060,10 @@ fn update_scene(
             .iter()
             .filter(|(light, _, visible)| visible.get() && light.intensity > 0.0)
             .map(|(point, transform, _)| {
-                (gap(transform, point.range), light(point.color, point.intensity, point.range, transform))
+                (
+                    gap(transform, point.range),
+                    light(point.color, point.intensity, point.range, transform),
+                )
             })
             .collect(),
     );
@@ -964,7 +1084,11 @@ fn update_scene(
             .collect(),
     );
     let mut emissives: Vec<_> = state.items.iter().filter_map(Item::emissive).collect();
-    emissives.sort_by(|a, b| a.center.distance_squared(eye).total_cmp(&b.center.distance_squared(eye)));
+    emissives.sort_by(|a, b| {
+        a.center
+            .distance_squared(eye)
+            .total_cmp(&b.center.distance_squared(eye))
+    });
     emissives.truncate(MAX_EMISSIVES);
 
     // Reflection probes, nearest the camera first.
@@ -980,7 +1104,8 @@ fn update_scene(
             let core = Vec3::splat(0.5) * (Vec3::ONE - falloff) - Vec3::splat(0.25) / size;
             let overrides = overrides.copied().unwrap_or_default();
             let flags = if core.min_element() > 0.0 {
-                u32::from(overrides.overrides_ambient) | (u32::from(overrides.overrides_reflections) << 1)
+                u32::from(overrides.overrides_ambient)
+                    | (u32::from(overrides.overrides_reflections) << 1)
             } else {
                 0
             };
@@ -1010,19 +1135,39 @@ fn update_scene(
         })
         .collect();
     probes.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let probes: Vec<Probe> = probes.into_iter().take(MAX_PROBES).map(|(_, probe)| probe).collect();
+    let probes: Vec<Probe> = probes
+        .into_iter()
+        .take(MAX_PROBES)
+        .map(|(_, probe)| probe)
+        .collect();
 
-    // What gives off light, not where: a change lets the cache follow quickly,
-    // from the next frame on, for FRESH_FRAMES frames.
-    let sources_changed = state.fresh_frames > 0;
+    // Changes to position, direction, range or emission change transport just
+    // as much as colour changes do.
     let mut hasher = DefaultHasher::new();
-    (omnis.len(), spots.len(), emissives.len()).hash(&mut hasher);
-    let mut hash_vec = |v: Vec3| v.to_array().map(f32::to_bits).hash(&mut hasher);
-    if let Some((_, color)) = sun {
-        hash_vec(color);
+    (sun.is_some(), omnis.len(), spots.len(), emissives.len()).hash(&mut hasher);
+    let mut hash_values = |values: &[f32]| {
+        for value in values {
+            value.to_bits().hash(&mut hasher);
+        }
+    };
+    if let Some((direction, color)) = sun {
+        hash_values(&direction.to_array());
+        hash_values(&color.to_array());
     }
-    omnis.iter().chain(&spots).for_each(|light| hash_vec(light.color));
-    emissives.iter().for_each(|emissive| hash_vec(emissive.color));
+    for light in omnis.iter().chain(&spots) {
+        hash_values(&light.position.to_array());
+        hash_values(&light.color.to_array());
+        hash_values(&light.direction.to_array());
+        hash_values(&[light.inv_range2, light.cone_scale, light.cone_offset]);
+    }
+    for emissive in &emissives {
+        hash_values(&emissive.center.to_array());
+        for axis in emissive.axes {
+            hash_values(&axis.to_array());
+        }
+        hash_values(&emissive.color.to_array());
+        hash_values(&[emissive.exposure_weight]);
+    }
     let hash = hasher.finish();
     if hash != state.sources_hash {
         state.sources_hash = hash;
@@ -1031,6 +1176,7 @@ fn update_scene(
     } else {
         state.fresh_frames = state.fresh_frames.saturating_sub(1);
     }
+    let sources_changed = state.fresh_frames > 0;
 
     scene.0 = Arc::new(SceneData {
         geometry: state.geometry.clone(),
@@ -1075,7 +1221,11 @@ fn build_geometry(items: &mut Vec<Item>, version: u64) -> Geometry {
         build_bvh(&mut build, &mut geometry.nodes, &mut order, 0);
     }
     let mut taken: Vec<Option<Item>> = items.drain(..).map(Some).collect();
-    items.extend(order.into_iter().map(|index| taken[index].take().expect("leaf order is a permutation")));
+    items.extend(
+        order
+            .into_iter()
+            .map(|index| taken[index].take().expect("leaf order is a permutation")),
+    );
     geometry.primitives = items.iter().flat_map(Item::record).collect();
     geometry
 }
@@ -1096,7 +1246,8 @@ fn sah_split(items: &mut [BuildItem], c_lo: Vec3, c_hi: Vec3) -> Option<usize> {
             continue;
         }
         let scale = BINS as f32 / extent;
-        let bin = |item: &BuildItem| (((item.center[axis] - c_lo[axis]) * scale) as usize).min(BINS - 1);
+        let bin =
+            |item: &BuildItem| (((item.center[axis] - c_lo[axis]) * scale) as usize).min(BINS - 1);
         let mut count = [0usize; BINS];
         let mut lo = [Vec3::INFINITY; BINS];
         let mut hi = [Vec3::NEG_INFINITY; BINS];
@@ -1139,7 +1290,12 @@ fn sah_split(items: &mut [BuildItem], c_lo: Vec3, c_hi: Vec3) -> Option<usize> {
 
 // Depth first, the left child right after its parent; leaves of up to four.
 // Never deeper than 15 levels: the shader's walk keeps a 16-entry stack.
-fn build_bvh(items: &mut [BuildItem], nodes: &mut Vec<[f32; 4]>, order: &mut Vec<usize>, depth: u32) -> usize {
+fn build_bvh(
+    items: &mut [BuildItem],
+    nodes: &mut Vec<[f32; 4]>,
+    order: &mut Vec<usize>,
+    depth: u32,
+) -> usize {
     let (mut lo, mut hi) = (Vec3::INFINITY, Vec3::NEG_INFINITY);
     let (mut c_lo, mut c_hi) = (Vec3::INFINITY, Vec3::NEG_INFINITY);
     for item in items.iter() {
@@ -1175,7 +1331,10 @@ fn build_bvh(items: &mut [BuildItem], nodes: &mut Vec<[f32; 4]>, order: &mut Vec
 fn refit_nodes(nodes: &mut [[f32; 4]], bounds: &[(Vec3, Vec3)]) {
     let union = |a: (Vec3, Vec3), b: (Vec3, Vec3)| (a.0.min(b.0), a.1.max(b.1));
     let node_bounds = |nodes: &[[f32; 4]], n: usize| {
-        (Vec3::from_slice(&nodes[n * 2]), Vec3::from_slice(&nodes[n * 2 + 1]))
+        (
+            Vec3::from_slice(&nodes[n * 2]),
+            Vec3::from_slice(&nodes[n * 2 + 1]),
+        )
     };
     for n in (0..nodes.len() / 2).rev() {
         let link = nodes[n * 2][3].to_bits() as usize;
@@ -1194,6 +1353,7 @@ fn refit_nodes(nodes: &mut [[f32; 4]], bounds: &[(Vec3, Vec3)]) {
 
 // ---------------------------------------------------------------- render world
 
+#[allow(clippy::type_complexity)]
 /// Each PXTGI camera's background (environment map, else skybox) and ambient
 /// light (its own `AmbientLight`, else the global one).
 fn extract_view_sources(
@@ -1304,11 +1464,15 @@ struct PxtgiView {
     current: usize,
     history: bool,
     prev_clip_from_world: Mat4,
+    history_epoch: u32,
+    history_reflections: PxtgiReflections,
+    history_debug: bool,
 }
 
 #[derive(Component)]
 struct PxtgiBindGroups {
     scene: BindGroup,
+    clip_from_world: Mat4,
     // trace, temporal, the three a-trous passes.
     diffuse: [BindGroup; 5],
     // reflect_trace, reflect_temporal, two filter passes.
@@ -1328,7 +1492,10 @@ fn storage_buffer(device: &RenderDevice, label: &'static str, bytes: u64) -> Buf
 }
 
 fn bytes(data: &[[f32; 4]]) -> Vec<u8> {
-    data.iter().flatten().flat_map(|v| v.to_le_bytes()).collect()
+    data.iter()
+        .flatten()
+        .flat_map(|v| v.to_le_bytes())
+        .collect()
 }
 
 fn init_pipelines(
@@ -1402,7 +1569,10 @@ fn init_pipelines(
             (
                 (8, unfiltered()),
                 (9, unfiltered()),
-                (12, texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly)),
+                (
+                    12,
+                    texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
+                ),
             ),
         ),
     );
@@ -1474,7 +1644,13 @@ fn init_pipelines(
     commands.insert_resource(PxtgiPipelines {
         cache: compute("cache_update"),
         diffuse: ["trace", "temporal", "atrous1", "atrous2", "atrous4"].map(compute),
-        reflect: ["reflect_trace", "reflect_temporal", "reflect_filter1", "reflect_filter2"].map(compute),
+        reflect: [
+            "reflect_trace",
+            "reflect_temporal",
+            "reflect_filter1",
+            "reflect_filter2",
+        ]
+        .map(compute),
         composite: composite(Some(additive)),
         composite_debug: composite(None),
         raw,
@@ -1528,7 +1704,11 @@ fn prepare_scene(
         gpu.shapes_version = geometry.shapes_version;
     }
     if geometry.version != gpu.version {
-        upload(&mut gpu.primitives, "pxtgi_primitives", &geometry.primitives);
+        upload(
+            &mut gpu.primitives,
+            "pxtgi_primitives",
+            &geometry.primitives,
+        );
         upload(&mut gpu.nodes, "pxtgi_nodes", &geometry.nodes);
         gpu.primitive_count = (geometry.primitives.len() / PRIMITIVE_VEC4S) as u32;
         gpu.node_count = (geometry.nodes.len() / 2) as u32;
@@ -1536,7 +1716,13 @@ fn prepare_scene(
     }
 }
 
-fn target(device: &RenderDevice, label: &'static str, size: UVec2, format: TextureFormat, usage: TextureUsages) -> Target {
+fn target(
+    device: &RenderDevice,
+    label: &'static str,
+    size: UVec2,
+    format: TextureFormat,
+    usage: TextureUsages,
+) -> Target {
     let texture = device.create_texture(&TextureDescriptor {
         label: Some(label),
         size: Extent3d {
@@ -1563,7 +1749,9 @@ impl PxtgiView {
         let usage = TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
         let light = |label, size| target(device, label, size, TextureFormat::Rgba16Float, usage);
         let scalar = |label, size| target(device, label, size, TextureFormat::R32Float, usage);
-        let pair = |make: &dyn Fn(&'static str, UVec2) -> Target, label, size| [make(label, size), make(label, size)];
+        let pair = |make: &dyn Fn(&'static str, UVec2) -> Target, label, size| {
+            [make(label, size), make(label, size)]
+        };
         Self {
             size,
             trace_size,
@@ -1596,6 +1784,9 @@ impl PxtgiView {
             current: 0,
             history: false,
             prev_clip_from_world: clip_from_world,
+            history_epoch: 0,
+            history_reflections: PxtgiReflections::Off,
+            history_debug: false,
         }
     }
 }
@@ -1655,20 +1846,60 @@ fn frame_uniform(
     // Light as the GI holds it: irradiance / pi, exposed like the lit image.
     let lit = exposure / PI;
     let mut u = Vec::with_capacity(FRAME_VEC4S);
-    for m in [clip_from_world, clip_from_world.inverse(), view.prev_clip_from_world] {
+    for m in [
+        clip_from_world,
+        clip_from_world.inverse(),
+        view.prev_clip_from_world,
+    ] {
         u.extend(m.to_cols_array_2d());
     }
     u.push(eye.extend(near).to_array());
-    u.push(bits([view.size.x, view.size.y, view.trace_size.x, view.trace_size.y]));
-    u.push([(frame % 4096) as f32, px.max_distance, settings.intensity, debug_index(px.debug)]);
+    u.push(bits([
+        view.size.x,
+        view.size.y,
+        view.trace_size.x,
+        view.trace_size.y,
+    ]));
+    u.push([
+        (frame % 4096) as f32,
+        px.max_distance,
+        settings.intensity,
+        debug_index(px.debug),
+    ]);
     let (sun_direction, sun_color) = scene.sun.unwrap_or_default();
     u.push(sun_direction.extend(flag(scene.sun.is_some())).to_array());
     u.push((sun_color * lit).extend(exposure).to_array());
     let sky = settings.environment;
-    u.push((Vec3::new(sky.red, sky.green, sky.blue) * exposure).extend(px.world_ray_distance).to_array());
-    u.push(bits([gpu.primitive_count, gpu.node_count, scene.omnis.len() as u32, scene.spots.len() as u32]));
-    u.push(bits([frame, CACHE_SLOTS - 1, u32::from(px.multi_bounce), px.rays_per_texel]));
-    u.push([scene.emissives.len() as f32, flag(scene.sources_changed), flag(view.history), 0.0]);
+    u.push(
+        (Vec3::new(sky.red, sky.green, sky.blue) * exposure)
+            .extend(px.world_ray_distance)
+            .to_array(),
+    );
+    u.push(bits([
+        gpu.primitive_count,
+        gpu.node_count,
+        scene.omnis.len() as u32,
+        scene.spots.len() as u32,
+    ]));
+    u.push(bits([
+        frame,
+        CACHE_SLOTS - 1,
+        u32::from(px.multi_bounce),
+        px.rays_per_texel,
+    ]));
+    let history = view.history
+        && view.history_epoch == settings.history_epoch
+        && !view.history_debug
+        && !debug_replaces_image(px.debug);
+    let reflection_history = history
+        && px.reflections != PxtgiReflections::Off
+        && px.reflections == view.history_reflections;
+    u.push([
+        scene.emissives.len() as f32,
+        flag(scene.sources_changed),
+        flag(history),
+        flag(reflection_history),
+    ]);
     let mode = match px.reflections {
         PxtgiReflections::Off => 0.0,
         PxtgiReflections::ScreenSpace => 1.0,
@@ -1678,8 +1909,15 @@ fn frame_uniform(
     u.push([mode, px.reflection_roughness_cutoff, 0.0, 0.0]);
     u.push(bits([view.reflect_size.x, view.reflect_size.y, 0, 0]));
     let (strength, roughest_mip, rotation, lights) = environment
-        .map_or((0.0, 0.0, Quat::IDENTITY, false), |e| (e.strength, e.roughest_mip, e.rotation, e.lights));
-    u.push([strength, roughest_mip, flag(environment.is_some()), flag(lights)]);
+        .map_or((0.0, 0.0, Quat::IDENTITY, false), |e| {
+            (e.strength, e.roughest_mip, e.rotation, e.lights)
+        });
+    u.push([
+        strength,
+        roughest_mip,
+        flag(environment.is_some()),
+        flag(lights),
+    ]);
     // Bevy samples its cube maps with the inverse of their rotation.
     let rotation_rows = |rotation: Quat| {
         let rows = Mat3::from_quat(rotation.inverse()).transpose();
@@ -1692,23 +1930,63 @@ fn frame_uniform(
         u.resize(start + len, [0.0; 4]);
     };
     let omnis = &scene.omnis;
-    pad(&mut u, &mut omnis.iter().map(|l| l.position.extend(l.inv_range2).to_array()), MAX_LIGHTS);
-    pad(&mut u, &mut omnis.iter().map(|l| (l.color * lit).extend(0.0).to_array()), MAX_LIGHTS);
+    pad(
+        &mut u,
+        &mut omnis
+            .iter()
+            .map(|l| l.position.extend(l.inv_range2).to_array()),
+        MAX_LIGHTS,
+    );
+    pad(
+        &mut u,
+        &mut omnis.iter().map(|l| (l.color * lit).extend(0.0).to_array()),
+        MAX_LIGHTS,
+    );
     let spots = &scene.spots;
-    pad(&mut u, &mut spots.iter().map(|l| l.position.extend(l.inv_range2).to_array()), MAX_LIGHTS);
-    pad(&mut u, &mut spots.iter().map(|l| l.direction.extend(l.cone_scale).to_array()), MAX_LIGHTS);
-    pad(&mut u, &mut spots.iter().map(|l| (l.color * lit).extend(l.cone_offset).to_array()), MAX_LIGHTS);
+    pad(
+        &mut u,
+        &mut spots
+            .iter()
+            .map(|l| l.position.extend(l.inv_range2).to_array()),
+        MAX_LIGHTS,
+    );
+    pad(
+        &mut u,
+        &mut spots
+            .iter()
+            .map(|l| l.direction.extend(l.cone_scale).to_array()),
+        MAX_LIGHTS,
+    );
+    pad(
+        &mut u,
+        &mut spots
+            .iter()
+            .map(|l| (l.color * lit).extend(l.cone_offset).to_array()),
+        MAX_LIGHTS,
+    );
     let emissives = &scene.emissives;
-    pad(&mut u, &mut emissives.iter().map(|e| e.center.extend(0.0).to_array()), MAX_EMISSIVES);
+    pad(
+        &mut u,
+        &mut emissives.iter().map(|e| e.center.extend(0.0).to_array()),
+        MAX_EMISSIVES,
+    );
     for axis in 0..3 {
-        pad(&mut u, &mut emissives.iter().map(|e| e.axes[axis].extend(0.0).to_array()), MAX_EMISSIVES);
+        pad(
+            &mut u,
+            &mut emissives
+                .iter()
+                .map(|e| e.axes[axis].extend(0.0).to_array()),
+            MAX_EMISSIVES,
+        );
     }
     // Bevy weights each emission by the exposure by its exposure weight.
     pad(
         &mut u,
-        &mut emissives
-            .iter()
-            .map(|e| (e.color * (1.0 + (exposure - 1.0) * e.exposure_weight)).extend(0.0).to_array()),
+        &mut emissives.iter().map(|e| {
+            (e.color * (1.0 + (exposure - 1.0) * e.exposure_weight))
+                .extend(0.0)
+                .to_array()
+        }),
         MAX_EMISSIVES,
     );
     u.push((ambient * exposure).extend(0.0).to_array());
@@ -1723,24 +2001,47 @@ fn frame_uniform(
         [0, 1, 2].map(|r| rows.col(r).extend(0.0).to_array())
     };
     for row in 0..3 {
-        pad(&mut u, &mut probes.iter().map(|(p, _)| affine_rows(&p.to_local)[row]), MAX_PROBES);
+        pad(
+            &mut u,
+            &mut probes.iter().map(|(p, _)| affine_rows(&p.to_local)[row]),
+            MAX_PROBES,
+        );
     }
     for row in 0..3 {
-        pad(&mut u, &mut probes.iter().map(|(p, _)| mat_rows(&p.to_world_dir)[row]), MAX_PROBES);
+        pad(
+            &mut u,
+            &mut probes.iter().map(|(p, _)| mat_rows(&p.to_world_dir)[row]),
+            MAX_PROBES,
+        );
     }
     pad(
         &mut u,
         &mut probes.iter().map(|(p, _)| {
             let flags = p.overrides | if p.parallax.is_some() { 4 } else { 0 };
-            p.parallax.unwrap_or_default().extend(flags as f32).to_array()
+            p.parallax
+                .unwrap_or_default()
+                .extend(flags as f32)
+                .to_array()
         }),
         MAX_PROBES,
     );
-    pad(&mut u, &mut probes.iter().map(|(p, _)| p.core.extend(p.volume).to_array()), MAX_PROBES);
-    pad(&mut u, &mut probes.iter().map(|(p, _)| p.falloff.extend(0.0).to_array()), MAX_PROBES);
     pad(
         &mut u,
-        &mut probes.iter().map(|(p, _)| p.capture.extend(p.intensity * exposure).to_array()),
+        &mut probes
+            .iter()
+            .map(|(p, _)| p.core.extend(p.volume).to_array()),
+        MAX_PROBES,
+    );
+    pad(
+        &mut u,
+        &mut probes.iter().map(|(p, _)| p.falloff.extend(0.0).to_array()),
+        MAX_PROBES,
+    );
+    pad(
+        &mut u,
+        &mut probes
+            .iter()
+            .map(|(p, _)| p.capture.extend(p.intensity * exposure).to_array()),
         MAX_PROBES,
     );
     for row in 0..3 {
@@ -1767,7 +2068,12 @@ fn cube_image(images: &RenderAssets<GpuImage>, id: AssetId<Image>) -> Option<(&G
         .texture_view_descriptor
         .as_ref()
         .is_some_and(|d| d.dimension == Some(TextureViewDimension::Cube));
-    cube.then(|| (image, image.texture_descriptor.mip_level_count.saturating_sub(1) as f32))
+    cube.then(|| {
+        (
+            image,
+            image.texture_descriptor.mip_level_count.saturating_sub(1) as f32,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -1802,18 +2108,26 @@ fn prepare_views(
         .0
         .probes
         .iter()
-        .filter_map(|probe| cube_image(&images, probe.specular).map(|(image, mip)| (probe, image, mip)))
+        .filter_map(|probe| {
+            cube_image(&images, probe.specular).map(|(image, mip)| (probe, image, mip))
+        })
         .collect();
-    for (entity, view, camera, target, prepass, settings, sources, raw_output, existing) in &mut views {
+    for (entity, view, camera, target, prepass, settings, sources, raw_output, existing) in
+        &mut views
+    {
         let settings = settings.sanitized();
         if !settings.pxtgi_active() {
             // The view runs another method, or none: its targets go too.
-            commands.entity(entity).remove::<(PxtgiBindGroups, PxtgiView)>();
+            commands
+                .entity(entity)
+                .remove::<(PxtgiBindGroups, PxtgiView)>();
             continue;
         }
-        let (Some(size), Some(depth), Some(gbuffer)) =
-            (camera.physical_viewport_size, prepass.depth_only_view(), prepass.deferred_view())
-        else {
+        let (Some(size), Some(depth), Some(gbuffer)) = (
+            camera.physical_viewport_size,
+            prepass.depth_only_view(),
+            prepass.deferred_view(),
+        ) else {
             commands.entity(entity).remove::<PxtgiBindGroups>();
             continue;
         };
@@ -1850,9 +2164,11 @@ fn prepare_views(
             _ => fresh.insert(PxtgiView::new(&device, size, clip_from_world)),
         };
         let prev = state.current;
-        state.current = 1 - prev;
-        let cur = state.current;
-        let probe_settings: Vec<(&Probe, f32)> = probes.iter().map(|(probe, _, mip)| (*probe, *mip)).collect();
+        let cur = 1 - prev;
+        let probe_settings: Vec<(&Probe, f32)> = probes
+            .iter()
+            .map(|(probe, _, mip)| (*probe, *mip))
+            .collect();
         let uniform = frame_uniform(
             &settings,
             &scene.0,
@@ -1869,11 +2185,14 @@ fn prepare_views(
             *frame,
         );
         queue.write_buffer(&state.frame, 0, &bytes(&uniform));
-        state.prev_clip_from_world = clip_from_world;
-        state.history = true;
 
-        let probe_map =
-            |i: usize| probes.get(i).map_or(&pipelines.no_environment, |(_, image, _)| &image.texture_view);
+        let probe_map = |i: usize| {
+            probes
+                .get(i)
+                .map_or(&pipelines.no_environment, |(_, image, _)| {
+                    &image.texture_view
+                })
+        };
         let scene_group = device.create_bind_group(
             "pxtgi_scene",
             &cache.get_bind_group_layout(&pipelines.scene_layout),
@@ -1922,17 +2241,42 @@ fn prepare_views(
         let atrous = |light: &Target, variance: &Target, i: usize| {
             io(
                 [light, variance, &s.accum_depth[cur], &s.trace],
-                [&s.filtered[i], &s.filtered_variance[i], &s.moments[prev], &s.accum_depth[prev]],
+                [
+                    &s.filtered[i],
+                    &s.filtered_variance[i],
+                    &s.moments[prev],
+                    &s.accum_depth[prev],
+                ],
             )
         };
         let diffuse = [
             io(
-                [&s.accum[prev], &s.accum_depth[prev], &s.moments[prev], &s.filtered_variance[1]],
-                [&s.trace, &s.variance, &s.filtered[0], &s.filtered_variance[0]],
+                [
+                    &s.accum[prev],
+                    &s.accum_depth[prev],
+                    &s.moments[prev],
+                    &s.filtered_variance[1],
+                ],
+                [
+                    &s.trace,
+                    &s.variance,
+                    &s.filtered[0],
+                    &s.filtered_variance[0],
+                ],
             ),
             io(
-                [&s.trace, &s.accum[prev], &s.accum_depth[prev], &s.moments[prev]],
-                [&s.accum[cur], &s.accum_depth[cur], &s.moments[cur], &s.variance],
+                [
+                    &s.trace,
+                    &s.accum[prev],
+                    &s.accum_depth[prev],
+                    &s.moments[prev],
+                ],
+                [
+                    &s.accum[cur],
+                    &s.accum_depth[cur],
+                    &s.moments[cur],
+                    &s.variance,
+                ],
             ),
             atrous(&s.accum[cur], &s.variance, 0),
             atrous(&s.filtered[0], &s.filtered_variance[0], 1),
@@ -1942,19 +2286,44 @@ fn prepare_views(
         let spare = [&s.variance, &s.filtered[1], &s.filtered_variance[1]];
         let reflect = [
             io(
-                [&s.accum[prev], &s.accum_depth[prev], &s.moments[prev], &s.trace],
+                [
+                    &s.accum[prev],
+                    &s.accum_depth[prev],
+                    &s.moments[prev],
+                    &s.trace,
+                ],
                 [&s.reflect_trace, spare[0], spare[1], spare[2]],
             ),
             io(
-                [&s.reflect_trace, &s.reflect_accum[prev], &s.reflect_depth[prev], &s.trace],
-                [&s.reflect_accum[cur], &s.reflect_depth[cur], spare[1], spare[2]],
+                [
+                    &s.reflect_trace,
+                    &s.reflect_accum[prev],
+                    &s.reflect_depth[prev],
+                    &s.trace,
+                ],
+                [
+                    &s.reflect_accum[cur],
+                    &s.reflect_depth[cur],
+                    spare[1],
+                    spare[2],
+                ],
             ),
             io(
-                [&s.reflect_accum[cur], &s.reflect_depth[cur], &s.trace, &s.trace],
+                [
+                    &s.reflect_accum[cur],
+                    &s.reflect_depth[cur],
+                    &s.trace,
+                    &s.trace,
+                ],
                 [&s.reflect_filtered[0], spare[0], spare[1], spare[2]],
             ),
             io(
-                [&s.reflect_filtered[0], &s.reflect_depth[cur], &s.trace, &s.trace],
+                [
+                    &s.reflect_filtered[0],
+                    &s.reflect_depth[cur],
+                    &s.trace,
+                    &s.trace,
+                ],
                 [&s.reflect_filtered[1], spare[0], spare[1], spare[2]],
             ),
         ];
@@ -1962,7 +2331,10 @@ fn prepare_views(
         let raw_image = raw_output.and_then(|output| {
             let image = images.get(&output.0)?;
             let usable = image.texture_descriptor.format == TextureFormat::Rgba32Float
-                && image.texture_descriptor.usage.contains(TextureUsages::COPY_DST);
+                && image
+                    .texture_descriptor
+                    .usage
+                    .contains(TextureUsages::COPY_DST);
             if !usable {
                 warn_once!("PXTGI raw output needs an Rgba32Float image with COPY_DST usage");
             }
@@ -2007,6 +2379,7 @@ fn prepare_views(
         );
         let mut entity_commands = commands.entity(entity);
         entity_commands.insert(PxtgiBindGroups {
+            clip_from_world,
             scene: scene_group,
             diffuse,
             reflect,
@@ -2019,8 +2392,14 @@ fn prepare_views(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render(
-    view: ViewQuery<(&ViewTarget, &RadianceCascades, &PxtgiView, &PxtgiBindGroups)>,
+    view: ViewQuery<(
+        &ViewTarget,
+        &RadianceCascades,
+        &mut PxtgiView,
+        &PxtgiBindGroups,
+    )>,
     pipelines: Res<PxtgiPipelines>,
     gpu: Res<PxtgiGpu>,
     cache: Res<PipelineCache>,
@@ -2030,7 +2409,7 @@ fn render(
     mut frame_id: Local<u64>,
     mut context: RenderContext,
 ) {
-    let (target, settings, state, groups) = view.into_inner();
+    let (target, settings, mut state, groups) = view.into_inner();
     let settings = settings.sanitized();
     if !settings.pxtgi_active() {
         return;
@@ -2060,10 +2439,12 @@ fn render(
                     group: &BindGroup,
                     (x, y): (u32, u32)| {
         let span = diagnostics.time_span(context.command_encoder(), name);
-        let mut pass = context.command_encoder().begin_compute_pass(&ComputePassDescriptor {
-            label: Some(name),
-            timestamp_writes: None,
-        });
+        let mut pass = context
+            .command_encoder()
+            .begin_compute_pass(&ComputePassDescriptor {
+                label: Some(name),
+                timestamp_writes: None,
+            });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &groups.scene, &[]);
         pass.set_bind_group(1, group, &[]);
@@ -2083,29 +2464,48 @@ fn render(
     }
     let names = ["trace", "temporal", "atrous1", "atrous2", "atrous4"];
     for ((pipeline, group), name) in diffuse.into_iter().zip(&groups.diffuse).zip(names) {
-        dispatch(&mut context, name, pipeline, group, groups_for(state.trace_size));
+        dispatch(
+            &mut context,
+            name,
+            pipeline,
+            group,
+            groups_for(state.trace_size),
+        );
     }
     if px.reflections != PxtgiReflections::Off {
-        let names = ["reflect_trace", "reflect_temporal", "reflect_filter1", "reflect_filter2"];
+        let names = [
+            "reflect_trace",
+            "reflect_temporal",
+            "reflect_filter1",
+            "reflect_filter2",
+        ];
         for ((pipeline, group), name) in reflect.into_iter().zip(&groups.reflect).zip(names) {
-            dispatch(&mut context, name, pipeline, group, groups_for(state.reflect_size));
+            dispatch(
+                &mut context,
+                name,
+                pipeline,
+                group,
+                groups_for(state.reflect_size),
+            );
         }
     }
     {
         let span = diagnostics.time_span(context.command_encoder(), "composite");
-        let mut pass = context.command_encoder().begin_render_pass(&RenderPassDescriptor {
-            label: Some("pxtgi_composite"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: target.main_texture_view(),
-                depth_slice: None,
-                resolve_target: None,
-                ops: Operations {
-                    load: LoadOp::Load,
-                    store: StoreOp::Store,
-                },
-            })],
-            ..default()
-        });
+        let mut pass = context
+            .command_encoder()
+            .begin_render_pass(&RenderPassDescriptor {
+                label: Some("pxtgi_composite"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: target.main_texture_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    },
+                })],
+                ..default()
+            });
         pass.set_pipeline(composite);
         pass.set_bind_group(0, &groups.scene, &[]);
         pass.set_bind_group(1, &groups.composite, &[]);
@@ -2128,7 +2528,13 @@ fn render(
         (Some((group, image)), Some(raw), Some(pipeline)) => match images.get(*image) {
             Some(destination) => {
                 let size = raw.texture.size();
-                dispatch(&mut context, "raw_output", pipeline, group, (size.width.div_ceil(8), size.height.div_ceil(8)));
+                dispatch(
+                    &mut context,
+                    "raw_output",
+                    pipeline,
+                    group,
+                    (size.width.div_ceil(8), size.height.div_ceil(8)),
+                );
                 context.command_encoder().copy_texture_to_texture(
                     raw.texture.as_image_copy(),
                     destination.texture.as_image_copy(),
@@ -2141,6 +2547,12 @@ fn render(
         _ => false,
     };
     total.end(context.command_encoder());
+    state.current = 1 - state.current;
+    state.prev_clip_from_world = groups.clip_from_world;
+    state.history_epoch = settings.history_epoch;
+    state.history_reflections = px.reflections;
+    state.history_debug = debug_replaces_image(px.debug);
+    state.history = true;
     *frame_id += 1;
     if let Some(status) = status {
         status.set_active_method(GiMethod::Pxtgi);
@@ -2164,6 +2576,70 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_ignores_equal_poses_and_tracks_collider_and_light_motion() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(bevy::transform::TransformPlugin)
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<PxtgiScene>()
+            .add_message::<AssetEvent<StandardMaterial>>()
+            .add_message::<AssetEvent<Image>>()
+            .add_systems(PostUpdate, update_scene.after(TransformSystems::Propagate));
+        app.world_mut().spawn((
+            Camera::default(),
+            GlobalTransform::IDENTITY,
+            RadianceCascades {
+                method: GiMethod::Pxtgi,
+                ..default()
+            },
+        ));
+        let collider = app
+            .world_mut()
+            .spawn((
+                Collider::Cuboid {
+                    half_extents: Vec3::splat(0.5),
+                },
+                Transform::IDENTITY,
+                GlobalTransform::IDENTITY,
+            ))
+            .id();
+        let light = app
+            .world_mut()
+            .spawn((
+                PointLight::default(),
+                Transform::IDENTITY,
+                GlobalTransform::IDENTITY,
+                InheritedVisibility::VISIBLE,
+            ))
+            .id();
+        app.update();
+        app.update();
+        let scene = app.world().resource::<PxtgiScene>().0.clone();
+        let geometry_version = scene.geometry.version;
+        let lighting_revision = scene.lighting_revision;
+        app.world_mut()
+            .entity_mut(collider)
+            .insert(Transform::IDENTITY);
+        app.update();
+        let unchanged = &app.world().resource::<PxtgiScene>().0;
+        assert_eq!(unchanged.geometry.version, geometry_version);
+        assert!(Arc::ptr_eq(&unchanged.geometry, &scene.geometry));
+        app.world_mut()
+            .entity_mut(collider)
+            .insert(Transform::from_xyz(2.0, 0.0, 0.0));
+        app.world_mut()
+            .entity_mut(light)
+            .insert(Transform::from_xyz(3.0, 0.0, 0.0));
+        app.update();
+        let moved = &app.world().resource::<PxtgiScene>().0;
+        assert!(moved.geometry.version > geometry_version);
+        assert!(moved.lighting_revision > lighting_revision);
+        assert!(moved.geometry.nodes[0][0] >= 1.5);
+        assert_eq!(moved.omnis[0].position, Vec3::new(3.0, 0.0, 0.0));
+    }
 
     fn item(entity: u32, collider: &Collider, at: Vec3, store: &mut ShapeStore) -> Item {
         let (shape, lower, upper) = store.shape(collider);
@@ -2205,12 +2681,24 @@ mod tests {
     fn tree_covers_every_collider_before_and_after_a_refit() {
         let mut store = ShapeStore::default();
         let shapes = [
-            Collider::Cuboid { half_extents: Vec3::splat(0.5) },
+            Collider::Cuboid {
+                half_extents: Vec3::splat(0.5),
+            },
             Collider::Sphere { radius: 0.4 },
-            Collider::Capsule { radius: 0.2, half_height: 0.3 },
+            Collider::Capsule {
+                radius: 0.2,
+                half_height: 0.3,
+            },
         ];
         let mut items: Vec<_> = (0..40)
-            .map(|i| item(i + 1, &shapes[i as usize % 3], Vec3::new(i as f32, (i % 5) as f32, 0.0), &mut store))
+            .map(|i| {
+                item(
+                    i + 1,
+                    &shapes[i as usize % 3],
+                    Vec3::new(i as f32, (i % 5) as f32, 0.0),
+                    &mut store,
+                )
+            })
             .collect();
         let mut geometry = build_geometry(&mut items, 1);
         assert_eq!(geometry.primitives.len(), 40 * PRIMITIVE_VEC4S);
@@ -2232,11 +2720,17 @@ mod tests {
         };
         let module = naga::front::wgsl::parse_str(&source)
             .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
-            .validate(&module)
-            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
         for entry in ENTRY_POINTS {
-            assert!(module.entry_points.iter().any(|point| point.name == entry), "{entry}");
+            assert!(
+                module.entry_points.iter().any(|point| point.name == entry),
+                "{entry}"
+            );
         }
         // The frame uniform the CPU writes must be exactly the shader's `Frame`.
         let mut layouter = naga::proc::Layouter::default();
@@ -2256,7 +2750,11 @@ mod tests {
         let mut images = Assets::<Image>::default();
         // A 2x2 texture whose mean is a mid red: it scales the base colour.
         let texture = images.add(Image::new_fill(
-            Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
+            Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
             TextureDimension::D2,
             &[255, 0, 0, 255],
             TextureFormat::Rgba8Unorm,
@@ -2284,7 +2782,13 @@ mod tests {
         let parent = world.spawn_empty().add_children(&[first, second]).id();
         let mut state: SystemState<(
             Query<&Children>,
-            Query<(Option<&PxtgiLook>, Option<&MeshMaterial3d<StandardMaterial>>), Without<Collider>>,
+            Query<
+                (
+                    Option<&PxtgiLook>,
+                    Option<&MeshMaterial3d<StandardMaterial>>,
+                ),
+                Without<Collider>,
+            >,
         )> = SystemState::new(&mut world);
         let (children, child_looks) = state.get(&world).unwrap();
         let (mut means, mut missing) = (HashMap::new(), HashSet::new());
@@ -2295,25 +2799,46 @@ mod tests {
             missing: &mut missing,
         };
         // Children: the first one's albedo, the brightest one's emission.
-        let (look, used) = body_look(&mut reader, None, None, children.get(parent).ok(), &child_looks);
+        let (look, used) = body_look(
+            &mut reader,
+            None,
+            None,
+            children.get(parent).ok(),
+            &child_looks,
+        );
         assert_eq!(look.albedo, LinearRgba::rgb(0.2, 0.3, 0.4));
         assert_eq!(look.emission, LinearRgba::rgb(0.0, 8.0, 0.0));
         assert_eq!(look.exposure_weight, 0.5);
         assert_eq!(used.len(), 2);
         // Its own material wins over its children, its texture's mean included.
         let own = MeshMaterial3d(textured);
-        let (look, _) = body_look(&mut reader, None, Some(&own), children.get(parent).ok(), &child_looks);
+        let (look, _) = body_look(
+            &mut reader,
+            None,
+            Some(&own),
+            children.get(parent).ok(),
+            &child_looks,
+        );
         assert!((look.albedo.red - 0.5).abs() < 1e-4 && look.albedo.green.abs() < 1e-4);
         // Its own PxtgiLook wins over everything.
         let override_look = PxtgiLook {
             albedo: LinearRgba::rgb(0.1, 0.1, 0.1),
             emission: LinearRgba::BLACK,
         };
-        let (look, used) = body_look(&mut reader, Some(&override_look), Some(&own), None, &child_looks);
+        let (look, used) = body_look(
+            &mut reader,
+            Some(&override_look),
+            Some(&own),
+            None,
+            &child_looks,
+        );
         assert_eq!(look.albedo, override_look.albedo);
         assert!(used.is_empty());
         // Nothing readable: neutral grey.
-        assert_eq!(body_look(&mut reader, None, None, None, &child_looks).0, GREY);
+        assert_eq!(
+            body_look(&mut reader, None, None, None, &child_looks).0,
+            GREY
+        );
     }
 
     #[test]

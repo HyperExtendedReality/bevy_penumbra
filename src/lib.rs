@@ -24,9 +24,9 @@ pub use frame_timing::FrameTimingPlugin;
 mod material;
 #[cfg(feature = "pxtgi")]
 mod pxtgi;
+pub use environment::RadianceCascadesEnvironment;
 #[cfg(feature = "pxtgi")]
 pub use pxtgi::{PxtgiLook, PxtgiProbe};
-pub use environment::RadianceCascadesEnvironment;
 mod receiver;
 mod render;
 mod scene;

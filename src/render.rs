@@ -1625,7 +1625,9 @@ fn cleanup_view_allocations(
     >,
 ) {
     for (entity, settings, active) in &views {
-        if !active || settings.is_none_or(|settings| !settings.sanitized().radiance_transport_active()) {
+        if !active
+            || settings.is_none_or(|settings| !settings.sanitized().radiance_transport_active())
+        {
             commands.entity(entity).remove::<(
                 ViewBuffers,
                 ViewBindings,

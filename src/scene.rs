@@ -1223,10 +1223,9 @@ pub(crate) fn update_scene(
         (Query<(&Camera, &RadianceCascades)>, Local<bool>),
     ),
 ) {
-    if !cameras
-        .iter()
-        .any(|(camera, settings)| camera.is_active && settings.sanitized().radiance_transport_active())
-    {
+    if !cameras.iter().any(|(camera, settings)| {
+        camera.is_active && settings.sanitized().radiance_transport_active()
+    }) {
         *suspended = true;
         if scene.ready {
             scene.ready = false;

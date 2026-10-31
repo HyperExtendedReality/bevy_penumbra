@@ -115,9 +115,9 @@ pub(crate) fn patch_bevy_shadow_shaders(
         done[index] = true;
     }
     let patched = handles.iter().all(|handle| {
-        shaders
-            .get(handle)
-            .is_some_and(|shader| matches!(&shader.source, Source::Wesl(source) if source.contains(MARKER)))
+        shaders.get(handle).is_some_and(
+            |shader| matches!(&shader.source, Source::Wesl(source) if source.contains(MARKER)),
+        )
     });
     patch.0.store(patched, Ordering::Relaxed);
 }
@@ -128,10 +128,16 @@ mod tests {
 
     /// The patched Bevy release's sources, from Cargo's registry checkout.
     fn bevy_source(name: &str) -> String {
-        let home = std::env::var_os("CARGO_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| {
-            std::path::PathBuf::from(std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).unwrap())
+        let home = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(
+                    std::env::var_os("USERPROFILE")
+                        .or_else(|| std::env::var_os("HOME"))
+                        .unwrap(),
+                )
                 .join(".cargo")
-        });
+            });
         let crate_dir = std::fs::read_dir(home.join("registry/src"))
             .unwrap()
             .flatten()

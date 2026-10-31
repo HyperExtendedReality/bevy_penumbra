@@ -35,7 +35,7 @@ struct Frame {
     float4 sky;             // radiance a ray leaving the scene sees; w world ray distance
     uint4 counts;           // primitives, nodes, point lights, spot lights
     uint4 cache;            // frame, slot mask, on, rays per texel
-    float4 extra;           // emissives, light sources just changed, history valid
+    float4 extra;           // emissives, light sources just changed, history valid, reflection history valid
     float4 reflection;      // mode (0 off, 1 screen, 2 and the colliders, 3 and probes), roughness cutoff
     uint4 reflectSize;      // xy the half-size reflection textures
     float4 env;             // environment map strength (exposed), roughest mip, present, lights the scene
@@ -424,9 +424,9 @@ float meshBoxEntry(float3 o, float3 inv, int at, float best) {
 }
 
 // The nearest triangle of a mesh along a local ray (either side), walking its
-// own tree near child first. Box3D's trees stay shallow; a deeper one only
-// drops the farthest branches.
-bool hitMesh(int nodesAt, int tris, float3 o, float3 d, inout float t, inout float3 n) {
+// own tree near child first. Shadow rays only need the first intersection.
+// Box3D's trees stay shallow; a deeper one only drops the farthest branches.
+bool hitMesh(int nodesAt, int tris, float3 o, float3 d, inout float t, inout float3 n, bool anyHit) {
     bool found = false;
     float3 inv = safeInv(d);
     if (meshBoxEntry(o, inv, nodesAt, t) >= 1e30) return false;
@@ -478,6 +478,7 @@ bool hitMesh(int nodesAt, int tris, float3 o, float3 d, inout float t, inout flo
                     t = th;
                     n = cross(e1, e2);
                     found = true;
+                    if (anyHit) return true;
                 }
             }
         }
@@ -499,7 +500,7 @@ bool hitMesh(int nodesAt, int tris, float3 o, float3 d, inout float t, inout flo
 }
 
 // The nearest hit of one collider closer than best; its world normal.
-bool hitPrimitive(Primitive q, float3 o, float3 d, inout float best, out float3 normal) {
+bool hitPrimitive(Primitive q, float3 o, float3 d, inout float best, out float3 normal, bool anyHit) {
     normal = float3(0.0);
     float3 lo = float3(dot(q.r0.xyz, o) + q.r0.w, dot(q.r1.xyz, o) + q.r1.w, dot(q.r2.xyz, o) + q.r2.w);
     float3 ld = float3(dot(q.r0.xyz, d), dot(q.r1.xyz, d), dot(q.r2.xyz, d));
@@ -534,7 +535,7 @@ bool hitPrimitive(Primitive q, float3 o, float3 d, inout float best, out float3 
         t = tIn;
     } else if (kind == 5) {
         t = best;
-        if (!hitMesh(asint(q.shape.y), asint(q.shape.z), lo, ld, t, n)) return false;
+        if (!hitMesh(asint(q.shape.y), asint(q.shape.z), lo, ld, t, n, anyHit)) return false;
     } else if (kind == 2 || kind == 3) {
         // Capsule / cylinder along local y: the infinite cylinder, then the caps.
         float r = q.shape.y;
@@ -640,7 +641,7 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
             int first = asint(nd.lo.w);
             [loop] for (int i = first; i < first + count; i++) {
                 float3 n;
-                if (hitPrimitive(prims[i], o, d, t, n)) {
+                if (hitPrimitive(prims[i], o, d, t, n, anyHit)) {
                     hit = i;
                     normal = n;
                     if (anyHit) return hit;
@@ -807,6 +808,21 @@ static const uint SEEN_MIRROR = 2u;
 // reflection probe's capture (Traced + Probes).
 static bool probeTexture = false;
 
+// All tracing passes bind the previous diffuse linear depth as in1. Reject
+// previous colour when another surface occupied the projected location.
+bool previousSurface(float3 p, out float2 pc) {
+    pc = 0.0;
+    if (f.extra.z < 0.5) return false;
+    float3 pp = project(f.prevClipFromWorld, p);
+    if (pp.z <= f.camera.w || !onScreen(pp.xy)) return false;
+    int2 size = traceSize();
+    int2 tp = clamp(int2(pp.xy * float2(size) / frameSize()), 0, size - 1);
+    float depth = in1.Load(int3(tp, 0)).r;
+    if (depth <= 0.0 || abs(depth - pp.z) >= 0.05 * pp.z) return false;
+    pc = pp.xy;
+    return true;
+}
+
 // The light leaving a collider's surface toward the ray: last frame's image
 // where that point was on it; off screen, for a reflection, a probe's capture
 // of a static body when it saw the point; otherwise its glow, plus its cache
@@ -820,10 +836,10 @@ float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, bool withGlow, u
     // `emissive_exposure_weight` (albedo.w).
     float3 glowAll = prims[hit].emission.rgb * lerp(1.0, f.sunColor.w, prims[hit].albedo.w);
     float3 s = project(f.clipFromWorld, x);
-    if (s.z > f.camera.w && onScreen(s.xy) && abs(surfaceDepth(s.xy) - s.z) < 0.1 + 0.02 * s.z) {
-        float3 pp = project(f.prevClipFromWorld, x);
-        if (onScreen(pp.xy)) {
-            float3 seen = colorTexture.SampleLevel(linearSampler, pp.xy / frameSize(), 0.0).rgb;
+    if (f.extra.z > 0.5 && s.z > f.camera.w && onScreen(s.xy) && abs(surfaceDepth(s.xy) - s.z) < 0.1 + 0.02 * s.z) {
+        float2 pc;
+        if (previousSurface(x, pc)) {
+            float3 seen = colorTexture.SampleLevel(linearSampler, pc / frameSize(), 0.0).rgb;
             return withGlow ? seen : max(seen - glowAll, 0.0);
         }
     }
@@ -942,9 +958,9 @@ float4 march(float3 origin, float3 dir, float reach, int steps, float jitter) {
             float2 hp = clamp(hq.xy, 0.0, frameSize() - 1.0);
             float hd = loadDepth(int2(hp));
             marchHit = worldFromPixel(floor(hp) + 0.5, hd > 0.0 ? hd : sd);
-            float3 pp = project(f.prevClipFromWorld, marchHit);
-            if (onScreen(pp.xy)) {
-                return float4(colorTexture.SampleLevel(linearSampler, pp.xy / frameSize(), 0.0).rgb, 1.0);
+            float2 pc;
+            if (previousSurface(marchHit, pc)) {
+                return float4(colorTexture.SampleLevel(linearSampler, pc / frameSize(), 0.0).rgb, 1.0);
             }
             break;
         }
@@ -1248,7 +1264,7 @@ void reflect_temporal(uint3 id : SV_DispatchThreadID) {
     float rough = gbufferRoughness(g);
     float4 now = in0.Load(int3(px, 0));
     float4 result = now;
-    if (f.extra.z > 0.5) {
+    if (f.extra.w > 0.5) {
         float3 pp = project(f.prevClipFromWorld, p);
         if (onScreen(pp.xy)) {
             float2 at = pp.xy * float2(size) / frameSize();
@@ -1454,9 +1470,12 @@ float4 composite(float4 position : SV_Position) : SV_Target {
             reflection = float4((reflection.rgb * a + fromProbe * (1.0 - a) * weight) / alpha, alpha);
         }
     }
-    float3 specular = envBrdf(gbufferF0(g), rough, max(dot(n, view), 1e-4))
-        * reflection.a * (reflection.rgb - bevyReflection(p, mirrored, rough));
     if (debug == DEBUG_REFLECTIONS) return float4(reflection.rgb * reflection.a, 1.0);
+    float3 specular = 0.0;
+    if (reflection.a > 0.0) {
+        specular = envBrdf(gbufferF0(g), rough, max(dot(n, view), 1e-4))
+            * reflection.a * (reflection.rgb - bevyReflection(p, mirrored, rough));
+    }
     float3 diffuse = gi.rgb * f.misc.z - gi.a * bevyAmbient(n);
     return float4(diffuse * gbufferAlbedo(g) + specular, 0.0);
 }
