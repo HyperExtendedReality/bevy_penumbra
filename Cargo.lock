@@ -1252,6 +1252,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_lux"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_box3d",
+ "bevy_slang",
+ "bevy_texture_cache",
+ "indexmap",
+ "naga",
+ "tempfile",
+ "wgpu",
+]
+
+[[package]]
 name = "bevy_macro_utils"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1393,20 +1407,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "wgpu-types",
-]
-
-[[package]]
-name = "bevy_penumbra"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "bevy_box3d",
- "bevy_slang",
- "bevy_texture_cache",
- "indexmap",
- "naga",
- "tempfile",
- "wgpu",
 ]
 
 [[package]]

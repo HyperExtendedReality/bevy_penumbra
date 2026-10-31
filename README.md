@@ -1,6 +1,6 @@
-# bevy_penumbra
+# bevy_lux
 
-`bevy_penumbra` implements diffuse global illumination in Bevy with Split
+`bevy_lux` implements diffuse global illumination in Bevy with Split
 Radiance Cascades, following the strict base of the v2 paper. It uses persistent
 world-space intervals with validated temporal reconstruction.
 
@@ -14,7 +14,7 @@ participating meshes with `RadianceCascadesGeometry`:
 ```rust
 use bevy::pbr::DefaultOpaqueRendererMethod;
 use bevy::prelude::*;
-use bevy_penumbra::{RadianceCascades, RadianceCascadesGeometry, RadianceCascadesPlugin};
+use bevy_lux::{RadianceCascades, RadianceCascadesGeometry, RadianceCascadesPlugin};
 
 App::new()
     .insert_resource(DefaultOpaqueRendererMethod::deferred())
@@ -46,6 +46,62 @@ emitters using stochastic texture-alpha coverage; they do not receive the
 deferred GI composite. This is not refractive or volumetric transmission.
 Forward-only receivers and MSAA remain unsupported.
 The examples show setup, controls, raw output, and scene registration patterns.
+
+## Ray-traced GI
+
+Set `method` to `GiMethod::RayTraced` on the camera's `RadianceCascades`
+component. It is a separate estimator from Split Radiance Cascades and runs
+none of the cascade passes; it always traces with Vulkan hardware ray queries,
+whatever `hardware_ray_queries` says. It never falls back to the cascades:
+until its acceleration structures and pipelines are ready, or on a device
+without ray-query support, the view keeps Bevy's native lighting.
+`RadianceCascadesStatus::active_method()` reports the method of the latest
+dispatch.
+
+The diffuse gather uses screen history, a hashed world-space radiance cache and
+cascaded irradiance volumes. Cache cells accumulate direct and bounce lighting
+separately; `ray_traced.multi_bounce` controls the latter. Temporal and spatial
+reservoir reuse, spherical-harmonic reconstruction and bilateral filtering
+trade exact path-traced results for real-time performance. Visible-surface
+specular lighting and transparent receivers remain outside this diffuse method.
+Bounded rigid-geometry changes invalidate cache cells whose retained lighting
+paths intersect the changed region; changes without reliable bounds reset the
+cache. Irradiance volumes are cleared on geometry changes, so continuously
+moving geometry can delay their convergence.
+
+## Physics-collider GI (PXTGI)
+
+With the default `pxtgi` feature, set `RadianceCascades::method` to
+`GiMethod::Pxtgi` and add `bevy_box3d` colliders to the scene. PXTGI traces
+those colliders rather than `RadianceCascadesGeometry` meshes. Collider material
+colours are approximated by texture means; off-screen geometry without a
+collider cannot be hit. `PxtgiSettings` controls ray count, multi-bounce cache,
+reflections and debug views. `reset_history()` and image-replacing debug views
+invalidate screen history; changing the reflection mode invalidates reflection
+history.
+The optional multi-bounce cache is shared between views and currently has
+unsynchronized cell accesses; its results can depend on GPU scheduling and
+can mix view-dependent lighting. Disable `multi_bounce` where those risks are
+unacceptable.
+
+The Sponza example accepts `--pxtgi` and reports `render/pxtgi` GPU pass
+timings in its F1 menu. For a matched fixed-camera regression capture:
+
+```text
+cargo run --release --example sponza -- --pxtgi --capture-stability --capture-raw --camera-pose-frame=0 --time=12 --width=640 --height=360 --warmup-frames=120 --capture-prefix=tmp/pxtgi
+```
+
+The existing Sponza benchmark and validation scripts measure Split, not PXTGI.
+PXTGI's raw support marks eligible receivers, not convergence or collider-hit
+coverage; an independent matched reference is needed to assess lighting accuracy.
+
+On the Vulkan RTX 4070 Laptop GPU at 320×180, the Sponza PXTGI motion
+capture reached the history reset and moving-light stages but failed its
+100 ms light-extinction gate: the latest observed residual was 68.4%, against
+a 5% limit. This is not a target-device performance or quality certification.
+During the stationary part of that capture, repeated identical transform writes
+kept geometry revision 137 unchanged from frame 128 to 159; before the motion
+tracking fix the revision advanced from 141 to 172 over the same interval.
 
 ## Tune a view
 
@@ -137,10 +193,14 @@ view budgets. While the structures or pipelines are not ready, the software
 traversal runs. `RadianceCascadesStatus::hardware_ray_queries` reports which
 traversal the latest dispatch used.
 
-The Sponza demo and library use Split Radiance Cascades. In the interactive
-Sponza demo, `F12` toggles cursor grab and `H` toggles hardware ray queries,
-which Sponza requests by default; the window title shows the traversal in use.
-`--software-traversal` starts with the software traversal.
+The library defaults to Split Radiance Cascades, as does the Sponza demo; its
+`--rtgi` flag starts with ray-traced GI. In the interactive Sponza demo, `F1`
+toggles the debug menu: live status, a method selector that shows only the
+selected method's controls, sun shadows, time of day and GPU pass timings.
+`M` switches the method, `F12` toggles cursor grab and `H` toggles the
+cascades' hardware ray queries, which Sponza requests by default.
+`--software-traversal` starts with the software traversal and `--shadow-maps`
+with Bevy's shadow maps instead of ray-traced sun shadows.
 Sponza defaults to 2,048 receiver updates and 131,072 traversal queries per
 frame, requested grid divisor 4, resolve scale 4, and two direct-light samples.
 The library's low-end preset remains at 1,024 updates and 16,384 queries. The demo keeps its requested
@@ -289,7 +349,7 @@ by visible GI geometry. Debug text and unrelated UI atlas updates preserve GI
 history. Idle controls leave the ceiling emitter's transform untouched, and
 identical geometry transforms do not trigger a rebuild. The warmup counter shows
 rendered GI frames, rather than independent samples per receiver.
-`RUST_LOG=bevy_penumbra::render=debug,bevy_penumbra::scene=debug` logs scene rebuild
+`RUST_LOG=bevy_lux::render=debug,bevy_lux::scene=debug` logs scene rebuild
 and sparse-history reset causes.
 `--capture-warmup-frames=N` can require a longer live observation before saving.
 

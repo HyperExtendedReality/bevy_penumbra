@@ -781,6 +781,9 @@ fn setup(
             })),
             Transform::from_translation(initial_motion_positions.occluder),
             RadianceCascadesGeometry,
+            Collider::Cuboid {
+                half_extents: Vec3::splat(0.35),
+            },
             MotionCaptureOccluder,
         ));
         commands.spawn((

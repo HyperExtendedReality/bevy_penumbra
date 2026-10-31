@@ -1,9 +1,9 @@
 [package]
-name = "bevy_penumbra"
+name = "bevy_lux"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
-description = "Sparse world-space Split Radiance Cascades global illumination for Bevy"
+description = "Split Radiance Cascades, ray-traced and physics-collider-traced (PXTGI) global illumination for Bevy"
 license = "MIT OR Apache-2.0"
 keywords = ["bevy", "global-illumination", "radiance-cascades", "slang"]
 categories = ["game-development", "graphics", "rendering"]
@@ -16,11 +16,13 @@ naga = { version = "30", features = ["wgsl-in", "spv-out"] }
 bevy_box3d = { version = "0.1.0", path = "../bevy_box3D", optional = true }
 
 [features]
-# PXTGI: GI traced against Box3D colliders (see `pxtgi` module).
+default = ["pxtgi"]
+# GiMethod::Pxtgi: GI traced against bevy_box3d colliders (see the `pxtgi` module).
 pxtgi = ["dep:bevy_box3d"]
 
 [dev-dependencies]
 bevy_texture_cache = { version = "0.1.0", path = "../bevy_texture_cache" }
+bevy_box3d = { version = "0.1.0", path = "../bevy_box3D" }
 bevy = { version = "0.20.0", default-features = false, features = ["3d", "png", "free_camera", "ui", "default_font"] }
 
 [profile.dev]
